@@ -3,7 +3,7 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 
@@ -11,13 +11,13 @@ from .config import settings
 from .db import get_session, init_db
 from .domain import DomainError
 from .profile_registry import all_profiles
+from .quarantine import CandidateQuarantineError, GitCandidateQuarantine
 from .repository import load_events
 from .schemas import (
     CreatePublicationRequest,
     MergeabilityRequest,
     PublishedRequest,
     ReviewRequest,
-    SubmitCandidateRequest,
     ValidationResultRequest,
 )
 from .service import (
@@ -28,7 +28,7 @@ from .service import (
     record_mergeability,
     record_review,
     record_validation,
-    submit_candidate,
+    submit_verified_candidate,
 )
 
 @asynccontextmanager
@@ -48,6 +48,13 @@ app.add_middleware(
 def require_token(x_control_plane_token: str | None = Header(default=None)) -> None:
     if x_control_plane_token != settings.internal_token:
         raise HTTPException(status_code=401, detail="invalid control-plane token")
+
+
+def get_quarantine() -> GitCandidateQuarantine:
+    return GitCandidateQuarantine(
+        settings.quarantine_root,
+        max_bundle_bytes=settings.max_candidate_bundle_bytes,
+    )
 
 
 def _payload(view):
@@ -100,18 +107,25 @@ def publication_events(publication_id: str, session: Session = Depends(get_sessi
         return load_events(session, publication_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="publication not found") from exc
-@app.post("/api/v1/publications/{publication_id}/candidates", dependencies=[Depends(require_token)])
-def candidate_submit(publication_id: str, request: SubmitCandidateRequest, session: Session = Depends(get_session)):
+@app.post(
+    "/api/v1/publications/{publication_id}/candidate-bundle",
+    dependencies=[Depends(require_token)],
+)
+def candidate_bundle_submit(
+    publication_id: str,
+    bundle: UploadFile = File(...),
+    session: Session = Depends(get_session),
+    quarantine: GitCandidateQuarantine = Depends(get_quarantine),
+):
     try:
-        return _payload(submit_candidate(
-            session,
-            publication_id,
-            base_sha=request.base_sha,
-            head_sha=request.head_sha,
-            tree_sha=request.tree_sha,
-        ))
+        source = quarantine.import_stream(bundle.file)
+        return _payload(submit_verified_candidate(session, publication_id, source))
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="publication not found") from exc
+    except CandidateQuarantineError as exc:
+        detail = str(exc)
+        status = 413 if "size limit" in detail else 422
+        raise HTTPException(status_code=status, detail=detail) from exc
     except DomainError as exc:
         raise _conflict(exc) from exc
 

@@ -16,8 +16,9 @@ from .domain import (
     fold_events,
     validate_transition,
 )
-from .models import CandidateRow, PublicationRow
+from .models import CandidateRow, CandidateSourceRow, PublicationRow
 from .profile_registry import DeliveryProfile, profile_for_repository
+from .quarantine import VerifiedCandidateSource
 from .repository import append_event, load_events
 
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -54,20 +55,36 @@ def create_publication(session: Session, repository: str, issue_number: int) -> 
     return get_view(session, publication_id)
 
 
-def submit_candidate(
+def _source_payload(source: VerifiedCandidateSource) -> dict[str, Any]:
+    return {
+        "bundle_sha256": source.bundle_sha256,
+        "byte_length": source.byte_length,
+        "quarantine_id": source.quarantine_id,
+        "base_sha": source.base_sha,
+        "head_sha": source.head_sha,
+        "tree_sha": source.tree_sha,
+    }
+
+
+def submit_verified_candidate(
     session: Session,
     publication_id: str,
-    *,
-    base_sha: str,
-    head_sha: str,
-    tree_sha: str,
+    source: VerifiedCandidateSource,
 ) -> PublicationView:
     view = get_view(session, publication_id)
     profile = profile_for_repository(view.repository)
-    base = _sha(base_sha, "base_sha")
-    head = _sha(head_sha, "head_sha")
-    tree = _sha(tree_sha, "tree_sha")
+    base = _sha(source.base_sha, "base_sha")
+    head = _sha(source.head_sha, "head_sha")
+    tree = _sha(source.tree_sha, "tree_sha")
+    if not re.fullmatch(r"[0-9a-f]{64}", source.bundle_sha256):
+        raise DomainError("bundle_sha256 must be exact lowercase sha256")
+    if source.quarantine_id != source.bundle_sha256:
+        raise DomainError("quarantine identity must equal bundle sha256")
+    if source.byte_length <= 0:
+        raise DomainError("candidate source byte_length must be positive")
+
     candidate_id = _candidate_id(publication_id, base, head, tree, profile)
+    source_payload = _source_payload(source)
     payload = {
         "candidate_id": candidate_id,
         "base_sha": base,
@@ -76,15 +93,52 @@ def submit_candidate(
         "profile_id": profile.profile_id,
         "profile_version": profile.version,
         "profile_digest": profile.digest,
+        "source": source_payload,
     }
-    if view.current_candidate and view.current_candidate.candidate_id == candidate_id:
-        return view
+
+    existing_candidate = session.get(CandidateRow, candidate_id)
+    existing_source = session.get(CandidateSourceRow, candidate_id)
+    if existing_candidate is not None:
+        if existing_source is None:
+            raise DomainError("candidate exists without immutable verified source")
+        observed = {
+            "bundle_sha256": existing_source.bundle_sha256,
+            "byte_length": existing_source.byte_length,
+            "quarantine_id": existing_source.quarantine_id,
+            "base_sha": existing_source.base_sha,
+            "head_sha": existing_source.head_sha,
+            "tree_sha": existing_source.tree_sha,
+        }
+        if observed != source_payload:
+            raise DomainError("immutable candidate source conflict")
+        if view.current_candidate and view.current_candidate.candidate_id == candidate_id:
+            return view
+        raise DomainError("candidate identity already belongs to another publication state")
+
     validate_transition(view, EventType.CANDIDATE_SUBMITTED, payload)
-    session.add(CandidateRow(id=candidate_id, publication_id=publication_id, **{
-        key: payload[key] for key in (
-            "base_sha", "head_sha", "tree_sha", "profile_id", "profile_version", "profile_digest"
+    session.add(
+        CandidateRow(
+            id=candidate_id,
+            publication_id=publication_id,
+            base_sha=base,
+            head_sha=head,
+            tree_sha=tree,
+            profile_id=profile.profile_id,
+            profile_version=profile.version,
+            profile_digest=profile.digest,
         )
-    }))
+    )
+    session.add(
+        CandidateSourceRow(
+            candidate_id=candidate_id,
+            bundle_sha256=source.bundle_sha256,
+            byte_length=source.byte_length,
+            quarantine_id=source.quarantine_id,
+            base_sha=base,
+            head_sha=head,
+            tree_sha=tree,
+        )
+    )
     append_event(session, publication_id, EventType.CANDIDATE_SUBMITTED, payload)
     session.commit()
     return get_view(session, publication_id)

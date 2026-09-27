@@ -8,12 +8,6 @@ class CreatePublicationRequest(BaseModel):
     issue_number: int = Field(gt=0)
 
 
-class SubmitCandidateRequest(BaseModel):
-    base_sha: str
-    head_sha: str
-    tree_sha: str
-
-
 class ValidationResultRequest(BaseModel):
     job_id: str
     status: ValidationStatus
