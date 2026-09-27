@@ -1,0 +1,33 @@
+from pydantic import BaseModel, Field
+
+from .domain import ReviewDecision, ValidationStatus
+
+
+class CreatePublicationRequest(BaseModel):
+    repository: str
+    issue_number: int = Field(gt=0)
+
+
+class SubmitCandidateRequest(BaseModel):
+    base_sha: str
+    head_sha: str
+    tree_sha: str
+
+
+class ValidationResultRequest(BaseModel):
+    job_id: str
+    status: ValidationStatus
+    evidence_sha256: str
+
+
+class PublishedRequest(BaseModel):
+    head_sha: str
+
+
+class ReviewRequest(BaseModel):
+    reviewed_head_sha: str
+    decision: ReviewDecision
+
+
+class MergeabilityRequest(BaseModel):
+    mergeable: bool

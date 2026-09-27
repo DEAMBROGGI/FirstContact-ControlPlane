@@ -1,0 +1,10 @@
+{
+  "repository": "DEAMBROGGI/FirstContact-SpecialistAgent",
+  "profile_id": "specialist/default",
+  "version": 1,
+  "required_jobs": [
+    "scripts-verify",
+    "lifecycle-contracts",
+    "mcp-contracts"
+  ]
+}
