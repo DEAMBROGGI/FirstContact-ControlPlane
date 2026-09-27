@@ -82,6 +82,44 @@ class GitCandidateQuarantine:
             raise CandidateQuarantineError("quarantined repository is unavailable")
         return path
 
+    def verify_existing(
+        self,
+        quarantine_id: str,
+        *,
+        byte_length: int,
+    ) -> VerifiedCandidateSource:
+        repo_path = self.repo_path(quarantine_id)
+        bundle_path = self._bundle_path(quarantine_id)
+        if not bundle_path.is_file():
+            raise CandidateQuarantineError("quarantined bundle is unavailable")
+        observed_digest, observed_length = self._hash_file(bundle_path)
+        if observed_digest != quarantine_id or observed_length != byte_length:
+            raise CandidateQuarantineError("quarantined bundle content identity mismatch")
+        return self._verify_repo(repo_path, quarantine_id, byte_length)
+
+    def is_ancestor(
+        self,
+        quarantine_id: str,
+        older_sha: str,
+        newer_sha: str,
+    ) -> bool:
+        repo_path = self.repo_path(quarantine_id)
+        for value in (older_sha, newer_sha):
+            if len(value) != 40 or any(c not in "0123456789abcdef" for c in value.lower()):
+                raise CandidateQuarantineError("invalid Git object identity")
+        result = self._run(
+            "-C",
+            str(repo_path),
+            "merge-base",
+            "--is-ancestor",
+            older_sha.lower(),
+            newer_sha.lower(),
+            check=False,
+        )
+        if result.returncode not in {0, 1}:
+            raise CandidateQuarantineError("failed to evaluate quarantine ancestry")
+        return result.returncode == 0
+
     def _ensure_roots(self) -> None:
         for path in (
             self.root / "incoming",

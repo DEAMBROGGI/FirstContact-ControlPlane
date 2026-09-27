@@ -22,7 +22,11 @@ class DeliveryProfile:
 def _load(name: str) -> DeliveryProfile:
     raw = resources.files("control_plane.policies").joinpath(name).read_bytes()
     payload = json.loads(raw.decode("utf-8"))
-    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    canonical = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
     return DeliveryProfile(
         repository=payload["repository"],
         profile_id=payload["profile_id"],
@@ -32,7 +36,14 @@ def _load(name: str) -> DeliveryProfile:
     )
 
 
-_PROFILES = tuple(_load(name) for name in ("firstcontact.json", "specialist.json"))
+_PROFILES = tuple(
+    _load(name)
+    for name in (
+        "firstcontact.json",
+        "specialist.json",
+        "controlplane.json",
+    )
+)
 
 
 def profile_for_repository(repository: str) -> DeliveryProfile:

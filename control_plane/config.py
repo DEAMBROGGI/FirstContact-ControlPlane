@@ -14,6 +14,9 @@ class Settings(BaseSettings):
     publisher_mode: str = "disabled"
     quarantine_root: str = ".control-plane/quarantine"
     max_candidate_bundle_bytes: int = 50 * 1024 * 1024
+    github_app_id: str = ""
+    github_app_private_key_path: str = ""
+    github_api_url: str = "https://api.github.com"
 
 
 settings = Settings()
