@@ -1,0 +1,12 @@
+{
+  "repository": "DEAMBROGGI/FirstContact",
+  "profile_id": "firstcontact/default",
+  "version": 1,
+  "required_jobs": [
+    "python-contracts",
+    "evergreen-audits",
+    "rojo-build",
+    "repository-integrity",
+    "evergreen-audits-repeat"
+  ]
+}

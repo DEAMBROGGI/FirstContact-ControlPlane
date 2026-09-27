@@ -1,0 +1,12 @@
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix="CONTROL_PLANE_")
+
+    database_url: str = "sqlite:///./control_plane.db"
+    internal_token: str = "local-dev-change-me"
+    publisher_mode: str = "disabled"
+
+
+settings = Settings()
