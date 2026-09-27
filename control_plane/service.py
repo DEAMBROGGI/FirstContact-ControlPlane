@@ -8,6 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .domain import (
+    AutomatedReviewStatus,
     DomainError,
     EventType,
     PublicationView,
@@ -232,8 +233,14 @@ def record_review(
     *,
     reviewed_head_sha: str,
     decision: ReviewDecision,
+    require_codex_review: bool = False,
 ) -> PublicationView:
     view = get_view(session, publication_id)
+    if (
+        require_codex_review
+        and view.automated_review_status is not AutomatedReviewStatus.PASS
+    ):
+        raise DomainError("required Codex review has not passed")
     payload = {
         "reviewed_head_sha": _sha(reviewed_head_sha, "reviewed_head_sha"),
         "decision": decision.value,
@@ -255,3 +262,124 @@ def record_mergeability(session: Session, publication_id: str, mergeable: bool) 
 
 def list_publication_ids(session: Session) -> list[str]:
     return list(session.scalars(select(PublicationRow.id).order_by(PublicationRow.created_at.desc())))
+
+
+def request_codex_review(
+    session: Session,
+    publication_id: str,
+    *,
+    mode: str,
+) -> PublicationView:
+    if mode not in {"advisory", "required"}:
+        raise DomainError("Codex review mode must be advisory or required")
+    view = get_view(session, publication_id)
+    if view.remote_head_sha is None:
+        raise DomainError("Codex review requires published head")
+    run_id = str(
+        uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"codex-review|{publication_id}|{view.remote_head_sha}",
+        )
+    )
+    if (
+        view.automated_review_run_id == run_id
+        and view.automated_review_status in {
+            AutomatedReviewStatus.RUNNING,
+            AutomatedReviewStatus.PASS,
+            AutomatedReviewStatus.CHANGES_REQUIRED,
+        }
+    ):
+        return view
+    payload = {
+        "run_id": run_id,
+        "provider": "CODEX_CODE_REVIEW",
+        "head_sha": view.remote_head_sha,
+        "pull_request_number": view.pull_request_number,
+        "mode": mode,
+    }
+    validate_transition(view, EventType.CODEX_REVIEW_REQUESTED, payload)
+    append_event(session, publication_id, EventType.CODEX_REVIEW_REQUESTED, payload)
+    session.commit()
+    return get_view(session, publication_id)
+
+
+def mark_codex_review_triggered(
+    session: Session,
+    publication_id: str,
+    *,
+    run_id: str,
+    comment_id: int,
+) -> PublicationView:
+    if comment_id <= 0:
+        raise DomainError("Codex trigger comment id must be positive")
+    view = get_view(session, publication_id)
+    if (
+        view.automated_review_trigger_comment_id == comment_id
+        and view.automated_review_run_id == run_id
+    ):
+        return view
+    payload = {
+        "run_id": run_id,
+        "comment_id": comment_id,
+    }
+    validate_transition(view, EventType.CODEX_REVIEW_TRIGGERED, payload)
+    append_event(session, publication_id, EventType.CODEX_REVIEW_TRIGGERED, payload)
+    session.commit()
+    return get_view(session, publication_id)
+
+
+def complete_codex_review(
+    session: Session,
+    publication_id: str,
+    *,
+    run_id: str,
+    reviewed_head_sha: str,
+    result: AutomatedReviewStatus,
+    findings: list[dict[str, Any]],
+    provider_review_ids: list[int],
+    provider_comment_ids: list[int],
+) -> PublicationView:
+    if result not in {
+        AutomatedReviewStatus.PASS,
+        AutomatedReviewStatus.CHANGES_REQUIRED,
+    }:
+        raise DomainError("Codex review result must be PASS or CHANGES_REQUIRED")
+    if len(findings) > 200:
+        raise DomainError("too many Codex review findings")
+    head = _sha(reviewed_head_sha, "reviewed_head_sha")
+    payload = {
+        "run_id": run_id,
+        "head_sha": head,
+        "result": result.value,
+        "findings_count": len(findings),
+        "findings": findings,
+        "provider_review_ids": sorted(set(int(value) for value in provider_review_ids)),
+        "provider_comment_ids": sorted(set(int(value) for value in provider_comment_ids)),
+    }
+    view = get_view(session, publication_id)
+    validate_transition(view, EventType.CODEX_REVIEW_COMPLETED, payload)
+    append_event(session, publication_id, EventType.CODEX_REVIEW_COMPLETED, payload)
+    session.commit()
+    return get_view(session, publication_id)
+
+
+def mark_codex_review_unavailable(
+    session: Session,
+    publication_id: str,
+    *,
+    run_id: str,
+    reviewed_head_sha: str,
+    reason: str,
+) -> PublicationView:
+    if not reason or len(reason) > 200:
+        raise DomainError("Codex unavailable reason must be 1..200 characters")
+    payload = {
+        "run_id": run_id,
+        "head_sha": _sha(reviewed_head_sha, "reviewed_head_sha"),
+        "reason": reason,
+    }
+    view = get_view(session, publication_id)
+    validate_transition(view, EventType.CODEX_REVIEW_UNAVAILABLE, payload)
+    append_event(session, publication_id, EventType.CODEX_REVIEW_UNAVAILABLE, payload)
+    session.commit()
+    return get_view(session, publication_id)

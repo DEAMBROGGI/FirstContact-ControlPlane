@@ -115,8 +115,27 @@ class GitHubAppTokenProvider:
             )
         return response
 
-    def installation_access(self, repository: str) -> InstallationAccess:
+    def installation_access(
+        self,
+        repository: str,
+        *,
+        permissions: dict[str, str] | None = None,
+    ) -> InstallationAccess:
         owner, name = self._repository_parts(repository)
+        requested_permissions = permissions or {
+            "contents": "write",
+            "pull_requests": "write",
+        }
+        allowed_permissions = {
+            "contents": {"read", "write"},
+            "pull_requests": {"read", "write"},
+            "issues": {"read", "write"},
+        }
+        if not requested_permissions:
+            raise GitHubAuthError("installation permissions cannot be empty")
+        for key, value in requested_permissions.items():
+            if key not in allowed_permissions or value not in allowed_permissions[key]:
+                raise GitHubAuthError("unsupported installation permission request")
         app_jwt = self._jwt()
 
         installation_response = self._request(
@@ -135,10 +154,7 @@ class GitHubAppTokenProvider:
             app_jwt=app_jwt,
             json={
                 "repositories": [name],
-                "permissions": {
-                    "contents": "write",
-                    "pull_requests": "write",
-                },
+                "permissions": requested_permissions,
             },
         )
         try:

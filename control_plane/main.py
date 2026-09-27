@@ -7,6 +7,7 @@ from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 
+from .codex_review import CodexReviewBroker, CodexReviewError
 from .config import settings
 from .db import get_session, init_db
 from .domain import DomainError
@@ -80,11 +81,37 @@ def get_publisher(
         github.close()
 
 
+def get_codex_review_broker():
+    token_provider = GitHubAppTokenProvider(
+        app_id=settings.github_app_id,
+        private_key_path=settings.github_app_private_key_path,
+        api_url=settings.github_api_url,
+    )
+    github = GitHubRepositoryGateway(api_url=settings.github_api_url)
+    actors = tuple(
+        value.strip()
+        for value in settings.codex_review_actors.split(",")
+        if value.strip()
+    )
+    try:
+        yield CodexReviewBroker(
+            token_provider=token_provider,
+            github=github,
+            mode=settings.codex_review_mode,
+            allowed_actors=actors,
+        )
+    finally:
+        token_provider.close()
+        github.close()
+
+
 def _payload(view):
     data = asdict(view)
     data["state"] = view.state.value
     if view.review_decision is not None:
         data["review_decision"] = view.review_decision.value
+    if view.automated_review_status is not None:
+        data["automated_review_status"] = view.automated_review_status.value
     return data
 
 
@@ -94,7 +121,11 @@ def _conflict(exc: Exception) -> HTTPException:
 
 @app.get("/api/v1/health")
 def health():
-    return {"status": "PASS", "publisher_mode": settings.publisher_mode}
+    return {
+        "status": "PASS",
+        "publisher_mode": settings.publisher_mode,
+        "codex_review_mode": settings.codex_review_mode,
+    }
 
 
 @app.get("/api/v1/profiles")
@@ -186,6 +217,51 @@ def publication_publish(
         raise HTTPException(status_code=502, detail="publication failed closed") from exc
 
 
+
+@app.post(
+    "/api/v1/internal/publications/{publication_id}/codex-review/request",
+    dependencies=[Depends(require_token)],
+)
+def codex_review_request(
+    publication_id: str,
+    session: Session = Depends(get_session),
+    broker: CodexReviewBroker = Depends(get_codex_review_broker),
+):
+    if settings.codex_review_mode.strip().lower() == "disabled":
+        raise HTTPException(status_code=503, detail="Codex review broker is disabled")
+    try:
+        return _payload(broker.request(session, publication_id))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="publication not found") from exc
+    except DomainError as exc:
+        raise _conflict(exc) from exc
+    except CodexReviewError as exc:
+        raise HTTPException(status_code=502, detail="Codex review failed closed") from exc
+
+
+@app.post(
+    "/api/v1/internal/publications/{publication_id}/codex-review/reconcile",
+    dependencies=[Depends(require_token)],
+)
+def codex_review_reconcile(
+    publication_id: str,
+    session: Session = Depends(get_session),
+    broker: CodexReviewBroker = Depends(get_codex_review_broker),
+):
+    try:
+        observation = broker.reconcile(session, publication_id)
+        return {
+            "observation": asdict(observation),
+            "publication": _payload(get_view(session, publication_id)),
+        }
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="publication not found") from exc
+    except DomainError as exc:
+        raise _conflict(exc) from exc
+    except CodexReviewError as exc:
+        raise HTTPException(status_code=502, detail="Codex review reconciliation failed closed") from exc
+
+
 @app.post("/api/v1/publications/{publication_id}/reviews", dependencies=[Depends(require_token)])
 def review_record(publication_id: str, request: ReviewRequest, session: Session = Depends(get_session)):
     try:
@@ -194,6 +270,9 @@ def review_record(publication_id: str, request: ReviewRequest, session: Session 
             publication_id,
             reviewed_head_sha=request.reviewed_head_sha,
             decision=request.decision,
+            require_codex_review=(
+                settings.codex_review_mode.strip().lower() == "required"
+            ),
         ))
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="publication not found") from exc

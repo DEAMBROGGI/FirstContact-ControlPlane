@@ -28,6 +28,10 @@ class EventType(StrEnum):
     CANDIDATE_ADMITTED = "CANDIDATE_ADMITTED"
     CANDIDATE_REJECTED = "CANDIDATE_REJECTED"
     REMOTE_PUBLISHED = "REMOTE_PUBLISHED"
+    CODEX_REVIEW_REQUESTED = "CODEX_REVIEW_REQUESTED"
+    CODEX_REVIEW_TRIGGERED = "CODEX_REVIEW_TRIGGERED"
+    CODEX_REVIEW_COMPLETED = "CODEX_REVIEW_COMPLETED"
+    CODEX_REVIEW_UNAVAILABLE = "CODEX_REVIEW_UNAVAILABLE"
     REVIEW_RECORDED = "REVIEW_RECORDED"
     MERGEABILITY_RECORDED = "MERGEABILITY_RECORDED"
     MERGED = "MERGED"
@@ -40,6 +44,13 @@ class ValidationStatus(StrEnum):
 class ReviewDecision(StrEnum):
     APPROVED = "APPROVED"
     CHANGES_REQUIRED = "CHANGES_REQUIRED"
+
+
+class AutomatedReviewStatus(StrEnum):
+    RUNNING = "RUNNING"
+    PASS = "PASS"
+    CHANGES_REQUIRED = "CHANGES_REQUIRED"
+    UNAVAILABLE = "UNAVAILABLE"
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,6 +82,13 @@ class PublicationView:
     remote_branch: str | None
     base_branch: str | None
     pull_request_number: int | None
+    automated_reviewer: str | None
+    automated_review_run_id: str | None
+    automated_review_status: AutomatedReviewStatus | None
+    automated_review_head_sha: str | None
+    automated_review_trigger_comment_id: int | None
+    automated_review_mode: str | None
+    automated_review_findings_count: int
     review_decision: ReviewDecision | None
     mergeable: bool | None
     projection: LifecycleProjection
@@ -114,6 +132,13 @@ def fold_events(
     remote_branch: str | None = None
     base_branch: str | None = None
     pull_request_number: int | None = None
+    automated_reviewer: str | None = None
+    automated_review_run_id: str | None = None
+    automated_review_status: AutomatedReviewStatus | None = None
+    automated_review_head_sha: str | None = None
+    automated_review_trigger_comment_id: int | None = None
+    automated_review_mode: str | None = None
+    automated_review_findings_count = 0
     review_decision: ReviewDecision | None = None
     mergeable: bool | None = None
 
@@ -127,6 +152,13 @@ def fold_events(
         elif event_type is EventType.CANDIDATE_SUBMITTED:
             candidate = _candidate(payload)
             state = PublicationState.VALIDATING
+            automated_reviewer = None
+            automated_review_run_id = None
+            automated_review_status = None
+            automated_review_head_sha = None
+            automated_review_trigger_comment_id = None
+            automated_review_mode = None
+            automated_review_findings_count = 0
             review_decision = None
             mergeable = None
         elif event_type is EventType.CANDIDATE_ADMITTED:
@@ -150,7 +182,33 @@ def fold_events(
                 if payload.get("pull_request_number") is not None
                 else pull_request_number
             )
+            automated_reviewer = None
+            automated_review_run_id = None
+            automated_review_status = None
+            automated_review_head_sha = None
+            automated_review_trigger_comment_id = None
+            automated_review_mode = None
+            automated_review_findings_count = 0
             state = PublicationState.IN_REVIEW
+        elif event_type is EventType.CODEX_REVIEW_REQUESTED:
+            automated_reviewer = "CODEX_CODE_REVIEW"
+            automated_review_run_id = str(payload["run_id"])
+            automated_review_status = AutomatedReviewStatus.RUNNING
+            automated_review_head_sha = str(payload["head_sha"])
+            automated_review_mode = str(payload["mode"])
+            automated_review_trigger_comment_id = None
+            automated_review_findings_count = 0
+        elif event_type is EventType.CODEX_REVIEW_TRIGGERED:
+            automated_review_trigger_comment_id = int(payload["comment_id"])
+        elif event_type is EventType.CODEX_REVIEW_COMPLETED:
+            automated_review_status = AutomatedReviewStatus(payload["result"])
+            automated_review_findings_count = int(payload.get("findings_count", 0))
+            automated_reviewer = None
+            if automated_review_status is AutomatedReviewStatus.CHANGES_REQUIRED:
+                state = PublicationState.CHANGES_REQUIRED
+        elif event_type is EventType.CODEX_REVIEW_UNAVAILABLE:
+            automated_review_status = AutomatedReviewStatus.UNAVAILABLE
+            automated_reviewer = None
         elif event_type is EventType.REVIEW_RECORDED:
             review_decision = ReviewDecision(payload["decision"])
             state = (
@@ -176,6 +234,13 @@ def fold_events(
         remote_branch=remote_branch,
         base_branch=base_branch,
         pull_request_number=pull_request_number,
+        automated_reviewer=automated_reviewer,
+        automated_review_run_id=automated_review_run_id,
+        automated_review_status=automated_review_status,
+        automated_review_head_sha=automated_review_head_sha,
+        automated_review_trigger_comment_id=automated_review_trigger_comment_id,
+        automated_review_mode=automated_review_mode,
+        automated_review_findings_count=automated_review_findings_count,
         review_decision=review_decision,
         mergeable=mergeable,
         projection=desired_projection(state),
@@ -208,9 +273,55 @@ def validate_transition(
         if payload.get("head_sha") != view.current_candidate.head_sha:
             raise DomainError("published head must equal admitted candidate head")
         return
+    if event_type is EventType.CODEX_REVIEW_REQUESTED:
+        if state is not PublicationState.IN_REVIEW:
+            raise DomainError("Codex review requires IN_REVIEW state")
+        if view.remote_head_sha is None or view.pull_request_number is None:
+            raise DomainError("Codex review requires published PR metadata")
+        if payload.get("head_sha") != view.remote_head_sha:
+            raise DomainError("Codex review head is stale")
+        if view.automated_review_status is AutomatedReviewStatus.RUNNING:
+            if (
+                payload.get("run_id") == view.automated_review_run_id
+                and payload.get("head_sha") == view.automated_review_head_sha
+            ):
+                return
+            raise DomainError("automated review is already assigned")
+        return
+    if event_type is EventType.CODEX_REVIEW_TRIGGERED:
+        if view.automated_review_status is not AutomatedReviewStatus.RUNNING:
+            raise DomainError("Codex trigger requires active review")
+        if payload.get("run_id") != view.automated_review_run_id:
+            raise DomainError("Codex trigger run is stale")
+        return
+    if event_type in {
+        EventType.CODEX_REVIEW_COMPLETED,
+        EventType.CODEX_REVIEW_UNAVAILABLE,
+    }:
+        if view.automated_review_status is not AutomatedReviewStatus.RUNNING:
+            raise DomainError("Codex result requires active review")
+        if payload.get("run_id") != view.automated_review_run_id:
+            raise DomainError("Codex result run is stale")
+        if payload.get("head_sha") != view.automated_review_head_sha:
+            raise DomainError("Codex result head is stale")
+        if event_type is EventType.CODEX_REVIEW_COMPLETED:
+            result = AutomatedReviewStatus(payload["result"])
+            if result not in {
+                AutomatedReviewStatus.PASS,
+                AutomatedReviewStatus.CHANGES_REQUIRED,
+            }:
+                raise DomainError("invalid Codex review result")
+        return
     if event_type is EventType.REVIEW_RECORDED:
         if state is not PublicationState.IN_REVIEW:
             raise DomainError("review requires IN_REVIEW state")
+        if view.automated_review_status is AutomatedReviewStatus.RUNNING:
+            raise DomainError("human review is locked by automated reviewer")
+        if (
+            view.automated_review_mode == "required"
+            and view.automated_review_status is not AutomatedReviewStatus.PASS
+        ):
+            raise DomainError("required Codex review has not passed")
         if payload.get("reviewed_head_sha") != view.remote_head_sha:
             raise DomainError("reviewed head is stale")
         ReviewDecision(payload["decision"])

@@ -24,6 +24,36 @@ class PullRequestSnapshot:
     head_sha: str
 
 
+@dataclass(frozen=True, slots=True)
+class IssueCommentSnapshot:
+    comment_id: int
+    actor: str
+    body: str
+    created_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class PullReviewSnapshot:
+    review_id: int
+    actor: str
+    body: str
+    state: str
+    commit_id: str
+    submitted_at: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class PullReviewCommentSnapshot:
+    comment_id: int
+    review_id: int | None
+    actor: str
+    body: str
+    commit_id: str
+    path: str
+    line: int | None
+    created_at: str
+
+
 class GitHubRepositoryGateway:
     def __init__(
         self,
@@ -218,3 +248,148 @@ class GitHubRepositoryGateway:
         if snapshot.head_sha != expected_head_sha.lower():
             raise GitHubApiError("publication pull request head SHA does not match")
         return snapshot
+
+
+    def add_issue_comment(
+        self,
+        repository: str,
+        issue_number: int,
+        body: str,
+        token: str,
+    ) -> IssueCommentSnapshot:
+        owner, name = self._parts(repository)
+        response = self._request(
+            "POST",
+            f"{self.api_url}/repos/{owner}/{name}/issues/{issue_number}/comments",
+            token=token,
+            json={"body": body},
+        )
+        assert response is not None
+        return self._issue_comment_snapshot(response.json())
+
+    @staticmethod
+    def _issue_comment_snapshot(payload: dict) -> IssueCommentSnapshot:
+        try:
+            return IssueCommentSnapshot(
+                comment_id=int(payload["id"]),
+                actor=str(payload["user"]["login"]),
+                body=str(payload.get("body") or ""),
+                created_at=str(payload["created_at"]),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise GitHubApiError("GitHub issue comment response is invalid") from exc
+
+    def list_issue_comments(
+        self,
+        repository: str,
+        issue_number: int,
+        token: str,
+    ) -> list[IssueCommentSnapshot]:
+        owner, name = self._parts(repository)
+        response = self._request(
+            "GET",
+            f"{self.api_url}/repos/{owner}/{name}/issues/{issue_number}/comments",
+            token=token,
+            params={"per_page": "100"},
+        )
+        assert response is not None
+        payload = response.json()
+        if not isinstance(payload, list):
+            raise GitHubApiError("GitHub issue comments response is invalid")
+        return [self._issue_comment_snapshot(item) for item in payload]
+
+    @staticmethod
+    def _pull_review_snapshot(payload: dict) -> PullReviewSnapshot:
+        try:
+            commit_id = str(payload.get("commit_id") or "").lower()
+            if commit_id and (
+                len(commit_id) != 40
+                or any(c not in "0123456789abcdef" for c in commit_id)
+            ):
+                raise ValueError("invalid commit id")
+            return PullReviewSnapshot(
+                review_id=int(payload["id"]),
+                actor=str(payload["user"]["login"]),
+                body=str(payload.get("body") or ""),
+                state=str(payload.get("state") or ""),
+                commit_id=commit_id,
+                submitted_at=(
+                    str(payload["submitted_at"])
+                    if payload.get("submitted_at") is not None
+                    else None
+                ),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise GitHubApiError("GitHub pull review response is invalid") from exc
+
+    def list_pull_reviews(
+        self,
+        repository: str,
+        pull_number: int,
+        token: str,
+    ) -> list[PullReviewSnapshot]:
+        owner, name = self._parts(repository)
+        response = self._request(
+            "GET",
+            f"{self.api_url}/repos/{owner}/{name}/pulls/{pull_number}/reviews",
+            token=token,
+            params={"per_page": "100"},
+        )
+        assert response is not None
+        payload = response.json()
+        if not isinstance(payload, list):
+            raise GitHubApiError("GitHub pull reviews response is invalid")
+        return [self._pull_review_snapshot(item) for item in payload]
+
+    @staticmethod
+    def _pull_review_comment_snapshot(payload: dict) -> PullReviewCommentSnapshot:
+        try:
+            commit_id = str(payload.get("commit_id") or "").lower()
+            if commit_id and (
+                len(commit_id) != 40
+                or any(c not in "0123456789abcdef" for c in commit_id)
+            ):
+                raise ValueError("invalid commit id")
+            return PullReviewCommentSnapshot(
+                comment_id=int(payload["id"]),
+                review_id=(
+                    int(payload["pull_request_review_id"])
+                    if payload.get("pull_request_review_id") is not None
+                    else None
+                ),
+                actor=str(payload["user"]["login"]),
+                body=str(payload.get("body") or ""),
+                commit_id=commit_id,
+                path=str(payload.get("path") or ""),
+                line=(
+                    int(payload["line"])
+                    if payload.get("line") is not None
+                    else None
+                ),
+                created_at=str(payload["created_at"]),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise GitHubApiError(
+                "GitHub pull review comment response is invalid"
+            ) from exc
+
+    def list_pull_review_comments(
+        self,
+        repository: str,
+        pull_number: int,
+        token: str,
+    ) -> list[PullReviewCommentSnapshot]:
+        owner, name = self._parts(repository)
+        response = self._request(
+            "GET",
+            f"{self.api_url}/repos/{owner}/{name}/pulls/{pull_number}/comments",
+            token=token,
+            params={"per_page": "100"},
+        )
+        assert response is not None
+        payload = response.json()
+        if not isinstance(payload, list):
+            raise GitHubApiError(
+                "GitHub pull review comments response is invalid"
+            )
+        return [self._pull_review_comment_snapshot(item) for item in payload]

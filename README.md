@@ -116,3 +116,28 @@ CONTROL_PLANE_GITHUB_APP_PRIVATE_KEY_PATH=C:\absolute\secure\path\app.pem
 ```
 
 The default remains `CONTROL_PLANE_PUBLISHER_MODE=disabled`.
+
+
+## Native Codex Code Review broker
+
+Issue #10 governs native Codex Code Review as a pre-review gate.
+
+The Control Plane owns the invocation. API clients cannot provide review text or
+reserved `@codex` mentions. For an exact published head the broker acquires an
+append-only review lock and emits `@codex review` itself through the
+repository-scoped GitHub App token.
+
+Configuration:
+
+```env
+CONTROL_PLANE_CODEX_REVIEW_MODE=disabled
+CONTROL_PLANE_CODEX_REVIEW_ACTORS=
+```
+
+Modes are `disabled`, `advisory`, and `required`. In `required` mode a
+human approval cannot be recorded until the exact-head native Codex review has
+completed with PASS. While Codex is RUNNING, human review is locked.
+
+Result ingestion initially reconciles GitHub pull-request reviews and inline
+review comments. Only configured Codex actor identities and the exact published
+commit are accepted.
