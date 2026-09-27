@@ -79,7 +79,7 @@ class CodexReviewBroker:
     def _review_access(self, repository: str, *, write: bool):
         permissions = {
             "issues": "write" if write else "read",
-            "pull_requests": "read",
+            "pull_requests": "write" if write else "read",
         }
         return self.token_provider.installation_access(
             repository,

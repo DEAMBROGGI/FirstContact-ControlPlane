@@ -164,7 +164,7 @@ def test_broker_acquires_exact_head_lock_and_trigger_is_idempotent(session):
     assert github.posted_bodies[0].startswith("@codex review\n\n<!--")
     assert tokens.requests[0][1] == {
         "issues": "write",
-        "pull_requests": "read",
+        "pull_requests": "write",
     }
 
     second = value.request(session, view.publication_id)
