@@ -3,6 +3,7 @@ import pytest
 from control_plane.domain import DomainError, PublicationState, ReviewDecision, ValidationStatus
 from control_plane.models import EventRow
 from control_plane.profile_registry import profile_for_repository
+from control_plane.quarantine import VerifiedCandidateSource
 from control_plane.service import (
     create_publication,
     get_view,
@@ -10,7 +11,7 @@ from control_plane.service import (
     record_mergeability,
     record_review,
     record_validation,
-    submit_candidate,
+    submit_verified_candidate,
 )
 
 BASE = "1" * 40
@@ -18,9 +19,26 @@ HEAD = "2" * 40
 TREE = "3" * 40
 
 
+def source(
+    *,
+    digest: str = "a" * 64,
+    base: str = BASE,
+    head: str = HEAD,
+    tree: str = TREE,
+) -> VerifiedCandidateSource:
+    return VerifiedCandidateSource(
+        bundle_sha256=digest,
+        byte_length=1234,
+        quarantine_id=digest,
+        base_sha=base,
+        head_sha=head,
+        tree_sha=tree,
+    )
+
+
 def admitted_publication(session, repository="DEAMBROGGI/FirstContact"):
     view = create_publication(session, repository, 42)
-    view = submit_candidate(session, view.publication_id, base_sha=BASE, head_sha=HEAD, tree_sha=TREE)
+    view = submit_verified_candidate(session, view.publication_id, source())
     profile = profile_for_repository(repository)
     for index, job in enumerate(profile.required_jobs):
         view = record_validation(
@@ -41,7 +59,7 @@ def test_all_required_jobs_admit_exact_candidate(session):
 
 def test_failed_required_job_returns_ready_projection(session):
     view = create_publication(session, "DEAMBROGGI/FirstContact", 43)
-    view = submit_candidate(session, view.publication_id, base_sha=BASE, head_sha=HEAD, tree_sha=TREE)
+    view = submit_verified_candidate(session, view.publication_id, source())
     view = record_validation(
         session,
         view.publication_id,
@@ -55,8 +73,8 @@ def test_failed_required_job_returns_ready_projection(session):
 
 def test_same_candidate_submission_is_idempotent(session):
     view = create_publication(session, "DEAMBROGGI/FirstContact", 44)
-    first = submit_candidate(session, view.publication_id, base_sha=BASE, head_sha=HEAD, tree_sha=TREE)
-    second = submit_candidate(session, view.publication_id, base_sha=BASE, head_sha=HEAD, tree_sha=TREE)
+    first = submit_verified_candidate(session, view.publication_id, source())
+    second = submit_verified_candidate(session, view.publication_id, source())
     assert first.current_candidate == second.current_candidate
 def test_review_is_exact_remote_head_bound(session):
     view = admitted_publication(session)
@@ -91,10 +109,24 @@ def test_hash_chain_tamper_fails_closed(session):
 def test_new_candidate_only_after_rework_state(session):
     view = admitted_publication(session)
     with pytest.raises(DomainError, match="cannot be submitted"):
-        submit_candidate(
+        submit_verified_candidate(
             session,
             view.publication_id,
-            base_sha=HEAD,
-            head_sha="5" * 40,
-            tree_sha="6" * 40,
+            source(
+                digest="b" * 64,
+                base=HEAD,
+                head="5" * 40,
+                tree="6" * 40,
+            ),
+        )
+
+
+def test_same_candidate_with_different_bundle_is_conflict(session):
+    view = create_publication(session, "DEAMBROGGI/FirstContact", 46)
+    submit_verified_candidate(session, view.publication_id, source(digest="a" * 64))
+    with pytest.raises(DomainError, match="immutable candidate source conflict"):
+        submit_verified_candidate(
+            session,
+            view.publication_id,
+            source(digest="b" * 64),
         )

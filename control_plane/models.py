@@ -35,6 +35,26 @@ class CandidateRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
 
 
+class CandidateSourceRow(Base):
+    __tablename__ = "candidate_sources"
+
+    candidate_id: Mapped[str] = mapped_column(
+        ForeignKey("candidates.id"),
+        primary_key=True,
+    )
+    bundle_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    byte_length: Mapped[int] = mapped_column(Integer, nullable=False)
+    quarantine_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    base_sha: Mapped[str] = mapped_column(String(40), nullable=False)
+    head_sha: Mapped[str] = mapped_column(String(40), nullable=False)
+    tree_sha: Mapped[str] = mapped_column(String(40), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utcnow,
+        nullable=False,
+    )
+
+
 class EventRow(Base):
     __tablename__ = "publication_events"
     __table_args__ = (UniqueConstraint("publication_id", "sequence", name="uq_publication_event_sequence"),)
