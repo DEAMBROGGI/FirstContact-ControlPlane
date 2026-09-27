@@ -109,3 +109,46 @@ def test_pull_request_readback_mismatch_fails_closed():
             issue_number=6,
             token="installation-token",
         )
+
+
+def test_review_comment_listing_exhausts_github_pagination():
+    def payload(comment_id):
+        return {
+            "id": comment_id,
+            "pull_request_review_id": 77,
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "body": f"finding-{comment_id}",
+            "commit_id": HEAD,
+            "path": "control_plane/example.py",
+            "line": comment_id,
+            "created_at": "2026-09-27T21:00:00Z",
+        }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        page = request.url.params.get("page")
+        if page == "2":
+            return httpx.Response(200, json=[payload(2)])
+        return httpx.Response(
+            200,
+            json=[payload(1)],
+            headers={
+                "Link": (
+                    '<https://api.github.test/repos/DEAMBROGGI/'
+                    'FirstContact/pulls/12/comments?per_page=100&page=2>; '
+                    'rel="next"'
+                )
+            },
+        )
+
+    gateway = GitHubRepositoryGateway(
+        api_url="https://api.github.test",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    comments = gateway.list_pull_review_comments(
+        "DEAMBROGGI/FirstContact",
+        12,
+        "installation-token",
+    )
+
+    assert [item.comment_id for item in comments] == [1, 2]

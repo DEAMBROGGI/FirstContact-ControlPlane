@@ -122,22 +122,52 @@ The default remains `CONTROL_PLANE_PUBLISHER_MODE=disabled`.
 
 Issue #10 governs native Codex Code Review as a pre-review gate.
 
-The Control Plane owns the invocation. API clients cannot provide review text or
-reserved `@codex` mentions. For an exact published head the broker acquires an
-append-only review lock and emits `@codex review` itself through the
-repository-scoped GitHub App token.
+The Control Plane owns the governed invocation. API clients cannot provide
+review text or reserved `@codex` mentions. For an exact published head the
+broker acquires a persistent dispatch lease before it emits `@codex review`.
+
+Live characterization established two separate GitHub identities:
+
+- repository publication uses a repository-scoped GitHub App installation token;
+- native Codex invocation must be user-attributed. GitHub App bot-authored
+  `@codex review` comments are ignored by Codex, while a user-attributed
+  trigger is accepted.
+
+The Codex trigger therefore uses a dedicated GitHub App user credential obtained
+through Device Flow. It is stored outside the repository and is used only to
+create the governed trigger comment. No PAT is part of the review path. The
+review App must not have `Contents: write`.
 
 Configuration:
 
 ```env
 CONTROL_PLANE_CODEX_REVIEW_MODE=disabled
-CONTROL_PLANE_CODEX_REVIEW_ACTORS=
+CONTROL_PLANE_CODEX_REVIEW_ACTORS=chatgpt-codex-connector[bot]
+CONTROL_PLANE_CODEX_REVIEW_GITHUB_CLIENT_ID=
+CONTROL_PLANE_CODEX_REVIEW_USER_TOKEN_PATH=
+CONTROL_PLANE_CODEX_REVIEW_TRIGGER_LOGIN=
 ```
 
 Modes are `disabled`, `advisory`, and `required`. In `required` mode a
-human approval cannot be recorded until the exact-head native Codex review has
-completed with PASS. While Codex is RUNNING, human review is locked.
+human APPROVED decision cannot be recorded until the exact-head native Codex
+review has completed with PASS. A human may still record CHANGES_REQUIRED.
+While Codex is RUNNING, human review is locked. Advisory findings are recorded
+without moving the publication out of IN_REVIEW.
 
-Result ingestion initially reconciles GitHub pull-request reviews and inline
-review comments. Only configured Codex actor identities and the exact published
-commit are accepted.
+The broker accepts only evidence bound to the governed trigger and exact head.
+It rejects unmanaged `@codex` invocations, stale/foreign actors and ambiguous
+review evidence. GitHub pagination is exhausted before deciding PASS.
+
+Native completion is recognized in either form observed/documented by Codex:
+
+- a Codex pull-request review, with inline comments normalized as findings;
+- a Codex thumbs-up reaction on the governed trigger when there are no findings.
+
+The observed native actor for this repository is
+`chatgpt-codex-connector[bot]`. It remains an explicit allowlist value rather
+than a hard-coded trust assumption.
+
+Delivery profiles are immutable historical contracts. A candidate continues to
+validate against its pinned profile id/version/digest even after a newer profile
+becomes active. Admission-critical jobs in schema-v2 profiles are additionally
+bound to versioned JobDefinitions and their digests.

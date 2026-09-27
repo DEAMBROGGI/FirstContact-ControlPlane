@@ -1,0 +1,12 @@
+{
+  "repository": "DEAMBROGGI/FirstContact-ControlPlane",
+  "profile_id": "controlplane/default",
+  "version": 1,
+  "required_jobs": [
+    "python-tests",
+    "publisher-security",
+    "ui-build",
+    "compose-config",
+    "repository-integrity"
+  ]
+}

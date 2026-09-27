@@ -1,8 +1,11 @@
+import uuid
+
 import pytest
 
-from control_plane.domain import DomainError, PublicationState, ReviewDecision, ValidationStatus
-from control_plane.models import EventRow
-from control_plane.profile_registry import profile_for_repository
+from control_plane.domain import DomainError, EventType, PublicationState, ReviewDecision, ValidationStatus
+from control_plane.models import CandidateRow, CandidateSourceRow, EventRow
+from control_plane.profile_registry import all_profiles, profile_for_repository
+from control_plane.repository import append_event, load_events
 from control_plane.quarantine import VerifiedCandidateSource
 from control_plane.service import (
     create_publication,
@@ -130,3 +133,126 @@ def test_same_candidate_with_different_bundle_is_conflict(session):
             view.publication_id,
             source(digest="b" * 64),
         )
+
+
+def test_inflight_candidate_keeps_historical_profile_contract(session):
+    repository = "DEAMBROGGI/FirstContact-ControlPlane"
+    v1 = next(
+        profile
+        for profile in all_profiles()
+        if profile.repository == repository and profile.version == 1
+    )
+    assert profile_for_repository(repository).version > v1.version
+
+    view = create_publication(session, repository, 47)
+    candidate_id = str(uuid.uuid4())
+    session.add(
+        CandidateRow(
+            id=candidate_id,
+            publication_id=view.publication_id,
+            base_sha=BASE,
+            head_sha=HEAD,
+            tree_sha=TREE,
+            profile_id=v1.profile_id,
+            profile_version=v1.version,
+            profile_digest=v1.digest,
+        )
+    )
+    session.add(
+        CandidateSourceRow(
+            candidate_id=candidate_id,
+            bundle_sha256="a" * 64,
+            byte_length=1234,
+            quarantine_id="a" * 64,
+            base_sha=BASE,
+            head_sha=HEAD,
+            tree_sha=TREE,
+        )
+    )
+    append_event(
+        session,
+        view.publication_id,
+        EventType.CANDIDATE_SUBMITTED,
+        {
+            "candidate_id": candidate_id,
+            "base_sha": BASE,
+            "head_sha": HEAD,
+            "tree_sha": TREE,
+            "profile_id": v1.profile_id,
+            "profile_version": v1.version,
+            "profile_digest": v1.digest,
+            "source": {
+                "bundle_sha256": "a" * 64,
+                "byte_length": 1234,
+                "quarantine_id": "a" * 64,
+                "base_sha": BASE,
+                "head_sha": HEAD,
+                "tree_sha": TREE,
+            },
+        },
+    )
+    session.commit()
+
+    current = get_view(session, view.publication_id)
+    assert current.current_candidate.profile_version == 1
+
+    for index, job in enumerate(v1.required_jobs, 1):
+        current = record_validation(
+            session,
+            view.publication_id,
+            job_id=job,
+            status=ValidationStatus.PASS,
+            evidence_sha256=f"{index:064x}",
+        )
+
+    assert current.state is PublicationState.ADMITTED
+    assert current.current_candidate.profile_version == 1
+    admitted = [
+        event
+        for event in load_events(session, view.publication_id)
+        if event["event_type"] == "CANDIDATE_ADMITTED"
+    ]
+    assert admitted[-1]["payload"]["profile_version"] == 1
+    assert admitted[-1]["payload"]["profile_digest"] == v1.digest
+
+
+def test_active_validation_records_versioned_job_definition(session):
+    repository = "DEAMBROGGI/FirstContact-ControlPlane"
+    profile = profile_for_repository(repository)
+    assert profile.version == 3
+    definition = profile.definition_for("codex-review-broker")
+    assert definition is not None
+    assert definition.version == 1
+    assert len(definition.digest) == 64
+
+    view = create_publication(session, repository, 48)
+    view = submit_verified_candidate(session, view.publication_id, source())
+    record_validation(
+        session,
+        view.publication_id,
+        job_id="codex-review-broker",
+        status=ValidationStatus.PASS,
+        evidence_sha256="f" * 64,
+    )
+    event = next(
+        item
+        for item in reversed(load_events(session, view.publication_id))
+        if item["event_type"] == "VALIDATION_RECORDED"
+    )
+    recorded = event["payload"]["job_definition"]
+    assert recorded["job_id"] == "codex-review-broker"
+    assert recorded["version"] == 1
+    assert recorded["digest"] == definition.digest
+    assert recorded["implementation"] == "controlplane.pytest"
+
+
+def test_historical_control_plane_profile_versions_remain_resolvable():
+    profiles = [
+        profile
+        for profile in all_profiles()
+        if profile.repository == "DEAMBROGGI/FirstContact-ControlPlane"
+    ]
+    assert [profile.version for profile in profiles] == [1, 2, 3]
+    assert profiles[0].schema_version == 1
+    assert profiles[1].schema_version == 1
+    assert profiles[2].schema_version == 2

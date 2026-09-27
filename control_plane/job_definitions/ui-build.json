@@ -1,0 +1,10 @@
+{
+  "job_id": "ui-build",
+  "version": 1,
+  "implementation": "controlplane.npm-build",
+  "parameters": {
+    "working_directory": "ui",
+    "script": "build"
+  },
+  "result_schema": "evidence-log/v1"
+}

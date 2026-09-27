@@ -17,6 +17,9 @@ class Settings(BaseSettings):
     github_app_id: str = ""
     github_app_private_key_path: str = ""
     github_api_url: str = "https://api.github.com"
+    codex_review_github_client_id: str = ""
+    codex_review_user_token_path: str = ""
+    codex_review_trigger_login: str = ""
     codex_review_mode: str = "disabled"
     codex_review_actors: str = ""
 

@@ -87,6 +87,8 @@ class PublicationView:
     automated_review_status: AutomatedReviewStatus | None
     automated_review_head_sha: str | None
     automated_review_trigger_comment_id: int | None
+    automated_review_trigger_actor: str | None
+    automated_review_triggered_at: str | None
     automated_review_mode: str | None
     automated_review_findings_count: int
     review_decision: ReviewDecision | None
@@ -137,6 +139,8 @@ def fold_events(
     automated_review_status: AutomatedReviewStatus | None = None
     automated_review_head_sha: str | None = None
     automated_review_trigger_comment_id: int | None = None
+    automated_review_trigger_actor: str | None = None
+    automated_review_triggered_at: str | None = None
     automated_review_mode: str | None = None
     automated_review_findings_count = 0
     review_decision: ReviewDecision | None = None
@@ -157,6 +161,8 @@ def fold_events(
             automated_review_status = None
             automated_review_head_sha = None
             automated_review_trigger_comment_id = None
+            automated_review_trigger_actor = None
+            automated_review_triggered_at = None
             automated_review_mode = None
             automated_review_findings_count = 0
             review_decision = None
@@ -187,6 +193,8 @@ def fold_events(
             automated_review_status = None
             automated_review_head_sha = None
             automated_review_trigger_comment_id = None
+            automated_review_trigger_actor = None
+            automated_review_triggered_at = None
             automated_review_mode = None
             automated_review_findings_count = 0
             state = PublicationState.IN_REVIEW
@@ -197,14 +205,21 @@ def fold_events(
             automated_review_head_sha = str(payload["head_sha"])
             automated_review_mode = str(payload["mode"])
             automated_review_trigger_comment_id = None
+            automated_review_trigger_actor = None
+            automated_review_triggered_at = None
             automated_review_findings_count = 0
         elif event_type is EventType.CODEX_REVIEW_TRIGGERED:
             automated_review_trigger_comment_id = int(payload["comment_id"])
+            automated_review_trigger_actor = str(payload["actor"])
+            automated_review_triggered_at = str(payload["created_at"])
         elif event_type is EventType.CODEX_REVIEW_COMPLETED:
             automated_review_status = AutomatedReviewStatus(payload["result"])
             automated_review_findings_count = int(payload.get("findings_count", 0))
             automated_reviewer = None
-            if automated_review_status is AutomatedReviewStatus.CHANGES_REQUIRED:
+            if (
+                automated_review_status is AutomatedReviewStatus.CHANGES_REQUIRED
+                and automated_review_mode == "required"
+            ):
                 state = PublicationState.CHANGES_REQUIRED
         elif event_type is EventType.CODEX_REVIEW_UNAVAILABLE:
             automated_review_status = AutomatedReviewStatus.UNAVAILABLE
@@ -239,6 +254,8 @@ def fold_events(
         automated_review_status=automated_review_status,
         automated_review_head_sha=automated_review_head_sha,
         automated_review_trigger_comment_id=automated_review_trigger_comment_id,
+        automated_review_trigger_actor=automated_review_trigger_actor,
+        automated_review_triggered_at=automated_review_triggered_at,
         automated_review_mode=automated_review_mode,
         automated_review_findings_count=automated_review_findings_count,
         review_decision=review_decision,
@@ -318,7 +335,8 @@ def validate_transition(
         if view.automated_review_status is AutomatedReviewStatus.RUNNING:
             raise DomainError("human review is locked by automated reviewer")
         if (
-            view.automated_review_mode == "required"
+            payload.get("decision") == ReviewDecision.APPROVED.value
+            and view.automated_review_mode == "required"
             and view.automated_review_status is not AutomatedReviewStatus.PASS
         ):
             raise DomainError("required Codex review has not passed")

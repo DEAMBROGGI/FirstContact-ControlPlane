@@ -1,0 +1,14 @@
+{
+  "job_id": "repository-integrity",
+  "version": 1,
+  "implementation": "controlplane.repository-integrity",
+  "parameters": {
+    "compile_roots": [
+      "control_plane",
+      "tests"
+    ],
+    "require_clean_tree": true,
+    "diff_check": true
+  },
+  "result_schema": "evidence-log/v1"
+}

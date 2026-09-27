@@ -54,6 +54,14 @@ class PullReviewCommentSnapshot:
     created_at: str
 
 
+@dataclass(frozen=True, slots=True)
+class IssueReactionSnapshot:
+    reaction_id: int
+    actor: str
+    content: str
+    created_at: str
+
+
 class GitHubRepositoryGateway:
     def __init__(
         self,
@@ -119,6 +127,66 @@ class GitHubRepositoryGateway:
                 f"GitHub repository request failed with HTTP {response.status_code}"
             )
         return response
+
+    @staticmethod
+    def _next_link(response: httpx.Response) -> str | None:
+        raw = response.headers.get("Link") or response.headers.get("link")
+        if not raw:
+            return None
+        for part in raw.split(","):
+            segments = [item.strip() for item in part.split(";")]
+            if not segments:
+                continue
+            target = segments[0]
+            relations = {
+                item.split("=", 1)[1].strip().strip('"')
+                for item in segments[1:]
+                if item.startswith("rel=") and "=" in item
+            }
+            if "next" not in relations:
+                continue
+            if not (target.startswith("<") and target.endswith(">")):
+                raise GitHubApiError("GitHub pagination Link target is invalid")
+            return target[1:-1]
+        return None
+
+    def _paginate(
+        self,
+        url: str,
+        *,
+        token: str,
+        params: dict[str, str] | None = None,
+        max_pages: int = 100,
+    ) -> list[dict]:
+        items: list[dict] = []
+        next_url: str | None = url
+        next_params = params
+        pages = 0
+        while next_url is not None:
+            pages += 1
+            if pages > max_pages:
+                raise GitHubApiError("GitHub pagination exceeded safety limit")
+            response = self._request(
+                "GET",
+                next_url,
+                token=token,
+                params=next_params,
+            )
+            assert response is not None
+            payload = response.json()
+            if not isinstance(payload, list):
+                raise GitHubApiError("GitHub paginated response is invalid")
+            items.extend(payload)
+            candidate = self._next_link(response)
+            if candidate is None:
+                next_url = None
+                continue
+            if not candidate.startswith(f"{self.api_url}/"):
+                raise GitHubApiError("GitHub pagination escaped configured API")
+            next_url = candidate
+            next_params = None
+        return items
+
     def repository(self, repository: str, token: str) -> RepositorySnapshot:
         owner, name = self._parts(repository)
         response = self._request(
@@ -286,18 +354,12 @@ class GitHubRepositoryGateway:
         token: str,
     ) -> list[IssueCommentSnapshot]:
         owner, name = self._parts(repository)
-        response = self._request(
-            "GET",
+        payload = self._paginate(
             f"{self.api_url}/repos/{owner}/{name}/issues/{issue_number}/comments",
             token=token,
             params={"per_page": "100"},
         )
-        assert response is not None
-        payload = response.json()
-        if not isinstance(payload, list):
-            raise GitHubApiError("GitHub issue comments response is invalid")
         return [self._issue_comment_snapshot(item) for item in payload]
-
     @staticmethod
     def _pull_review_snapshot(payload: dict) -> PullReviewSnapshot:
         try:
@@ -329,18 +391,12 @@ class GitHubRepositoryGateway:
         token: str,
     ) -> list[PullReviewSnapshot]:
         owner, name = self._parts(repository)
-        response = self._request(
-            "GET",
+        payload = self._paginate(
             f"{self.api_url}/repos/{owner}/{name}/pulls/{pull_number}/reviews",
             token=token,
             params={"per_page": "100"},
         )
-        assert response is not None
-        payload = response.json()
-        if not isinstance(payload, list):
-            raise GitHubApiError("GitHub pull reviews response is invalid")
         return [self._pull_review_snapshot(item) for item in payload]
-
     @staticmethod
     def _pull_review_comment_snapshot(payload: dict) -> PullReviewCommentSnapshot:
         try:
@@ -380,16 +436,35 @@ class GitHubRepositoryGateway:
         token: str,
     ) -> list[PullReviewCommentSnapshot]:
         owner, name = self._parts(repository)
-        response = self._request(
-            "GET",
+        payload = self._paginate(
             f"{self.api_url}/repos/{owner}/{name}/pulls/{pull_number}/comments",
             token=token,
             params={"per_page": "100"},
         )
-        assert response is not None
-        payload = response.json()
-        if not isinstance(payload, list):
-            raise GitHubApiError(
-                "GitHub pull review comments response is invalid"
-            )
         return [self._pull_review_comment_snapshot(item) for item in payload]
+
+    @staticmethod
+    def _issue_reaction_snapshot(payload: dict) -> IssueReactionSnapshot:
+        try:
+            return IssueReactionSnapshot(
+                reaction_id=int(payload["id"]),
+                actor=str(payload["user"]["login"]),
+                content=str(payload["content"]),
+                created_at=str(payload["created_at"]),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise GitHubApiError("GitHub issue reaction response is invalid") from exc
+
+    def list_issue_comment_reactions(
+        self,
+        repository: str,
+        comment_id: int,
+        token: str,
+    ) -> list[IssueReactionSnapshot]:
+        owner, name = self._parts(repository)
+        payload = self._paginate(
+            f"{self.api_url}/repos/{owner}/{name}/issues/comments/{comment_id}/reactions",
+            token=token,
+            params={"per_page": "100"},
+        )
+        return [self._issue_reaction_snapshot(item) for item in payload]

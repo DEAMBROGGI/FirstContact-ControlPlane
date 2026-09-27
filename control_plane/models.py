@@ -55,6 +55,33 @@ class CandidateSourceRow(Base):
     )
 
 
+class CodexReviewDispatchRow(Base):
+    __tablename__ = "codex_review_dispatches"
+
+    run_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    publication_id: Mapped[str] = mapped_column(
+        ForeignKey("publications.id"),
+        nullable=False,
+        index=True,
+    )
+    state: Mapped[str] = mapped_column(String(24), nullable=False)
+    lease_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    completed_comment_id: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utcnow,
+        onupdate=utcnow,
+        nullable=False,
+    )
+
+
 class EventRow(Base):
     __tablename__ = "publication_events"
     __table_args__ = (UniqueConstraint("publication_id", "sequence", name="uq_publication_event_sequence"),)
