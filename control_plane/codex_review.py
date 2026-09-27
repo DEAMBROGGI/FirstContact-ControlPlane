@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 
-from .domain import AutomatedReviewStatus, DomainError, PublicationState
+from .domain import AutomatedReviewStatus, DomainError, EventType, PublicationState
 from .github_api import (
     GitHubApiError,
     GitHubRepositoryGateway,
@@ -15,6 +15,7 @@ from .github_api import (
 )
 from .github_app import GitHubAppTokenProvider, GitHubAuthError
 from .github_user_auth import GitHubUserAccessProvider, GitHubUserAuthError
+from .repository import load_events
 from .service import (
     claim_codex_review_trigger_dispatch,
     complete_codex_review,
@@ -111,6 +112,21 @@ class CodexReviewBroker:
         )
 
     @staticmethod
+    def _published_at(session: Session, publication_id: str, head_sha: str) -> datetime:
+        matches = [
+            event
+            for event in load_events(session, publication_id)
+            if event["event_type"] == EventType.REMOTE_PUBLISHED.value
+            and event["payload"].get("head_sha") == head_sha
+        ]
+        if not matches:
+            raise CodexReviewError("published head has no publication event")
+        observed = _parse_time(matches[-1].get("occurred_at"))
+        if observed is None:
+            raise CodexReviewError("published head timestamp is missing")
+        return observed
+
+    @staticmethod
     def _verify_exact_pr(view, pull) -> None:
         if view.pull_request_number is None:
             raise CodexReviewError("publication has no pull request")
@@ -171,6 +187,11 @@ class CodexReviewBroker:
             if not acquired:
                 return get_view(session, publication_id)
 
+            published_at = self._published_at(
+                session,
+                publication_id,
+                locked.remote_head_sha or "",
+            )
             issue_comments = self.github.list_issue_comments(
                 locked.repository,
                 locked.pull_request_number or 0,
@@ -181,6 +202,7 @@ class CodexReviewBroker:
                 for item in issue_comments
                 if _RESERVED_CODEX_MENTION.search(item.body or "")
                 and marker not in item.body
+                and (_parse_time(item.created_at) or published_at) >= published_at
             ]
             if foreign_invocations:
                 raise CodexReviewError(

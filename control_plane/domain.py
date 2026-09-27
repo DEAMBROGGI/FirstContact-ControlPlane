@@ -210,8 +210,16 @@ def fold_events(
             automated_review_findings_count = 0
         elif event_type is EventType.CODEX_REVIEW_TRIGGERED:
             automated_review_trigger_comment_id = int(payload["comment_id"])
-            automated_review_trigger_actor = str(payload["actor"])
-            automated_review_triggered_at = str(payload["created_at"])
+            automated_review_trigger_actor = (
+                str(payload["actor"])
+                if payload.get("actor") is not None
+                else None
+            )
+            automated_review_triggered_at = (
+                str(payload["created_at"])
+                if payload.get("created_at") is not None
+                else None
+            )
         elif event_type is EventType.CODEX_REVIEW_COMPLETED:
             automated_review_status = AutomatedReviewStatus(payload["result"])
             automated_review_findings_count = int(payload.get("findings_count", 0))

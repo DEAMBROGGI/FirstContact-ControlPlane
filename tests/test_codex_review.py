@@ -456,14 +456,22 @@ def test_disabled_mode_never_invokes_github(session):
 
 
 def test_preexisting_unmanaged_codex_invocation_blocks_governed_trigger(session):
+    from control_plane.repository import load_events
+
     view = published_publication(session)
+    published = next(
+        event
+        for event in reversed(load_events(session, view.publication_id))
+        if event["event_type"] == "REMOTE_PUBLISHED"
+    )
+    published_at = datetime.fromisoformat(published["occurred_at"])
     value, _tokens, github = broker()
     github.issue_comments.append(
         IssueCommentSnapshot(
             comment_id=850,
             actor="DEAMBROGGI",
             body="@codex review",
-            created_at="2026-09-27T19:59:00Z",
+            created_at=(published_at + timedelta(seconds=1)).isoformat(),
         )
     )
 
@@ -501,3 +509,55 @@ def test_retry_after_unavailable_creates_new_codex_attempt(session):
     assert second.automated_review_status is AutomatedReviewStatus.RUNNING
     assert second.automated_review_run_id is not None
     assert second.automated_review_run_id != first_run
+
+
+def test_legacy_codex_trigger_event_remains_foldable():
+    from control_plane.domain import fold_events
+
+    events = [
+        {
+            "event_type": "PUBLICATION_CREATED",
+            "payload": {"repository": "DEAMBROGGI/FirstContact-ControlPlane", "issue_number": 10},
+        },
+        {
+            "event_type": "REMOTE_PUBLISHED",
+            "payload": {"head_sha": HEAD, "pull_request_number": 12},
+        },
+        {
+            "event_type": "CODEX_REVIEW_REQUESTED",
+            "payload": {
+                "run_id": "legacy-run",
+                "head_sha": HEAD,
+                "mode": "required",
+            },
+        },
+        {
+            "event_type": "CODEX_REVIEW_TRIGGERED",
+            "payload": {"run_id": "legacy-run", "comment_id": 5860110112},
+        },
+    ]
+    view = fold_events("legacy-publication", events)
+
+    assert view.automated_review_trigger_comment_id == 5860110112
+    assert view.automated_review_trigger_actor is None
+    assert view.automated_review_triggered_at is None
+
+
+def test_unmanaged_codex_invocation_from_older_head_does_not_poison_retry(session):
+    view = published_publication(session)
+    value, _tokens, github = broker()
+    github.issue_comments.append(
+        IssueCommentSnapshot(
+            comment_id=851,
+            actor="DEAMBROGGI",
+            body="@codex review",
+            created_at="2000-01-01T00:00:00Z",
+        )
+    )
+
+    requested = value.request(session, view.publication_id)
+
+    assert requested.automated_review_status is AutomatedReviewStatus.RUNNING
+    assert requested.automated_review_trigger_comment_id is not None
+    assert requested.automated_review_trigger_comment_id != 851
+    assert len(github.posted_bodies) == 1
