@@ -68,6 +68,9 @@ class PublicationView:
     state: PublicationState
     current_candidate: CandidateIdentity | None
     remote_head_sha: str | None
+    remote_branch: str | None
+    base_branch: str | None
+    pull_request_number: int | None
     review_decision: ReviewDecision | None
     mergeable: bool | None
     projection: LifecycleProjection
@@ -108,6 +111,9 @@ def fold_events(
     state: PublicationState | None = None
     candidate: CandidateIdentity | None = None
     remote_head: str | None = None
+    remote_branch: str | None = None
+    base_branch: str | None = None
+    pull_request_number: int | None = None
     review_decision: ReviewDecision | None = None
     mergeable: bool | None = None
 
@@ -129,6 +135,21 @@ def fold_events(
             state = PublicationState.VALIDATION_FAILED
         elif event_type is EventType.REMOTE_PUBLISHED:
             remote_head = str(payload["head_sha"])
+            remote_branch = (
+                str(payload["branch"])
+                if payload.get("branch") is not None
+                else remote_branch
+            )
+            base_branch = (
+                str(payload["base_branch"])
+                if payload.get("base_branch") is not None
+                else base_branch
+            )
+            pull_request_number = (
+                int(payload["pull_request_number"])
+                if payload.get("pull_request_number") is not None
+                else pull_request_number
+            )
             state = PublicationState.IN_REVIEW
         elif event_type is EventType.REVIEW_RECORDED:
             review_decision = ReviewDecision(payload["decision"])
@@ -152,6 +173,9 @@ def fold_events(
         state=state,
         current_candidate=candidate,
         remote_head_sha=remote_head,
+        remote_branch=remote_branch,
+        base_branch=base_branch,
+        pull_request_number=pull_request_number,
         review_decision=review_decision,
         mergeable=mergeable,
         projection=desired_projection(state),

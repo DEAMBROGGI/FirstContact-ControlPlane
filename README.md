@@ -46,6 +46,7 @@ Initial profile registry:
 
 - `DEAMBROGGI/FirstContact`
 - `DEAMBROGGI/FirstContact-SpecialistAgent`
+- `DEAMBROGGI/FirstContact-ControlPlane` (self-governance/dogfooding)
 
 They are configuration/policy inputs. The core is repository-neutral.
 
@@ -84,3 +85,34 @@ only then creates the Candidate. The legacy caller-declared SHA endpoint is not
 available.
 
 The publisher remains disabled.
+
+
+## GitHub App publisher
+
+Issue #6 adds the exclusive repository publication boundary.
+
+The endpoint is bodyless:
+
+```text
+POST /api/v1/internal/publications/{publicationId}/publish
+```
+
+Repository, exact candidate head, quarantine repository, base branch and target
+branch are derived by the server. A caller cannot provide any of them.
+
+Repository publication uses a GitHub App installation token. The token is
+requested just-in-time for one repository with only `contents:write` and
+`pull_requests:write`, expires at GitHub's installation-token boundary, and is
+never persisted. Git uses an askpass helper so the installation token is not
+present in process arguments.
+
+Local configuration contains only the GitHub App id and an absolute path to a
+PEM stored outside the repository:
+
+```env
+CONTROL_PLANE_PUBLISHER_MODE=github-app
+CONTROL_PLANE_GITHUB_APP_ID=<app-id>
+CONTROL_PLANE_GITHUB_APP_PRIVATE_KEY_PATH=C:\absolute\secure\path\app.pem
+```
+
+The default remains `CONTROL_PLANE_PUBLISHER_MODE=disabled`.

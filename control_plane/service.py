@@ -203,9 +203,25 @@ def record_validation(
     return get_view(session, publication_id)
 
 
-def mark_remote_published(session: Session, publication_id: str, head_sha: str) -> PublicationView:
+def mark_remote_published(
+    session: Session,
+    publication_id: str,
+    head_sha: str,
+    *,
+    branch: str | None = None,
+    base_branch: str | None = None,
+    pull_request_number: int | None = None,
+) -> PublicationView:
     view = get_view(session, publication_id)
-    payload = {"head_sha": _sha(head_sha, "head_sha")}
+    payload: dict[str, Any] = {"head_sha": _sha(head_sha, "head_sha")}
+    if branch is not None:
+        payload["branch"] = branch
+    if base_branch is not None:
+        payload["base_branch"] = base_branch
+    if pull_request_number is not None:
+        if pull_request_number <= 0:
+            raise DomainError("pull_request_number must be positive")
+        payload["pull_request_number"] = pull_request_number
     validate_transition(view, EventType.REMOTE_PUBLISHED, payload)
     append_event(session, publication_id, EventType.REMOTE_PUBLISHED, payload)
     session.commit()

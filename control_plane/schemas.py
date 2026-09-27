@@ -14,10 +14,6 @@ class ValidationResultRequest(BaseModel):
     evidence_sha256: str
 
 
-class PublishedRequest(BaseModel):
-    head_sha: str
-
-
 class ReviewRequest(BaseModel):
     reviewed_head_sha: str
     decision: ReviewDecision

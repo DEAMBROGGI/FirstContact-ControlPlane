@@ -88,9 +88,8 @@ def test_api_creates_verified_candidate_and_keeps_publisher_disabled(
         )
         assert old_endpoint.status_code == 404
         published = client.post(
-            f"/api/v1/internal/publications/{publication_id}/published",
+            f"/api/v1/internal/publications/{publication_id}/publish",
             headers=headers,
-            json={"head_sha": head},
         )
         assert published.status_code == 503
         assert published.json()["detail"] == "publisher is disabled"

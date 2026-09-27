@@ -14,3 +14,5 @@
 - Fail closed on missing, stale, ambiguous or corrupt evidence.
 - PostgreSQL is the production persistence target; tests may use isolated SQLite for domain/API fixtures.
 - Qdrant is not part of authoritative state and must never become required for admission or publication.
+- Repository publication credentials are GitHub App installation tokens only; do not add PAT-based Git push paths.
+- Never persist or log GitHub App PEM contents or installation tokens; token material may exist only in bounded publisher memory/child environment.

@@ -10,13 +10,15 @@ from sqlalchemy.orm import Session
 from .config import settings
 from .db import get_session, init_db
 from .domain import DomainError
+from .github_api import GitHubRepositoryGateway
+from .github_app import GitHubAppTokenProvider
 from .profile_registry import all_profiles
+from .publisher import GitHubPublisher, PublicationError
 from .quarantine import CandidateQuarantineError, GitCandidateQuarantine
 from .repository import load_events
 from .schemas import (
     CreatePublicationRequest,
     MergeabilityRequest,
-    PublishedRequest,
     ReviewRequest,
     ValidationResultRequest,
 )
@@ -24,7 +26,6 @@ from .service import (
     create_publication,
     get_view,
     list_publication_ids,
-    mark_remote_published,
     record_mergeability,
     record_review,
     record_validation,
@@ -55,6 +56,28 @@ def get_quarantine() -> GitCandidateQuarantine:
         settings.quarantine_root,
         max_bundle_bytes=settings.max_candidate_bundle_bytes,
     )
+
+
+def get_publisher(
+    quarantine: GitCandidateQuarantine = Depends(get_quarantine),
+):
+    if settings.publisher_mode != "github-app":
+        raise HTTPException(status_code=503, detail="publisher is disabled")
+    token_provider = GitHubAppTokenProvider(
+        app_id=settings.github_app_id,
+        private_key_path=settings.github_app_private_key_path,
+        api_url=settings.github_api_url,
+    )
+    github = GitHubRepositoryGateway(api_url=settings.github_api_url)
+    try:
+        yield GitHubPublisher(
+            token_provider=token_provider,
+            github=github,
+            quarantine=quarantine,
+        )
+    finally:
+        token_provider.close()
+        github.close()
 
 
 def _payload(view):
@@ -144,16 +167,23 @@ def validation_record(publication_id: str, request: ValidationResultRequest, ses
         raise HTTPException(status_code=404, detail="publication not found") from exc
     except DomainError as exc:
         raise _conflict(exc) from exc
-@app.post("/api/v1/internal/publications/{publication_id}/published", dependencies=[Depends(require_token)])
-def publication_mark_published(publication_id: str, request: PublishedRequest, session: Session = Depends(get_session)):
-    if settings.publisher_mode != "simulated":
-        raise HTTPException(status_code=503, detail="publisher is disabled")
+@app.post(
+    "/api/v1/internal/publications/{publication_id}/publish",
+    dependencies=[Depends(require_token)],
+)
+def publication_publish(
+    publication_id: str,
+    session: Session = Depends(get_session),
+    publisher: GitHubPublisher = Depends(get_publisher),
+):
     try:
-        return _payload(mark_remote_published(session, publication_id, request.head_sha))
+        return _payload(publisher.publish(session, publication_id))
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="publication not found") from exc
     except DomainError as exc:
         raise _conflict(exc) from exc
+    except PublicationError as exc:
+        raise HTTPException(status_code=502, detail="publication failed closed") from exc
 
 
 @app.post("/api/v1/publications/{publication_id}/reviews", dependencies=[Depends(require_token)])
