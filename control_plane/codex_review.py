@@ -14,7 +14,10 @@ from .github_api import (
     PullReviewCommentSnapshot,
 )
 from .github_app import GitHubAppTokenProvider, GitHubAuthError
-from .github_user_auth import GitHubUserAccessProvider, GitHubUserAuthError
+from .github_review_auth import (
+    GitHubReviewAuthError,
+    GitHubReviewTokenProvider,
+)
 from .repository import load_events
 from .service import (
     claim_codex_review_trigger_dispatch,
@@ -76,7 +79,7 @@ class CodexReviewBroker:
         github: GitHubRepositoryGateway,
         mode: str,
         allowed_actors: tuple[str, ...] = (),
-        trigger_user: GitHubUserAccessProvider | None = None,
+        trigger_user: GitHubReviewTokenProvider | None = None,
     ) -> None:
         normalized_mode = mode.strip().lower()
         if normalized_mode not in {"disabled", "advisory", "required"}:
@@ -140,13 +143,30 @@ class CodexReviewBroker:
             raise CodexReviewError("pull request head ref moved")
         if view.base_branch is not None and pull.base_ref != view.base_branch:
             raise CodexReviewError("pull request base moved")
+
+    @staticmethod
+    def _trigger_is_registered(view, head_sha: str) -> bool:
+        if (
+            view.automated_review_status is not AutomatedReviewStatus.RUNNING
+            or view.automated_review_head_sha != head_sha
+            or not view.automated_review_run_id
+            or view.automated_review_trigger_comment_id is None
+            or view.automated_review_trigger_comment_id <= 0
+            or not view.automated_review_trigger_actor
+            or not view.automated_review_trigger_actor.strip()
+            or not view.automated_review_triggered_at
+        ):
+            return False
+        try:
+            return _parse_time(view.automated_review_triggered_at) is not None
+        except CodexReviewError:
+            return False
+
     def request(self, session: Session, publication_id: str):
         if self.mode == "disabled":
             raise DomainError("Codex review broker is disabled")
 
         view = get_view(session, publication_id)
-        if view.state is not PublicationState.IN_REVIEW:
-            raise DomainError("Codex review requires IN_REVIEW state")
         if view.remote_head_sha is None or view.pull_request_number is None:
             raise DomainError("Codex review requires published PR metadata")
 
@@ -161,6 +181,48 @@ class CodexReviewBroker:
             )
             self._verify_exact_pr(view, pull)
 
+            # Re-read after the remote PR/head check so retries make their
+            # decision from the current event fold, not a stale initial view.
+            view = get_view(session, publication_id)
+            if (
+                view.remote_head_sha != pull.head_sha
+                or view.pull_request_number != pull.number
+            ):
+                raise CodexReviewError(
+                    "publication PR/head changed during Codex request"
+                )
+            self._verify_exact_pr(view, pull)
+
+            same_review_head = view.automated_review_head_sha == pull.head_sha
+            if same_review_head and view.automated_review_status in {
+                AutomatedReviewStatus.PASS,
+                AutomatedReviewStatus.CHANGES_REQUIRED,
+            }:
+                return view
+            if same_review_head and view.automated_review_status is AutomatedReviewStatus.RUNNING:
+                if view.automated_review_run_id is None:
+                    raise CodexReviewError(
+                        "active Codex review metadata is incomplete"
+                    )
+                if self._trigger_is_registered(view, pull.head_sha):
+                    return view
+            elif (
+                view.automated_review_status is AutomatedReviewStatus.RUNNING
+                and view.automated_review_head_sha != pull.head_sha
+            ):
+                raise CodexReviewError(
+                    "active Codex review is bound to a different head"
+                )
+
+            if view.state is not PublicationState.IN_REVIEW:
+                raise DomainError("Codex review requires IN_REVIEW state")
+
+            if self.trigger_user is None:
+                raise CodexReviewError(
+                    "Codex trigger user credential is not configured"
+                )
+            trigger_access = self.trigger_user.access()
+
             locked = request_codex_review(
                 session,
                 publication_id,
@@ -171,11 +233,6 @@ class CodexReviewBroker:
             assert locked.automated_review_run_id is not None
             run_id = locked.automated_review_run_id
 
-            if self.trigger_user is None:
-                raise CodexReviewError(
-                    "Codex trigger user credential is not configured"
-                )
-            trigger_access = self.trigger_user.access()
             marker = self._marker(run_id, locked.remote_head_sha or "")
             lease_id = str(uuid.uuid4())
             acquired = claim_codex_review_trigger_dispatch(
@@ -246,7 +303,7 @@ class CodexReviewBroker:
             )
         except (
             GitHubAuthError,
-            GitHubUserAuthError,
+            GitHubReviewAuthError,
             GitHubApiError,
             CodexReviewError,
             DomainError,
@@ -263,6 +320,10 @@ class CodexReviewBroker:
                 latest.automated_review_status is AutomatedReviewStatus.RUNNING
                 and latest.automated_review_run_id is not None
                 and latest.automated_review_head_sha is not None
+                and not self._trigger_is_registered(
+                    latest,
+                    latest.remote_head_sha or "",
+                )
             ):
                 mark_codex_review_unavailable(
                     session,

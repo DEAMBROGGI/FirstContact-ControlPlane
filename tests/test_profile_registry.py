@@ -42,7 +42,7 @@ def test_active_control_plane_profile_pins_versioned_job_definitions():
         "DEAMBROGGI/FirstContact-ControlPlane"
     )
 
-    assert profile.version == 3
+    assert profile.version == 4
     assert profile.schema_version == 2
     assert len(profile.job_definitions) == len(profile.required_jobs)
     assert {
@@ -153,12 +153,12 @@ def test_active_validation_event_records_job_definition_identity(session):
     definition = event["payload"]["job_definition"]
 
     assert definition["job_id"] == "codex-review-broker"
-    assert definition["version"] == 1
+    assert definition["version"] == 2
     assert len(definition["digest"]) == 64
     assert definition["implementation"] == "controlplane.pytest"
 
 
-def test_historical_v2_profile_remains_resolvable_after_v3_activation():
+def test_historical_v2_profile_remains_resolvable_after_v4_activation():
     historical = next(
         item
         for item in all_profiles()
@@ -169,10 +169,38 @@ def test_historical_v2_profile_remains_resolvable_after_v3_activation():
 
     assert historical.version == 2
     assert historical.schema_version == 1
-    assert active.version == 3
+    assert active.version == 4
     assert profile_for_identity(
         historical.repository,
         historical.profile_id,
         historical.version,
         historical.digest,
     ) == historical
+
+
+def test_previous_codex_profile_keeps_its_pinned_job_definition():
+    historical = next(
+        item
+        for item in all_profiles()
+        if item.repository == "DEAMBROGGI/FirstContact-ControlPlane"
+        and item.version == 3
+    )
+    definition = historical.definition_for("codex-review-broker")
+
+    assert definition is not None
+    assert definition.version == 1
+    assert profile_for_identity(
+        historical.repository,
+        historical.profile_id,
+        historical.version,
+        historical.digest,
+    ) == historical
+
+
+def test_active_codex_profile_uses_new_job_definition_version():
+    active = profile_for_repository("DEAMBROGGI/FirstContact-ControlPlane")
+    definition = active.definition_for("codex-review-broker")
+
+    assert active.version == 4
+    assert definition is not None
+    assert definition.version == 2

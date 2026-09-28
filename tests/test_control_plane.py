@@ -219,10 +219,10 @@ def test_inflight_candidate_keeps_historical_profile_contract(session):
 def test_active_validation_records_versioned_job_definition(session):
     repository = "DEAMBROGGI/FirstContact-ControlPlane"
     profile = profile_for_repository(repository)
-    assert profile.version == 3
+    assert profile.version == 4
     definition = profile.definition_for("codex-review-broker")
     assert definition is not None
-    assert definition.version == 1
+    assert definition.version == 2
     assert len(definition.digest) == 64
 
     view = create_publication(session, repository, 48)
@@ -241,18 +241,19 @@ def test_active_validation_records_versioned_job_definition(session):
     )
     recorded = event["payload"]["job_definition"]
     assert recorded["job_id"] == "codex-review-broker"
-    assert recorded["version"] == 1
+    assert recorded["version"] == 2
     assert recorded["digest"] == definition.digest
     assert recorded["implementation"] == "controlplane.pytest"
 
 
-def test_historical_control_plane_profile_versions_remain_resolvable():
+def test_control_plane_profile_versions_remain_resolvable():
     profiles = [
         profile
         for profile in all_profiles()
         if profile.repository == "DEAMBROGGI/FirstContact-ControlPlane"
     ]
-    assert [profile.version for profile in profiles] == [1, 2, 3]
+    assert [profile.version for profile in profiles] == [1, 2, 3, 4]
     assert profiles[0].schema_version == 1
     assert profiles[1].schema_version == 1
     assert profiles[2].schema_version == 2
+    assert profiles[3].schema_version == 2

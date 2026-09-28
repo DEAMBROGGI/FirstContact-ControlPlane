@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from pydantic import SecretStr
 
 from control_plane.codex_review import (
     CodexReviewBroker,
@@ -24,9 +26,12 @@ from control_plane.github_api import (
     PullReviewSnapshot,
 )
 from control_plane.github_app import InstallationAccess
-from control_plane.github_user_auth import UserAccess
+from control_plane.github_review_auth import (
+    GitHubReviewTokenProvider,
+)
 from control_plane.profile_registry import profile_for_repository
 from control_plane.quarantine import VerifiedCandidateSource
+from control_plane.repository import load_events
 from control_plane.service import (
     claim_codex_review_trigger_dispatch,
     create_publication,
@@ -93,15 +98,6 @@ class FakeTokenProvider:
         )
 
 
-class FakeTriggerUser:
-    def access(self):
-        return UserAccess(
-            token="human-review-token",
-            login="DEAMBROGGI",
-            expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
-        )
-
-
 class FakeGitHub:
     def __init__(self):
         self.head_sha = HEAD
@@ -110,8 +106,19 @@ class FakeGitHub:
         self.review_comments = []
         self.reactions = []
         self.posted_bodies = []
+        self.trigger_actor = "DEAMBROGGI"
+        self.authenticated_login = "DEAMBROGGI"
+        self.authenticated_user_requests = 0
+        self.pull_request_requests = 0
+        self.issue_comment_list_requests = 0
+
+    def authenticated_user_login(self, token):
+        self.authenticated_user_requests += 1
+        assert token == "github_pat_human-review-token"
+        return self.authenticated_login
 
     def pull_request(self, repository, number, token):
+        self.pull_request_requests += 1
         assert repository == "DEAMBROGGI/FirstContact"
         assert number == 44
         assert token == "review-token"
@@ -124,15 +131,16 @@ class FakeGitHub:
         )
 
     def list_issue_comments(self, repository, number, token):
+        self.issue_comment_list_requests += 1
         assert token == "review-token"
         return list(self.issue_comments)
 
     def add_issue_comment(self, repository, number, body, token):
-        assert token == "human-review-token"
+        assert token == "github_pat_human-review-token"
         self.posted_bodies.append(body)
         item = IssueCommentSnapshot(
             comment_id=900 + len(self.issue_comments),
-            actor="DEAMBROGGI",
+            actor=self.trigger_actor,
             body=body,
             created_at=TRIGGER_AT,
         )
@@ -152,17 +160,36 @@ class FakeGitHub:
         return list(self.reactions)
 
 
-def broker(*, github=None, mode="required", actors=("chatgpt-codex-connector",)):
+def broker(
+    *,
+    github=None,
+    mode="required",
+    actors=("chatgpt-codex-connector",),
+    trigger_token="github_pat_human-review-token",
+):
     token_provider = FakeTokenProvider()
     github = github or FakeGitHub()
+    trigger_user = GitHubReviewTokenProvider(
+        token=SecretStr(trigger_token),
+        expected_login="DEAMBROGGI",
+        github=github,
+    )
     value = CodexReviewBroker(
         token_provider=token_provider,
         github=github,
         mode=mode,
         allowed_actors=actors,
-        trigger_user=FakeTriggerUser(),
+        trigger_user=trigger_user,
     )
     return value, token_provider, github
+
+
+def remove_trigger_credential(value):
+    value.trigger_user = GitHubReviewTokenProvider(
+        token=SecretStr(""),
+        expected_login="DEAMBROGGI",
+        github=value.github,
+    )
 
 
 def add_codex_review(github, *, review_id=501, submitted_at="2026-09-27T20:01:00Z"):
@@ -207,10 +234,220 @@ def test_broker_acquires_exact_head_lock_and_trigger_is_idempotent(session):
         "issues": "read",
         "pull_requests": "read",
     }
+    run_id = first.automated_review_run_id
+    before_retry_events = load_events(session, view.publication_id)
+    user_requests = github.authenticated_user_requests
 
     second = value.request(session, view.publication_id)
+    assert second.automated_review_run_id == run_id
     assert second.automated_review_trigger_comment_id == 900
     assert len(github.posted_bodies) == 1
+    assert github.authenticated_user_requests == user_requests
+    assert load_events(session, view.publication_id) == before_retry_events
+    ledger = json.dumps(load_events(session, view.publication_id))
+    assert "github_pat_human-review-token" not in ledger
+
+
+def test_pass_same_head_reads_back_without_trigger_credential(session):
+    view = published_publication(session)
+    value, _tokens, github = broker()
+    first = value.request(session, view.publication_id)
+    add_codex_review(github)
+    assert value.reconcile(session, view.publication_id).state == "PASS"
+    before = load_events(session, view.publication_id)
+    user_requests = github.authenticated_user_requests
+    comment_count = len(github.posted_bodies)
+    remove_trigger_credential(value)
+
+    result = value.request(session, view.publication_id)
+
+    assert result.automated_review_status is AutomatedReviewStatus.PASS
+    assert result.automated_review_head_sha == HEAD
+    assert result.automated_review_run_id == first.automated_review_run_id
+    assert github.authenticated_user_requests == user_requests
+    assert len(github.posted_bodies) == comment_count
+    assert load_events(session, view.publication_id) == before
+
+
+def test_changes_required_same_head_reads_back_without_trigger_credential(session):
+    view = published_publication(session)
+    value, _tokens, github = broker()
+    first = value.request(session, view.publication_id)
+    add_codex_review(github, review_id=502)
+    github.review_comments.append(
+        PullReviewCommentSnapshot(
+            comment_id=602,
+            review_id=502,
+            actor=CODEX_ACTOR,
+            body="Requires a change.",
+            commit_id=HEAD,
+            path="control_plane/domain.py",
+            line=10,
+            created_at="2026-09-27T20:01:01Z",
+        )
+    )
+    assert value.reconcile(session, view.publication_id).state == "CHANGES_REQUIRED"
+    before = load_events(session, view.publication_id)
+    user_requests = github.authenticated_user_requests
+    comment_count = len(github.posted_bodies)
+    remove_trigger_credential(value)
+
+    result = value.request(session, view.publication_id)
+
+    assert result.automated_review_status is AutomatedReviewStatus.CHANGES_REQUIRED
+    assert result.automated_review_head_sha == HEAD
+    assert result.automated_review_run_id == first.automated_review_run_id
+    assert github.authenticated_user_requests == user_requests
+    assert len(github.posted_bodies) == comment_count
+    assert load_events(session, view.publication_id) == before
+
+
+def test_running_with_registered_trigger_reads_back_without_credential(session):
+    view = published_publication(session)
+    value, _tokens, github = broker()
+    first = value.request(session, view.publication_id)
+    comment_id = first.automated_review_trigger_comment_id
+    assert comment_id is not None
+    before = load_events(session, view.publication_id)
+    user_requests = github.authenticated_user_requests
+    comment_count = len(github.posted_bodies)
+    remove_trigger_credential(value)
+
+    result = value.request(session, view.publication_id)
+
+    assert result.automated_review_status is AutomatedReviewStatus.RUNNING
+    assert result.automated_review_run_id == first.automated_review_run_id
+    assert result.automated_review_trigger_comment_id == comment_id
+    assert github.authenticated_user_requests == user_requests
+    assert len(github.posted_bodies) == comment_count
+    assert load_events(session, view.publication_id) == before
+
+
+def test_running_without_registered_trigger_recovers_dispatch_once(session):
+    view = published_publication(session)
+    running = request_codex_review(
+        session,
+        view.publication_id,
+        mode="required",
+    )
+    run_id = running.automated_review_run_id
+    assert run_id is not None
+    assert running.automated_review_trigger_comment_id is None
+    value, _tokens, github = broker()
+
+    recovered = value.request(session, view.publication_id)
+
+    assert recovered.automated_review_status is AutomatedReviewStatus.RUNNING
+    assert recovered.automated_review_run_id == run_id
+    assert recovered.automated_review_trigger_comment_id is not None
+    assert github.authenticated_user_requests == 1
+    assert len(github.posted_bodies) == 1
+    before_retry = load_events(session, view.publication_id)
+    comment_id = recovered.automated_review_trigger_comment_id
+    remove_trigger_credential(value)
+
+    retried = value.request(session, view.publication_id)
+
+    assert retried.automated_review_status is AutomatedReviewStatus.RUNNING
+    assert retried.automated_review_run_id == run_id
+    assert retried.automated_review_trigger_comment_id == comment_id
+    assert github.authenticated_user_requests == 1
+    assert len(github.posted_bodies) == 1
+    assert load_events(session, view.publication_id) == before_retry
+
+
+def test_retry_during_active_dispatch_lease_does_not_create_second_run_or_comment(
+    session,
+):
+    view = published_publication(session)
+    running = request_codex_review(
+        session,
+        view.publication_id,
+        mode="required",
+    )
+    run_id = running.automated_review_run_id
+    assert run_id is not None
+    lease_id = "dispatch-owner-a"
+    assert claim_codex_review_trigger_dispatch(
+        session,
+        view.publication_id,
+        run_id=run_id,
+        lease_id=lease_id,
+    )
+    value, _tokens, github = broker()
+    before_retry = load_events(session, view.publication_id)
+
+    concurrent_retry = value.request(session, view.publication_id)
+
+    assert concurrent_retry.automated_review_run_id == run_id
+    assert concurrent_retry.automated_review_trigger_comment_id is None
+    assert github.authenticated_user_requests == 1
+    assert github.posted_bodies == []
+    assert load_events(session, view.publication_id) == before_retry
+
+    release_codex_review_trigger_dispatch(
+        session,
+        view.publication_id,
+        run_id=run_id,
+        lease_id=lease_id,
+    )
+    dispatched = value.request(session, view.publication_id)
+
+    assert dispatched.automated_review_run_id == run_id
+    assert dispatched.automated_review_trigger_comment_id is not None
+    assert len(github.posted_bodies) == 1
+    before_idempotent_retry = load_events(session, view.publication_id)
+    remove_trigger_credential(value)
+
+    retried = value.request(session, view.publication_id)
+
+    assert retried.automated_review_run_id == run_id
+    assert retried.automated_review_trigger_comment_id == (
+        dispatched.automated_review_trigger_comment_id
+    )
+    assert github.authenticated_user_requests == 2
+    assert len(github.posted_bodies) == 1
+    assert load_events(session, view.publication_id) == before_idempotent_retry
+
+
+def test_trigger_identity_mismatch_fails_before_comment_or_run(session):
+    view = published_publication(session)
+    github = FakeGitHub()
+    github.authenticated_login = "OTHER"
+    value, _tokens, _github = broker(github=github)
+
+    with pytest.raises(CodexReviewError, match="failed closed"):
+        value.request(session, view.publication_id)
+
+    assert github.posted_bodies == []
+    assert get_view(session, view.publication_id).automated_review_status is None
+
+
+def test_missing_trigger_token_fails_before_comment_or_run(session):
+    view = published_publication(session)
+    github = FakeGitHub()
+    value, _tokens, _github = broker(github=github, trigger_token="")
+
+    with pytest.raises(CodexReviewError, match="failed closed"):
+        value.request(session, view.publication_id)
+
+    assert github.posted_bodies == []
+    assert get_view(session, view.publication_id).automated_review_status is None
+
+
+def test_returned_trigger_actor_mismatch_fails_closed(session):
+    view = published_publication(session)
+    github = FakeGitHub()
+    github.trigger_actor = "OTHER"
+    value, _tokens, _github = broker(github=github)
+
+    with pytest.raises(CodexReviewError, match="failed closed"):
+        value.request(session, view.publication_id)
+
+    assert len(github.posted_bodies) == 1
+    assert get_view(
+        session, view.publication_id
+    ).automated_review_status is AutomatedReviewStatus.UNAVAILABLE
 
 
 def test_dispatch_lease_serializes_trigger_ownership(session):

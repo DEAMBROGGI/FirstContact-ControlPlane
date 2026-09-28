@@ -43,6 +43,7 @@ _DEFINITIONS = tuple(
     for name in (
         "python-tests.json",
         "publisher-security.json",
+        "codex-review-broker.v1.json",
         "codex-review-broker.json",
         "ui-build.json",
         "compose-config.json",

@@ -92,7 +92,7 @@ class GitHubRepositoryGateway:
     @staticmethod
     def _headers(token: str) -> dict[str, str]:
         if not token:
-            raise GitHubApiError("installation token is unavailable")
+            raise GitHubApiError("GitHub bearer token is unavailable")
         return {
             "Accept": "application/vnd.github+json",
             "Authorization": f"Bearer {token}",
@@ -110,6 +110,7 @@ class GitHubRepositoryGateway:
         json: dict | None = None,
         allow_404: bool = False,
     ) -> httpx.Response | None:
+        request_failed = False
         try:
             response = self.client.request(
                 method,
@@ -118,8 +119,10 @@ class GitHubRepositoryGateway:
                 params=params,
                 json=json,
             )
-        except httpx.HTTPError as exc:
-            raise GitHubApiError("GitHub repository request failed") from exc
+        except httpx.HTTPError:
+            request_failed = True
+        if request_failed:
+            raise GitHubApiError("GitHub repository request failed")
         if allow_404 and response.status_code == 404:
             return None
         if response.status_code < 200 or response.status_code >= 300:
@@ -127,6 +130,22 @@ class GitHubRepositoryGateway:
                 f"GitHub repository request failed with HTTP {response.status_code}"
             )
         return response
+
+    def authenticated_user_login(self, token: str) -> str:
+        response = self._request("GET", f"{self.api_url}/user", token=token)
+        assert response is not None
+        invalid_response = False
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = None
+            invalid_response = True
+        if invalid_response or not isinstance(payload, dict):
+            raise GitHubApiError("GitHub authenticated user response is invalid")
+        login = payload.get("login")
+        if not isinstance(login, str) or not login or login != login.strip():
+            raise GitHubApiError("GitHub authenticated user response is invalid")
+        return login
 
     @staticmethod
     def _next_link(response: httpx.Response) -> str | None:

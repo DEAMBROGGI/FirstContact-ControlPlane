@@ -88,6 +88,7 @@ _PROFILE_FILES = (
     "specialist.json",
     "controlplane.v1.json",
     "controlplane.v2.json",
+    "controlplane.v3.json",
     "controlplane.json",
 )
 _PROFILES = tuple(_load(name) for name in _PROFILE_FILES)
@@ -99,7 +100,7 @@ _ACTIVE_BY_REPOSITORY = {
 _ACTIVE_VERSION = {
     "DEAMBROGGI/FirstContact": 1,
     "DEAMBROGGI/FirstContact-SpecialistAgent": 1,
-    "DEAMBROGGI/FirstContact-ControlPlane": 3,
+    "DEAMBROGGI/FirstContact-ControlPlane": 4,
 }
 
 

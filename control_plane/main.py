@@ -13,7 +13,7 @@ from .db import get_session, init_db
 from .domain import DomainError
 from .github_api import GitHubRepositoryGateway
 from .github_app import GitHubAppTokenProvider
-from .github_user_auth import GitHubUserAccessProvider
+from .github_review_auth import GitHubReviewTokenProvider
 from .profile_registry import all_profiles
 from .publisher import GitHubPublisher, PublicationError
 from .quarantine import CandidateQuarantineError, GitCandidateQuarantine
@@ -94,18 +94,11 @@ def get_codex_review_broker():
         for value in settings.codex_review_actors.split(",")
         if value.strip()
     )
-    trigger_user = None
-    if (
-        settings.codex_review_github_client_id
-        and settings.codex_review_user_token_path
-        and settings.codex_review_trigger_login
-    ):
-        trigger_user = GitHubUserAccessProvider(
-            client_id=settings.codex_review_github_client_id,
-            token_path=settings.codex_review_user_token_path,
-            expected_login=settings.codex_review_trigger_login,
-            api_url=settings.github_api_url,
-        )
+    trigger_user = GitHubReviewTokenProvider(
+        token=settings.codex_review_user_token,
+        expected_login=settings.codex_review_trigger_login,
+        github=github,
+    )
     try:
         yield CodexReviewBroker(
             token_provider=token_provider,
@@ -115,8 +108,6 @@ def get_codex_review_broker():
             trigger_user=trigger_user,
         )
     finally:
-        if trigger_user is not None:
-            trigger_user.close()
         token_provider.close()
         github.close()
 
