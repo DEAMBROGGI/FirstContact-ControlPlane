@@ -175,3 +175,18 @@ class GitHubAppTokenProvider:
             token=token,
             expires_at=expires_at,
         )
+
+    def bot_login(self) -> str:
+        """Return the installation actor login without exposing JWT material."""
+        response = self._request(
+            "GET",
+            f"{self.api_url}/app",
+            app_jwt=self._jwt(),
+        )
+        try:
+            slug = str(response.json()["slug"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise GitHubAuthError("GitHub App metadata response is invalid") from exc
+        if not slug or slug != slug.strip():
+            raise GitHubAuthError("GitHub App metadata response is invalid")
+        return f"{slug}[bot]"

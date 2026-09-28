@@ -1,0 +1,246 @@
+# Remediation work package workflow
+
+This document describes the provider-neutral lifecycle for implementing and
+closing findings accepted from a completed review. It applies to implementation
+issues linked to a canonical Control Plane publication.
+
+## Authority and records
+
+`RemediationWorkPackageRow` holds immutable identity and linkage: repository,
+implementation issue number, publication, source review run, and reviewed head.
+It does not hold an authoritative mutable status.
+
+`RemediationEventRow` is the authoritative history. Events are append-only,
+ordered per work package, idempotency-keyed, and linked by a SHA-256 hash chain.
+The API view folds those events into the current work-package state and finding
+projections. The projection can be rebuilt from the event ledger.
+
+`RemediationDispatchRow` is coordination state only. Its expiring leases prevent
+concurrent workers from starting the same external action. It is not evidence
+that an action happened. A GitHub artifact becomes authoritative only after its
+receipt event is appended.
+
+The implementation issue number is a projection link and can be absent when the
+batch is first recorded. A package without an issue number cannot be claimed.
+The Control Plane creates or recovers the marked issue, records
+`IMPLEMENTATION_ISSUE_LINKED`, then projects its parent relationship, labels,
+and Project V2 lifecycle. This lets ledger decisions exist before GitHub
+materialization.
+
+Every candidate, validation, review, and finding verification remains bound to
+the exact publication and commit SHA recorded in its event. Candidate code runs
+without Control Plane writer or GitHub credentials. Publication remains the
+Control Plane's responsibility.
+
+## State machine
+
+```text
+READY --implementer claim--> IN_PROGRESS -> IMPLEMENTED -> VERIFYING
+                               ^                              |      |
+                               |                              |      +--> DONE
+                 REWORK_REQUIRED <-- any accepted PERSISTS ---+
+READY --all findings REJECTED / decision-only finalization--> VERIFYING
+```
+
+- `READY`: the package is linked to the current published head and a completed
+  source review; its provider finding set is checked against that immutable run,
+  and Principal Reviewer decisions are recorded for every finding.
+- `IN_PROGRESS`: an implementer claimed the package.
+- `IMPLEMENTED`: an implementation attempt from the linked publication was
+  submitted with its exact candidate/head, summary, and evidence digest.
+- `VERIFYING`: either a completed review of the exact successor head was bound,
+  or an all-rejected package entered decision-only finalization on its source
+  head.
+- `REWORK_REQUIRED`: all accepted findings were verified for the current
+  successor, and at least one returned `PERSISTS`. The Control Plane appends this
+  transition automatically; the batch can be claimed again for another
+  implementation attempt.
+- `DONE`: every accepted finding was verified absent, every rejected finding
+  has its recorded Principal Reviewer disposition, required GitHub receipts and
+  summary exist, the implementation issue is closed, and completion was
+  appended.
+
+An accepted finding whose successor verification says `PERSISTS` remains open
+for closure and blocks materialization and completion. Once every accepted
+finding has a result for that successor, any `PERSISTS` result moves the whole
+package to `REWORK_REQUIRED`. This applies to mixed results too: previous
+`ABSENT` findings are re-opened for the next attempt, and no reaction, reply,
+thread resolution, summary, or issue closure is materialized from that mixed
+attempt. The old implementation, review, and verification remain in the
+append-only event ledger and in each finding's `verification_history`; the next
+attempt records new events and new current verification without editing history.
+
+## Commands and events
+
+All routes below require the internal Control Plane token. Each modifying command
+requires a caller-provided `idempotency_key`.
+
+| Command | Route | Event / result |
+| --- | --- | --- |
+| Create package | `POST /api/v1/internal/remediation/work-packages` | `WORK_PACKAGE_CREATED` |
+| Read package | `GET /api/v1/internal/remediation/work-packages/{id}` | Folded view |
+| Read history | `GET /api/v1/internal/remediation/work-packages/{id}/events` | Ordered event ledger |
+| Claim from READY or REWORK_REQUIRED | `POST .../{id}/claim` | `WORK_PACKAGE_CLAIMED` |
+| Submit implementation | `POST .../{id}/implementation` | `IMPLEMENTATION_SUBMITTED` |
+| Bind successor review | `POST .../{id}/successor-review` | `SUCCESSOR_REVIEW_STARTED` |
+| Start rejected-only finalization | `POST .../{id}/rejected-finalization` | `REJECTED_FINDINGS_FINALIZATION_STARTED` |
+| Verify a finding | `POST .../{id}/findings/{finding_id}/verification` | `FINDING_VERIFIED` |
+| Materialize and complete | `POST .../{id}/materialize` | Artifact, summary, issue-close, and completion events |
+
+The remaining event types are `GITHUB_ARTIFACT_MATERIALIZED`,
+`WORK_PACKAGE_SUMMARY_MATERIALIZED`, `IMPLEMENTATION_ISSUE_CLOSED`, and
+`WORK_PACKAGE_COMPLETED`. A fully verified successor with at least one
+`PERSISTS` result appends `WORK_PACKAGE_REWORK_REQUIRED` automatically.
+Automated issue creation adds
+`IMPLEMENTATION_ISSUE_LINKED` after marker readback.
+
+Replaying a command with the same key and same canonical payload returns the
+existing result. Reusing a key with a different command or payload is rejected.
+Package identity is deterministic for publication, source review run, and
+implementation issue; an automatic batch uses a stable pending identity until
+its issue link is recorded. Database uniqueness also prevents the same issue from
+being linked to multiple packages or the same source review from creating
+multiple packages.
+
+## Exact lifecycle
+
+1. Create a package from the completed source review, its exact published head,
+   provider-neutral finding identities, source references, and Principal
+   Reviewer decisions. Provider finding ids, review ids, and identities must
+   exactly match the immutable source Review Run: omission, duplicates, invented
+   ids, and provider mismatches fail closed. Explicit `CONTROL_PLANE` findings
+   may be added without replacing provider findings. Creation also fails if the
+   review is not complete/current or does not match the publication head. When
+   an issue number is omitted, the
+   Control Plane creates or reuses a Fix Issue using the work-package marker,
+   links it as a sub-issue of the parent, and applies `type:fix`, `priority:*`,
+   and `status:ready` labels plus `Lifecycle = Ready`.
+2. Claim the package from `READY`, or reclaim it from `REWORK_REQUIRED`. A retry
+   by the same implementer is idempotent; another claim cannot silently replace
+   it.
+3. For accepted findings, submit a candidate through the existing quarantine and
+   admission path. The submission must identify the publication's current
+   candidate and its exact head. The normal validations and publisher then
+   publish that candidate to the same canonical pull request.
+4. Bind a completed automated review to the exact published successor head.
+   That head and candidate must equal the work package's latest submitted
+   implementation and remain the publication's current candidate and published
+   head; another candidate's review cannot be borrowed. A Principal Reviewer
+   records each accepted finding as `ABSENT` or `PERSISTS`, with the review run,
+   head, reviewer, and evidence retained in the ledger.
+5. If every finding was rejected, use decision-only finalization from `READY`.
+   It is valid only while the source review and source head remain current; it
+   does not fabricate an implementation or successor review.
+6. Materialization rechecks the canonical PR number, open state, head/base
+   branches, and exact current head before each external action. It records
+   receipts only after readback or provider confirmation.
+7. Once all finding closure evidence and thread receipts are present, the
+   Control Plane posts one work-package summary, closes the implementation
+   issue, records that closure, and appends `WORK_PACKAGE_COMPLETED`.
+
+Claim, implementation submission, successor verification, and completion
+reconcile the managed status label and Project #4's `Lifecycle` field. The projection vocabulary is `Ready`,
+`In Progress`, `Review`, and `Done`: `IMPLEMENTED`, `VERIFYING`, and
+`REWORK_REQUIRED` map to `status:review` plus `Lifecycle = Review`; no
+`Verifying` Project option or `status:verifying` label is used. Cross-links
+include the parent issue, canonical PR, source review run, and remediation batch
+marker. The Project V2 number is configured with
+`CONTROL_PLANE_REMEDIATION_PROJECT_NUMBER`, and its field name is explicitly
+configured by `CONTROL_PLANE_REMEDIATION_PROJECT_LIFECYCLE_FIELD=Lifecycle`.
+Project #4 is user-owned, so its GraphQL mutations use the separate runtime
+secret `CONTROL_PLANE_REMEDIATION_PROJECT_TOKEN`, configured for Project write
+access only. It is never reused for Issues or pull-request operations, which
+continue to use the GitHub App installation token. This Project credential is
+also separate from the Codex trigger credential. An empty Project credential
+makes projection fail closed after retaining the ledger event for retry. The
+Project adapter reads the item before adding it and reads back mutation results,
+so retries recover without duplicate Project items.
+
+## Accepted and rejected findings
+
+An `ACCEPTED` finding requires an exact successor review verification of
+`ABSENT` before closure. A `PERSISTS` result prevents completion and returns the
+batch to rework once all accepted findings have been checked for that attempt.
+Its requested reaction may be `+1` or `none`; a provider thread, when present, gets a reply
+that points to the successor evidence and is resolved after the receipt is
+recorded.
+
+A `REJECTED` finding requires a Principal Reviewer reason. It does not require
+code changes or successor review when every finding in the package is rejected.
+Its requested reaction may be `-1` or `none`; a provider thread, when present,
+gets a reply stating the recorded disposition and is resolved. A finding with
+no provider thread cannot request a reaction or thread action. Internal findings
+are represented in the same package and ledger but do not create provider
+thread artifacts.
+
+## Retry and recovery
+
+Database command retries are protected by event idempotency keys and immutable
+event identity. External calls never hold a database row lock while waiting on
+GitHub. A short-lived dispatch lease coordinates each reaction, reply,
+resolution, summary, and issue-close action.
+
+If a response is lost after GitHub accepted an operation, retry recovers its
+identity before creating another artifact: reactions use the provider's
+same-actor/same-content idempotent operation; replies and summaries carry
+package-specific hidden markers and are read back from paginated comments;
+thread resolution looks up the exact provider comment and treats an already
+resolved thread as complete; issue closure reads back the issue state. Lease
+expiry/release permits recovery, while the event ledger remains the source of
+truth. Ambiguous duplicates, unexpected actors, changed PR identity/head, or
+failed readback stop the workflow closed.
+
+## Provider adapter boundary
+
+The domain package accepts a provider name, provider review id, provider thread
+id, and stable normalized finding identity. Provider-specific parsing and
+review-correlation rules belong in an adapter that produces this input and
+proves the source review belongs to the exact publication head. The adapter
+must not change the work-package state machine or ledger format.
+
+An adapter integration must:
+
+- keep provider credentials separate from publication credentials;
+- bind review decisions and comments to an exact completed review and head;
+- preserve stable provider ids without narrowing them to 32-bit integers;
+- map accepted/rejected dispositions explicitly and retain Principal Reviewer
+  actor, reason, and evidence;
+- fail closed for unmanaged, concurrent, stale, or ambiguously correlated
+  provider activity;
+- use bounded provider operations rather than generic REST, GraphQL, shell, or
+  filesystem passthrough;
+- test duplicate delivery, lost responses, retries, exact-head changes, and
+  provider identity mismatches.
+
+The Codex Review Broker remains one provider adapter. Its trigger and correlation
+rules do not define the generic remediation package contract.
+
+## Onboarding checklist for another API or repository
+
+- Register the repository identity, GitHub App installation, canonical parent
+  issue workflow, target branch, and one-publication/one-canonical-PR policy.
+- Select versioned validation profiles and JobDefinitions. Candidate execution
+  receives no Control Plane writer or GitHub credentials.
+- Provide a provider adapter that submits one completed exact-head Review Run
+  and stable finding identities. Keep provider trigger/correlation rules inside
+  that adapter; reject stale, unmanaged, concurrent, or ambiguous reviews.
+- Have the Principal Reviewer submit only finding decisions, priority,
+  rejection reason when needed, and desired reaction. The Control Plane creates
+  or reuses the batch and projects its Fix Issue, links, labels, and Project V2
+  state.
+- Use the existing quarantine, validation, admission, and publisher path to
+  publish a successor to the same canonical PR. Bind the successor review and
+  each finding verification to the exact published HEAD.
+- Configure `CONTROL_PLANE_REMEDIATION_PROJECT_NUMBER` and
+  `CONTROL_PLANE_REMEDIATION_PROJECT_LIFECYCLE_FIELD=Lifecycle` for Project #4.
+  Grant the GitHub App only required repository `issues:write` /
+  `pull_requests:write` permissions. Configure the dedicated
+  `CONTROL_PLANE_REMEDIATION_PROJECT_TOKEN` runtime secret with Project write
+  access only; do not reuse the Codex trigger credential.
+- Route issue, label, Project, reaction, reply, thread-resolution, summary, and
+  closure effects through Control Plane commands. Do not add direct-write
+  helpers in the consumer API or candidate.
+- Run provider adapter tests for duplicate delivery, lost responses, retries,
+  actor/id mismatches, exact-head changes, and ambiguous concurrent activity;
+  run the shared Control Plane and publisher regression gates before enabling
+  the integration.

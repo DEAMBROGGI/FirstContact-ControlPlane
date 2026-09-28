@@ -17,12 +17,32 @@ from .github_review_auth import GitHubReviewTokenProvider
 from .profile_registry import all_profiles
 from .publisher import GitHubPublisher, PublicationError
 from .quarantine import CandidateQuarantineError, GitCandidateQuarantine
+from .remediation_materializer import (
+    GitHubRemediationMaterializer,
+    RemediationMaterializationError,
+)
 from .repository import load_events
 from .schemas import (
     CreatePublicationRequest,
+    CreateRemediationWorkPackageRequest,
+    ClaimRemediationWorkPackageRequest,
+    IdempotencyRequest,
     MergeabilityRequest,
     ReviewRequest,
+    StartSuccessorVerificationRequest,
+    SubmitRemediationImplementationRequest,
     ValidationResultRequest,
+    VerifyRemediationFindingRequest,
+)
+from .remediation import (
+    begin_rejected_findings_finalization,
+    begin_successor_verification,
+    claim_work_package,
+    create_work_package,
+    get_work_package,
+    submit_implementation,
+    verify_finding,
+    work_package_events,
 )
 from .service import (
     create_publication,
@@ -112,6 +132,33 @@ def get_codex_review_broker():
         github.close()
 
 
+def get_remediation_materializer():
+    project_token = settings.remediation_project_token.get_secret_value().strip()
+    codex_trigger_token = settings.codex_review_user_token.get_secret_value().strip()
+    if project_token and project_token == codex_trigger_token:
+        raise HTTPException(
+            status_code=503,
+            detail="remediation Project V2 credential configuration is invalid",
+        )
+    token_provider = GitHubAppTokenProvider(
+        app_id=settings.github_app_id,
+        private_key_path=settings.github_app_private_key_path,
+        api_url=settings.github_api_url,
+    )
+    github = GitHubRepositoryGateway(api_url=settings.github_api_url)
+    try:
+        yield GitHubRemediationMaterializer(
+            token_provider=token_provider,
+            github=github,
+            project_number=settings.remediation_project_number,
+            project_lifecycle_field=settings.remediation_project_lifecycle_field,
+            project_token=settings.remediation_project_token,
+        )
+    finally:
+        token_provider.close()
+        github.close()
+
+
 def _payload(view):
     data = asdict(view)
     data["state"] = view.state.value
@@ -119,6 +166,12 @@ def _payload(view):
         data["review_decision"] = view.review_decision.value
     if view.automated_review_status is not None:
         data["automated_review_status"] = view.automated_review_status.value
+    return data
+
+
+def _work_package_payload(view):
+    data = asdict(view)
+    data["state"] = view.state.value
     return data
 
 
@@ -300,3 +353,248 @@ def mergeability_record(publication_id: str, request: MergeabilityRequest, sessi
         raise HTTPException(status_code=404, detail="publication not found") from exc
     except DomainError as exc:
         raise _conflict(exc) from exc
+
+
+@app.post(
+    "/api/v1/internal/remediation/work-packages",
+    dependencies=[Depends(require_token)],
+)
+def remediation_work_package_create(
+    request: CreateRemediationWorkPackageRequest,
+    session: Session = Depends(get_session),
+    materializer: GitHubRemediationMaterializer = Depends(get_remediation_materializer),
+):
+    try:
+        view = create_work_package(
+            session,
+            publication_id=request.publication_id,
+            implementation_issue_number=request.implementation_issue_number,
+            review_run_id=request.review_run_id,
+            review_provider=request.review_provider,
+            provider_review_id=request.provider_review_id,
+            reviewed_head_sha=request.reviewed_head_sha,
+            findings=request.findings,
+            idempotency_key=request.idempotency_key,
+        )
+        if request.implementation_issue_number is None:
+            view = materializer.ensure_implementation_issue(
+                session,
+                view.work_package_id,
+            )
+        return _work_package_payload(view)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="publication not found") from exc
+    except DomainError as exc:
+        raise _conflict(exc) from exc
+    except RemediationMaterializationError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="remediation work package projection failed closed",
+        ) from exc
+
+
+@app.get(
+    "/api/v1/internal/remediation/work-packages/{work_package_id}",
+    dependencies=[Depends(require_token)],
+)
+def remediation_work_package_get(
+    work_package_id: str,
+    session: Session = Depends(get_session),
+):
+    try:
+        return _work_package_payload(get_work_package(session, work_package_id))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="work package not found") from exc
+
+
+@app.get(
+    "/api/v1/internal/remediation/work-packages/{work_package_id}/events",
+    dependencies=[Depends(require_token)],
+)
+def remediation_work_package_events(
+    work_package_id: str,
+    session: Session = Depends(get_session),
+):
+    try:
+        return work_package_events(session, work_package_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="work package not found") from exc
+
+
+@app.post(
+    "/api/v1/internal/remediation/work-packages/{work_package_id}/claim",
+    dependencies=[Depends(require_token)],
+)
+def remediation_work_package_claim(
+    work_package_id: str,
+    request: ClaimRemediationWorkPackageRequest,
+    session: Session = Depends(get_session),
+    materializer: GitHubRemediationMaterializer = Depends(get_remediation_materializer),
+):
+    try:
+        view = claim_work_package(
+            session,
+            work_package_id,
+            actor=request.actor,
+            idempotency_key=request.idempotency_key,
+        )
+        return _work_package_payload(
+            materializer.sync_issue_projection(session, view.work_package_id)
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="work package not found") from exc
+    except DomainError as exc:
+        raise _conflict(exc) from exc
+    except RemediationMaterializationError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="remediation status projection failed closed",
+        ) from exc
+
+
+@app.post(
+    "/api/v1/internal/remediation/work-packages/{work_package_id}/implementation",
+    dependencies=[Depends(require_token)],
+)
+def remediation_work_package_submit_implementation(
+    work_package_id: str,
+    request: SubmitRemediationImplementationRequest,
+    session: Session = Depends(get_session),
+    materializer: GitHubRemediationMaterializer = Depends(get_remediation_materializer),
+):
+    try:
+        view = submit_implementation(
+            session,
+            work_package_id,
+            candidate_id=request.candidate_id,
+            head_sha=request.head_sha,
+            summary=request.summary,
+            evidence_sha256=request.evidence_sha256,
+            idempotency_key=request.idempotency_key,
+        )
+        return _work_package_payload(
+            materializer.sync_issue_projection(session, view.work_package_id)
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="work package not found") from exc
+    except DomainError as exc:
+        raise _conflict(exc) from exc
+    except RemediationMaterializationError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="remediation status projection failed closed",
+        ) from exc
+
+
+@app.post(
+    "/api/v1/internal/remediation/work-packages/{work_package_id}/successor-review",
+    dependencies=[Depends(require_token)],
+)
+def remediation_work_package_start_verification(
+    work_package_id: str,
+    request: StartSuccessorVerificationRequest,
+    session: Session = Depends(get_session),
+    materializer: GitHubRemediationMaterializer = Depends(get_remediation_materializer),
+):
+    try:
+        view = begin_successor_verification(
+            session,
+            work_package_id,
+            review_run_id=request.review_run_id,
+            head_sha=request.head_sha,
+            idempotency_key=request.idempotency_key,
+        )
+        return _work_package_payload(
+            materializer.sync_issue_projection(session, view.work_package_id)
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="work package not found") from exc
+    except DomainError as exc:
+        raise _conflict(exc) from exc
+    except RemediationMaterializationError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="remediation status projection failed closed",
+        ) from exc
+
+
+@app.post(
+    "/api/v1/internal/remediation/work-packages/{work_package_id}/rejected-finalization",
+    dependencies=[Depends(require_token)],
+)
+def remediation_work_package_start_rejected_finalization(
+    work_package_id: str,
+    request: IdempotencyRequest,
+    session: Session = Depends(get_session),
+    materializer: GitHubRemediationMaterializer = Depends(get_remediation_materializer),
+):
+    try:
+        view = begin_rejected_findings_finalization(
+            session,
+            work_package_id,
+            idempotency_key=request.idempotency_key,
+        )
+        return _work_package_payload(
+            materializer.sync_issue_projection(session, view.work_package_id)
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="work package not found") from exc
+    except DomainError as exc:
+        raise _conflict(exc) from exc
+    except RemediationMaterializationError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="remediation status projection failed closed",
+        ) from exc
+
+
+@app.post(
+    "/api/v1/internal/remediation/work-packages/{work_package_id}/findings/{finding_id}/verification",
+    dependencies=[Depends(require_token)],
+)
+def remediation_finding_verify(
+    work_package_id: str,
+    finding_id: str,
+    request: VerifyRemediationFindingRequest,
+    session: Session = Depends(get_session),
+):
+    try:
+        return _work_package_payload(
+            verify_finding(
+                session,
+                work_package_id,
+                finding_id=finding_id,
+                outcome=request.outcome,
+                reviewer=request.reviewer,
+                evidence=request.evidence,
+                idempotency_key=request.idempotency_key,
+            )
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="work package not found") from exc
+    except DomainError as exc:
+        raise _conflict(exc) from exc
+
+
+@app.post(
+    "/api/v1/internal/remediation/work-packages/{work_package_id}/materialize",
+    dependencies=[Depends(require_token)],
+)
+def remediation_work_package_materialize(
+    work_package_id: str,
+    session: Session = Depends(get_session),
+    materializer: GitHubRemediationMaterializer = Depends(get_remediation_materializer),
+):
+    try:
+        return _work_package_payload(
+            materializer.materialize(session, work_package_id)
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="work package not found") from exc
+    except DomainError as exc:
+        raise _conflict(exc) from exc
+    except RemediationMaterializationError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="remediation materialization failed closed",
+        ) from exc

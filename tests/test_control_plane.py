@@ -87,7 +87,12 @@ def published_publication(session, issue_number=42):
 
 
 def pass_codex_review(session, view):
-    running = request_codex_review(session, view.publication_id, mode="required")
+    running = request_codex_review(
+        session,
+        view.publication_id,
+        mode="required",
+        expected_head_sha=view.remote_head_sha,
+    )
     return complete_codex_review(
         session,
         view.publication_id,
@@ -517,7 +522,12 @@ def test_merged_publication_rejects_successor_candidate(session):
 
 def test_late_codex_result_from_old_head_is_rejected_after_successor_submission(session):
     first = published_publication(session, issue_number=56)
-    running = request_codex_review(session, first.publication_id, mode="required")
+    running = request_codex_review(
+        session,
+        first.publication_id,
+        mode="required",
+        expected_head_sha=first.remote_head_sha,
+    )
     second = submit_verified_candidate(session, first.publication_id, successor_source())
 
     assert second.automated_review_status is None
@@ -727,7 +737,12 @@ def test_codex_result_is_revalidated_after_candidate_wins_lock_race(
     monkeypatch,
 ):
     published = published_publication(session, issue_number=72)
-    running = request_codex_review(session, published.publication_id, mode="required")
+    running = request_codex_review(
+        session,
+        published.publication_id,
+        mode="required",
+        expected_head_sha=published.remote_head_sha,
+    )
     state = interleave_after_first_publication_lock(
         session,
         monkeypatch,
@@ -851,7 +866,12 @@ def test_codex_request_is_rejected_if_successor_candidate_wins_lock_race(
     )
 
     with pytest.raises(DomainError, match="Codex review requires IN_REVIEW"):
-        request_codex_review(session, published.publication_id, mode="required")
+        request_codex_review(
+            session,
+            published.publication_id,
+            mode="required",
+            expected_head_sha=published.remote_head_sha,
+        )
 
     events = load_events(session, published.publication_id)
     assert state["interleaved"]
@@ -1149,7 +1169,12 @@ def test_supersession_requires_both_publications_to_exist(session):
 
 def test_superseded_publication_rejects_late_codex_result(session):
     old = published_publication(session, issue_number=67)
-    running = request_codex_review(session, old.publication_id, mode="required")
+    running = request_codex_review(
+        session,
+        old.publication_id,
+        mode="required",
+        expected_head_sha=old.remote_head_sha,
+    )
     successor = raw_publication(session, old.repository, old.issue_number)
     supersede_publication(
         session,

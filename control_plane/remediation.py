@@ -1,0 +1,1285 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+import uuid
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from enum import StrEnum
+from typing import Any, Mapping
+
+from sqlalchemy import select, text
+from sqlalchemy.orm import Session
+
+from .domain import AutomatedReviewStatus, DomainError
+from .models import (
+    CandidateRow,
+    RemediationDispatchRow,
+    PublicationRow,
+    RemediationEventRow,
+    RemediationWorkPackageRow,
+)
+from .repository import ZERO_HASH
+from .service import get_view
+
+_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+_EVIDENCE_RE = re.compile(r"^[0-9a-f]{64}$")
+_BATCH_NAMESPACE = uuid.UUID("a68dd9c2-c23c-4e78-8b0c-9a2e0ef506bf")
+
+
+class WorkPackageState(StrEnum):
+    READY = "READY"
+    IN_PROGRESS = "IN_PROGRESS"
+    IMPLEMENTED = "IMPLEMENTED"
+    VERIFYING = "VERIFYING"
+    REWORK_REQUIRED = "REWORK_REQUIRED"
+    DONE = "DONE"
+
+
+class PrincipalDecision(StrEnum):
+    ACCEPTED = "ACCEPTED"
+    REJECTED = "REJECTED"
+
+
+@dataclass(frozen=True, slots=True)
+class RemediationWorkPackageView:
+    work_package_id: str
+    publication_id: str
+    repository: str
+    implementation_issue_number: int | None
+    review_run: dict[str, Any]
+    reviewed_head_sha: str
+    state: WorkPackageState
+    findings: tuple[dict[str, Any], ...]
+    implementer: str | None
+    candidate_id: str | None
+    implementation_head_sha: str | None
+    implementation_summary: str | None
+    implementation_evidence_sha256: str | None
+    successor_review_run_id: str | None
+    successor_head_sha: str | None
+    summary_comment_id: int | None
+    issue_closed: bool
+
+
+def _canonical(value: Mapping[str, Any]) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _hash_event(
+    work_package_id: str,
+    sequence: int,
+    event_type: str,
+    idempotency_key: str,
+    payload: Mapping[str, Any],
+    previous_hash: str,
+) -> str:
+    return hashlib.sha256(
+        _canonical(
+            {
+                "work_package_id": work_package_id,
+                "sequence": sequence,
+                "event_type": event_type,
+                "idempotency_key": idempotency_key,
+                "payload": payload,
+                "previous_hash": previous_hash,
+            }
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _event_payload(row: RemediationEventRow) -> dict[str, Any]:
+    return {
+        "sequence": row.sequence,
+        "event_type": row.event_type,
+        "idempotency_key": row.idempotency_key,
+        "payload": row.payload,
+        "previous_hash": row.previous_hash,
+        "event_hash": row.event_hash,
+        "occurred_at": row.occurred_at.isoformat(),
+    }
+
+
+def load_work_package_events(
+    session: Session,
+    work_package_id: str,
+) -> list[dict[str, Any]]:
+    rows = list(
+        session.scalars(
+            select(RemediationEventRow)
+            .where(RemediationEventRow.work_package_id == work_package_id)
+            .order_by(RemediationEventRow.sequence.asc())
+        )
+    )
+    previous = ZERO_HASH
+    events: list[dict[str, Any]] = []
+    for expected, row in enumerate(rows, start=1):
+        if row.sequence != expected or row.previous_hash != previous:
+            raise RuntimeError("remediation event chain is corrupt")
+        expected_hash = _hash_event(
+            work_package_id,
+            row.sequence,
+            row.event_type,
+            row.idempotency_key,
+            row.payload,
+            row.previous_hash,
+        )
+        if row.event_hash != expected_hash:
+            raise RuntimeError("remediation event hash mismatch")
+        events.append(_event_payload(row))
+        previous = row.event_hash
+    return events
+
+
+def _lock_create_scope(
+    session: Session,
+    repository: str,
+    issue_number: int | None,
+) -> None:
+    if session.get_bind().dialect.name != "postgresql":
+        return
+    key = hashlib.sha256(
+        f"firstcontact-remediation-issue\0{repository}\0{issue_number}".encode()
+    ).digest()[:8]
+    lock_key = int.from_bytes(key, byteorder="big", signed=True)
+    session.execute(
+        text("SELECT pg_advisory_xact_lock(:remediation_issue_key)"),
+        {"remediation_issue_key": lock_key},
+    )
+
+
+def _lock_work_package(session: Session, work_package_id: str) -> RemediationWorkPackageRow:
+    row = session.scalar(
+        select(RemediationWorkPackageRow)
+        .where(RemediationWorkPackageRow.id == work_package_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if row is None:
+        raise KeyError(work_package_id)
+    return row
+
+
+def _append(
+    session: Session,
+    row: RemediationWorkPackageRow,
+    *,
+    event_type: str,
+    idempotency_key: str,
+    payload: dict[str, Any],
+) -> RemediationEventRow:
+    if not idempotency_key.strip() or len(idempotency_key) > 200:
+        raise DomainError("idempotency_key must contain 1..200 characters")
+    existing = session.scalar(
+        select(RemediationEventRow).where(
+            RemediationEventRow.work_package_id == row.id,
+            RemediationEventRow.idempotency_key == idempotency_key,
+        )
+    )
+    if existing is not None:
+        if existing.event_type != event_type or _canonical(existing.payload) != _canonical(payload):
+            raise DomainError("idempotency key was already used for another command")
+        return existing
+
+    last = session.scalar(
+        select(RemediationEventRow)
+        .where(RemediationEventRow.work_package_id == row.id)
+        .order_by(RemediationEventRow.sequence.desc())
+        .limit(1)
+    )
+    sequence = 1 if last is None else last.sequence + 1
+    previous_hash = ZERO_HASH if last is None else last.event_hash
+    event_hash = _hash_event(
+        row.id,
+        sequence,
+        event_type,
+        idempotency_key,
+        payload,
+        previous_hash,
+    )
+    event = RemediationEventRow(
+        work_package_id=row.id,
+        sequence=sequence,
+        event_type=event_type,
+        idempotency_key=idempotency_key,
+        payload=payload,
+        previous_hash=previous_hash,
+        event_hash=event_hash,
+    )
+    session.add(event)
+    session.flush()
+    return event
+
+
+def _finding_defaults(finding: dict[str, Any]) -> dict[str, Any]:
+    thread_id = finding["source"].get("provider_thread_id")
+    has_thread = thread_id is not None
+    decision = finding["principal_decision"]["decision"]
+    return {
+        **finding,
+        "closure_state": (
+            "AWAITING_VERIFICATION"
+            if decision == PrincipalDecision.ACCEPTED.value
+            else "REJECTED_BY_PRINCIPAL"
+        ),
+        "verification": None,
+        "verification_history": [],
+        "materialization": {
+            "reaction": "PENDING" if has_thread and finding["desired_reaction"] != "none" else "NOT_APPLICABLE",
+            "reply": "PENDING" if has_thread else "NOT_APPLICABLE",
+            "resolution": "PENDING" if has_thread else "NOT_APPLICABLE",
+        },
+        "materialization_ids": {},
+    }
+
+
+def _fold(work_package_id: str, row: RemediationWorkPackageRow, events: list[dict[str, Any]]) -> RemediationWorkPackageView:
+    if not events or events[0]["event_type"] != "WORK_PACKAGE_CREATED":
+        raise RuntimeError("remediation work package has no creation event")
+    initial = events[0]["payload"]
+    findings = {}
+    for item in initial["findings"]:
+        finding = dict(item)
+        finding.setdefault("verification_history", [])
+        findings[item["finding_id"]] = finding
+    state = WorkPackageState.READY
+    implementer = None
+    candidate_id = None
+    implementation_head_sha = None
+    implementation_summary = None
+    implementation_evidence_sha256 = None
+    successor_review_run_id = None
+    successor_head_sha = None
+    implementation_issue_number = initial.get("implementation_issue_number")
+    summary_comment_id = None
+    issue_closed = False
+
+    for event in events[1:]:
+        payload = event["payload"]
+        event_type = event["event_type"]
+        if event_type == "IMPLEMENTATION_ISSUE_LINKED":
+            linked_number = payload["issue_number"]
+            if implementation_issue_number is not None and implementation_issue_number != linked_number:
+                raise RuntimeError("remediation issue link changed in the event ledger")
+            implementation_issue_number = linked_number
+        elif event_type == "WORK_PACKAGE_CLAIMED":
+            state = WorkPackageState.IN_PROGRESS
+            implementer = payload["actor"]
+        elif event_type == "IMPLEMENTATION_SUBMITTED":
+            state = WorkPackageState.IMPLEMENTED
+            candidate_id = payload["candidate_id"]
+            implementation_head_sha = payload["head_sha"]
+            implementation_summary = payload["summary"]
+            implementation_evidence_sha256 = payload["evidence_sha256"]
+        elif event_type == "SUCCESSOR_REVIEW_STARTED":
+            state = WorkPackageState.VERIFYING
+            successor_review_run_id = payload["review_run_id"]
+            successor_head_sha = payload["head_sha"]
+        elif event_type == "REJECTED_FINDINGS_FINALIZATION_STARTED":
+            state = WorkPackageState.VERIFYING
+        elif event_type == "FINDING_VERIFIED":
+            finding = findings[payload["finding_id"]]
+            verification = {
+                "outcome": payload["outcome"],
+                "review_run_id": payload["review_run_id"],
+                "head_sha": payload["head_sha"],
+                "reviewer": payload["reviewer"],
+                "evidence": payload["evidence"],
+            }
+            finding["verification_history"].append(verification)
+            finding["verification"] = verification
+            finding["closure_state"] = (
+                "VERIFIED_ABSENT"
+                if payload["outcome"] == "ABSENT"
+                else "PERSISTS"
+            )
+        elif event_type == "WORK_PACKAGE_REWORK_REQUIRED":
+            state = WorkPackageState.REWORK_REQUIRED
+            for finding in findings.values():
+                if finding["principal_decision"]["decision"] == PrincipalDecision.ACCEPTED.value:
+                    finding["verification"] = None
+                    finding["closure_state"] = "AWAITING_VERIFICATION"
+        elif event_type == "GITHUB_ARTIFACT_MATERIALIZED":
+            finding = findings[payload["finding_id"]]
+            finding["materialization"][payload["artifact"]] = "MATERIALIZED"
+            finding["materialization_ids"][payload["artifact"]] = payload["remote_id"]
+        elif event_type == "WORK_PACKAGE_SUMMARY_MATERIALIZED":
+            summary_comment_id = payload["comment_id"]
+        elif event_type == "IMPLEMENTATION_ISSUE_CLOSED":
+            issue_closed = True
+        elif event_type == "WORK_PACKAGE_COMPLETED":
+            state = WorkPackageState.DONE
+
+    if row.implementation_issue_number != implementation_issue_number:
+        raise RuntimeError("remediation issue-link index differs from the event ledger")
+
+    return RemediationWorkPackageView(
+        work_package_id=work_package_id,
+        publication_id=row.publication_id,
+        repository=row.repository,
+        implementation_issue_number=implementation_issue_number,
+        review_run=initial["review_run"],
+        reviewed_head_sha=row.reviewed_head_sha,
+        state=state,
+        findings=tuple(findings.values()),
+        implementer=implementer,
+        candidate_id=candidate_id,
+        implementation_head_sha=implementation_head_sha,
+        implementation_summary=implementation_summary,
+        implementation_evidence_sha256=implementation_evidence_sha256,
+        successor_review_run_id=successor_review_run_id,
+        successor_head_sha=successor_head_sha,
+        summary_comment_id=summary_comment_id,
+        issue_closed=issue_closed,
+    )
+
+
+def get_work_package(session: Session, work_package_id: str) -> RemediationWorkPackageView:
+    row = session.get(RemediationWorkPackageRow, work_package_id)
+    if row is None:
+        raise KeyError(work_package_id)
+    return _fold(work_package_id, row, load_work_package_events(session, work_package_id))
+
+
+def _find_source_review(
+    session: Session,
+    publication_id: str,
+    review_run_id: str,
+    reviewed_head_sha: str,
+    provider_review_id: int | None,
+) -> dict[str, Any] | None:
+    from .repository import load_events
+
+    for event in load_events(session, publication_id):
+        payload = event["payload"]
+        if (
+            payload.get("run_id") != review_run_id
+            or payload.get("head_sha") != reviewed_head_sha
+            or not event["event_type"].endswith("COMPLETED")
+        ):
+            continue
+        if payload.get("result") not in {"PASS", "CHANGES_REQUIRED"}:
+            continue
+        if event["event_type"] != "CODEX_REVIEW_COMPLETED":
+            raise DomainError("source review provider is unsupported")
+        provider_review_ids = payload.get("provider_review_ids")
+        provider_comment_ids = payload.get("provider_comment_ids")
+        findings = payload.get("findings")
+        if (
+            not isinstance(provider_review_ids, list)
+            or not isinstance(provider_comment_ids, list)
+            or not isinstance(findings, list)
+            or payload.get("findings_count") != len(findings)
+        ):
+            raise DomainError("source review finding ledger is inconsistent")
+        if len(set(provider_review_ids)) != len(provider_review_ids) or len(
+            set(provider_comment_ids)
+        ) != len(provider_comment_ids):
+            raise DomainError("source review finding ledger contains duplicate ids")
+        source_comments: dict[int, dict[str, Any]] = {}
+        for finding in findings:
+            if not isinstance(finding, dict):
+                raise DomainError("source review finding ledger is inconsistent")
+            try:
+                comment_id = int(finding["provider_comment_id"])
+                review_id = int(finding["provider_review_id"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise DomainError("source review finding ledger is inconsistent") from exc
+            if (
+                comment_id <= 0
+                or review_id <= 0
+                or comment_id in source_comments
+                or review_id not in provider_review_ids
+                or comment_id not in provider_comment_ids
+            ):
+                raise DomainError("source review finding ledger is inconsistent")
+            source_comments[comment_id] = finding
+        if set(source_comments) != set(provider_comment_ids):
+            raise DomainError("source review provider comments do not match its findings")
+        if provider_review_id is not None and provider_review_id not in provider_review_ids:
+            continue
+        return {"event_type": event["event_type"], **payload}
+    return None
+
+
+def _validate_review_findings(
+    findings: list[dict[str, Any]],
+    *,
+    source_review: dict[str, Any],
+    review_provider: str,
+) -> None:
+    if review_provider != "CODEX_CODE_REVIEW":
+        raise DomainError("source review provider does not match the completed review")
+    trusted_comments = {
+        int(item["provider_comment_id"]): item
+        for item in source_review["findings"]
+    }
+    submitted_comments: list[tuple[int, int]] = []
+    for finding in findings:
+        source = finding["source"]
+        kind = source["kind"]
+        if kind == "CONTROL_PLANE":
+            if (
+                source["provider"] != "CONTROL_PLANE"
+                or source["provider_review_id"] is not None
+                or source["provider_thread_id"] is not None
+            ):
+                raise DomainError("internal findings require the explicit Control Plane source")
+            continue
+        if kind != "PROVIDER_THREAD":
+            raise DomainError("finding source kind is unsupported")
+        review_id = source["provider_review_id"]
+        comment_id = source["provider_thread_id"]
+        if source["provider"] != review_provider or review_id is None or comment_id is None:
+            raise DomainError("provider finding does not match the source review provider")
+        trusted = trusted_comments.get(comment_id)
+        if trusted is None or int(trusted["provider_review_id"]) != review_id:
+            raise DomainError("provider finding is not owned by the source review run")
+        expected_id = f"codex:{review_id}:{comment_id}"
+        expected_identity = f"codex:review-{review_id}:comment-{comment_id}"
+        if (
+            finding["finding_id"] != expected_id
+            or finding["normalized_identity"] != expected_identity
+        ):
+            raise DomainError("provider finding identity differs from the source review")
+        finding["source"].update(
+            {
+                "path": trusted.get("path"),
+                "line": trusted.get("line"),
+                "body": str(trusted.get("body", ""))[:4000],
+            }
+        )
+        submitted_comments.append((review_id, comment_id))
+    if len(submitted_comments) != len(set(submitted_comments)):
+        raise DomainError("duplicate provider finding in Principal Reviewer decision set")
+    expected_comments = {
+        (int(item["provider_review_id"]), int(item["provider_comment_id"]))
+        for item in source_review["findings"]
+    }
+    if set(submitted_comments) != expected_comments:
+        raise DomainError("Principal Reviewer decision set must include every source provider finding exactly once")
+
+
+def _normalize_findings(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not findings or len(findings) > 200:
+        raise DomainError("work package requires 1..200 findings")
+    normalized = []
+    seen: set[str] = set()
+    for item in findings:
+        finding_id = str(item.get("finding_id", "")).strip()
+        identity = str(item.get("normalized_identity", "")).strip()
+        priority = str(item.get("priority", "")).upper()
+        source = item.get("source")
+        decision = item.get("principal_decision")
+        desired_reaction = str(item.get("desired_reaction", "")).lower()
+        if not finding_id or len(finding_id) > 200 or not identity or len(identity) > 500:
+            raise DomainError("finding identity is required and bounded")
+        if finding_id in seen:
+            raise DomainError("duplicate finding identity")
+        seen.add(finding_id)
+        if priority not in {"P0", "P1", "P2", "P3", "P4"}:
+            raise DomainError("finding priority is invalid")
+        if not isinstance(source, dict) or not source.get("kind"):
+            raise DomainError("finding source is required")
+        if not isinstance(decision, dict):
+            raise DomainError("Principal Reviewer decision is required")
+        try:
+            decision_value = PrincipalDecision(str(decision.get("decision", "")).upper())
+        except ValueError as exc:
+            raise DomainError("Principal Reviewer decision is invalid") from exc
+        reason = str(decision.get("reason") or "").strip()
+        actor = str(decision.get("actor", "")).strip()
+        if not actor or len(actor) > 200:
+            raise DomainError("Principal Reviewer decision actor is required and bounded")
+        if decision_value is PrincipalDecision.REJECTED and not reason:
+            raise DomainError("rejected finding requires a reason")
+        if decision_value is PrincipalDecision.ACCEPTED and desired_reaction not in {"+1", "none"}:
+            raise DomainError("accepted finding reaction must be +1 or none")
+        if decision_value is PrincipalDecision.REJECTED and desired_reaction not in {"-1", "none"}:
+            raise DomainError("rejected finding reaction must be -1 or none")
+        provider_thread_id = source.get("provider_thread_id")
+        if provider_thread_id is not None and int(provider_thread_id) <= 0:
+            raise DomainError("provider thread id must be positive")
+        if provider_thread_id is None and desired_reaction != "none":
+            raise DomainError("finding without a provider thread cannot request a reaction")
+        provider_review_id = source.get("provider_review_id")
+        if provider_review_id is not None and int(provider_review_id) <= 0:
+            raise DomainError("provider review id must be positive")
+        normalized.append(
+            {
+                "finding_id": finding_id,
+                "normalized_identity": identity,
+                "priority": priority,
+                "source": {
+                    "kind": str(source["kind"]),
+                    "provider": str(source.get("provider", "")),
+                    "provider_review_id": int(provider_review_id) if provider_review_id is not None else None,
+                    "provider_thread_id": int(provider_thread_id) if provider_thread_id is not None else None,
+                },
+                "principal_decision": {
+                    "decision": decision_value.value,
+                    "actor": actor,
+                    "reason": reason or None,
+                },
+                "desired_reaction": desired_reaction,
+            }
+        )
+    return sorted(normalized, key=lambda item: item["finding_id"])
+
+
+def create_work_package(
+    session: Session,
+    *,
+    publication_id: str,
+    implementation_issue_number: int | None,
+    review_run_id: str,
+    review_provider: str,
+    provider_review_id: int | None,
+    reviewed_head_sha: str,
+    findings: list[dict[str, Any]],
+    idempotency_key: str,
+) -> RemediationWorkPackageView:
+    if implementation_issue_number is not None and implementation_issue_number <= 0:
+        raise DomainError("implementation issue number must be positive")
+    if not review_run_id.strip() or len(review_run_id) > 160:
+        raise DomainError("review run id is invalid")
+    if not review_provider.strip() or len(review_provider) > 100:
+        raise DomainError("review provider is invalid")
+    head = reviewed_head_sha.lower()
+    if not _SHA_RE.fullmatch(head):
+        raise DomainError("reviewed_head_sha must be an exact 40-hex Git SHA")
+    if provider_review_id is not None and provider_review_id <= 0:
+        raise DomainError("provider review id must be positive")
+    normalized_findings = _normalize_findings(findings)
+    work_package_id = str(
+        uuid.uuid5(
+            _BATCH_NAMESPACE,
+            f"{publication_id}|{review_run_id}|{implementation_issue_number or 'pending'}",
+        )
+    )
+    publication_row = session.get(PublicationRow, publication_id)
+    if publication_row is None:
+        raise KeyError(publication_id)
+    _lock_create_scope(
+        session,
+        publication_row.repository,
+        implementation_issue_number,
+    )
+    if implementation_issue_number is not None:
+        linked_issue = session.scalar(
+            select(RemediationWorkPackageRow).where(
+                RemediationWorkPackageRow.repository == publication_row.repository,
+                RemediationWorkPackageRow.implementation_issue_number
+                == implementation_issue_number,
+            )
+        )
+        if linked_issue is not None and linked_issue.id != work_package_id:
+            raise DomainError("implementation issue is already linked to another work package")
+    source_review = _find_source_review(
+        session,
+        publication_id,
+        review_run_id,
+        head,
+        provider_review_id,
+    )
+    if source_review is None:
+        raise DomainError("source review run is missing or does not match the exact head")
+    if source_review["event_type"] != "CODEX_REVIEW_COMPLETED":
+        raise DomainError("source review provider is unsupported")
+    _validate_review_findings(
+        normalized_findings,
+        source_review=source_review,
+        review_provider=review_provider.strip(),
+    )
+    payload = {
+        "publication_id": publication_id,
+        "implementation_issue_number": implementation_issue_number,
+        "review_run": {
+            "run_id": review_run_id,
+            "provider": review_provider.strip(),
+            "provider_review_id": provider_review_id,
+            "head_sha": head,
+        },
+        "findings": [
+            _finding_defaults(finding)
+            for finding in normalized_findings
+        ],
+    }
+    existing_row = session.get(RemediationWorkPackageRow, work_package_id)
+    if existing_row is not None:
+        events = load_work_package_events(session, work_package_id)
+        if not events or _canonical(events[0]["payload"]) != _canonical(payload):
+            raise DomainError("work package identity already exists with different content")
+        session.commit()
+        return _fold(work_package_id, existing_row, events)
+
+    view = get_view(session, publication_id)
+    if view.remote_head_sha != head:
+        raise DomainError("reviewed head is not the current published head")
+
+    row = RemediationWorkPackageRow(
+        id=work_package_id,
+        publication_id=publication_id,
+        repository=publication_row.repository,
+        review_run_id=review_run_id,
+        reviewed_head_sha=head,
+        implementation_issue_number=implementation_issue_number,
+    )
+    session.add(row)
+    session.flush()
+    _append(
+        session,
+        row,
+        event_type="WORK_PACKAGE_CREATED",
+        idempotency_key=idempotency_key,
+        payload=payload,
+    )
+    session.commit()
+    return get_work_package(session, work_package_id)
+
+
+def record_implementation_issue_linked(
+    session: Session,
+    work_package_id: str,
+    *,
+    issue_number: int,
+    idempotency_key: str,
+) -> RemediationWorkPackageView:
+    if issue_number <= 0:
+        raise DomainError("implementation issue number must be positive")
+    row = _lock_work_package(session, work_package_id)
+    payload = {"issue_number": issue_number}
+    duplicate = _command_duplicate(
+        session,
+        row,
+        event_type="IMPLEMENTATION_ISSUE_LINKED",
+        idempotency_key=idempotency_key,
+        payload=payload,
+    )
+    if duplicate is not None:
+        return duplicate
+    if row.implementation_issue_number is not None:
+        if row.implementation_issue_number == issue_number:
+            session.commit()
+            return get_work_package(session, work_package_id)
+        raise DomainError("work package is already linked to another implementation issue")
+    linked = session.scalar(
+        select(RemediationWorkPackageRow).where(
+            RemediationWorkPackageRow.repository == row.repository,
+            RemediationWorkPackageRow.implementation_issue_number == issue_number,
+        )
+    )
+    if linked is not None and linked.id != row.id:
+        raise DomainError("implementation issue is already linked to another work package")
+    row.implementation_issue_number = issue_number
+    _append(
+        session,
+        row,
+        event_type="IMPLEMENTATION_ISSUE_LINKED",
+        idempotency_key=idempotency_key,
+        payload=payload,
+    )
+    session.commit()
+    return get_work_package(session, work_package_id)
+
+
+def _command_duplicate(
+    session: Session,
+    row: RemediationWorkPackageRow,
+    *,
+    event_type: str,
+    idempotency_key: str,
+    payload: dict[str, Any],
+) -> RemediationWorkPackageView | None:
+    existing = session.scalar(
+        select(RemediationEventRow).where(
+            RemediationEventRow.work_package_id == row.id,
+            RemediationEventRow.idempotency_key == idempotency_key,
+        )
+    )
+    if existing is None:
+        return None
+    if existing.event_type != event_type or _canonical(existing.payload) != _canonical(payload):
+        raise DomainError("idempotency key was already used for another command")
+    session.commit()
+    return get_work_package(session, row.id)
+
+
+def claim_work_package(
+    session: Session,
+    work_package_id: str,
+    *,
+    actor: str,
+    idempotency_key: str,
+) -> RemediationWorkPackageView:
+    row = _lock_work_package(session, work_package_id)
+    payload = {"actor": actor.strip()}
+    duplicate = _command_duplicate(
+        session,
+        row,
+        event_type="WORK_PACKAGE_CLAIMED",
+        idempotency_key=idempotency_key,
+        payload=payload,
+    )
+    if duplicate is not None:
+        return duplicate
+    view = get_work_package(session, work_package_id)
+    if view.state is WorkPackageState.IN_PROGRESS and view.implementer == payload["actor"]:
+        session.commit()
+        return view
+    if view.state not in {WorkPackageState.READY, WorkPackageState.REWORK_REQUIRED}:
+        raise DomainError("work package can only be claimed from READY or REWORK_REQUIRED")
+    if view.implementation_issue_number is None:
+        raise DomainError("implementation issue must be linked before the package can be claimed")
+    if not payload["actor"] or len(payload["actor"]) > 200:
+        raise DomainError("claim actor is required and bounded")
+    _append(
+        session,
+        row,
+        event_type="WORK_PACKAGE_CLAIMED",
+        idempotency_key=idempotency_key,
+        payload=payload,
+    )
+    session.commit()
+    return get_work_package(session, work_package_id)
+
+
+def submit_implementation(
+    session: Session,
+    work_package_id: str,
+    *,
+    candidate_id: str,
+    head_sha: str,
+    summary: str,
+    evidence_sha256: str,
+    idempotency_key: str,
+) -> RemediationWorkPackageView:
+    row = _lock_work_package(session, work_package_id)
+    payload = {
+        "candidate_id": candidate_id,
+        "head_sha": head_sha.lower(),
+        "summary": summary.strip(),
+        "evidence_sha256": evidence_sha256.lower(),
+    }
+    duplicate = _command_duplicate(
+        session,
+        row,
+        event_type="IMPLEMENTATION_SUBMITTED",
+        idempotency_key=idempotency_key,
+        payload=payload,
+    )
+    if duplicate is not None:
+        return duplicate
+    view = get_work_package(session, work_package_id)
+    if view.state is WorkPackageState.IMPLEMENTED:
+        if (
+            view.candidate_id == candidate_id
+            and view.implementation_head_sha == payload["head_sha"]
+            and view.implementation_summary == payload["summary"]
+            and view.implementation_evidence_sha256 == payload["evidence_sha256"]
+        ):
+            session.commit()
+            return view
+        raise DomainError("work package already has a different implementation submission")
+    if view.state is not WorkPackageState.IN_PROGRESS:
+        raise DomainError("implementation can only be submitted from IN_PROGRESS")
+    if not candidate_id or len(candidate_id) > 36:
+        raise DomainError("candidate id is invalid")
+    if not _SHA_RE.fullmatch(payload["head_sha"]):
+        raise DomainError("implementation head must be an exact 40-hex Git SHA")
+    if not _EVIDENCE_RE.fullmatch(payload["evidence_sha256"]):
+        raise DomainError("implementation evidence must be a SHA-256 digest")
+    if not payload["summary"] or len(payload["summary"]) > 4000:
+        raise DomainError("implementation summary must contain 1..4000 characters")
+    candidate = session.get(CandidateRow, candidate_id)
+    publication = get_view(session, row.publication_id)
+    if (
+        candidate is None
+        or candidate.publication_id != row.publication_id
+        or publication.current_candidate is None
+        or publication.current_candidate.candidate_id != candidate_id
+        or publication.current_candidate.head_sha != payload["head_sha"]
+    ):
+        raise DomainError("implementation submission does not match the current publication candidate")
+    _append(
+        session,
+        row,
+        event_type="IMPLEMENTATION_SUBMITTED",
+        idempotency_key=idempotency_key,
+        payload=payload,
+    )
+    session.commit()
+    return get_work_package(session, work_package_id)
+
+
+def begin_successor_verification(
+    session: Session,
+    work_package_id: str,
+    *,
+    review_run_id: str,
+    head_sha: str,
+    idempotency_key: str,
+) -> RemediationWorkPackageView:
+    row = _lock_work_package(session, work_package_id)
+    payload = {"review_run_id": review_run_id, "head_sha": head_sha.lower()}
+    duplicate = _command_duplicate(
+        session,
+        row,
+        event_type="SUCCESSOR_REVIEW_STARTED",
+        idempotency_key=idempotency_key,
+        payload=payload,
+    )
+    if duplicate is not None:
+        return duplicate
+    view = get_work_package(session, work_package_id)
+    if view.state is WorkPackageState.VERIFYING:
+        if view.successor_review_run_id == review_run_id and view.successor_head_sha == payload["head_sha"]:
+            session.commit()
+            return view
+        raise DomainError("work package is already bound to another successor review")
+    if view.state is not WorkPackageState.IMPLEMENTED:
+        raise DomainError("successor verification can only start from IMPLEMENTED")
+    if not _SHA_RE.fullmatch(payload["head_sha"]):
+        raise DomainError("successor head must be an exact 40-hex Git SHA")
+    publication = get_view(session, row.publication_id)
+    if (
+        payload["head_sha"] == row.reviewed_head_sha
+        or payload["head_sha"] != view.implementation_head_sha
+        or publication.current_candidate is None
+        or publication.current_candidate.candidate_id != view.candidate_id
+        or publication.current_candidate.head_sha != view.implementation_head_sha
+        or publication.remote_head_sha != payload["head_sha"]
+        or publication.automated_review_head_sha != payload["head_sha"]
+        or publication.automated_review_run_id != review_run_id
+        or publication.automated_review_status
+        not in {AutomatedReviewStatus.PASS, AutomatedReviewStatus.CHANGES_REQUIRED}
+    ):
+        raise DomainError("successor review is not complete for the exact published head")
+    _append(
+        session,
+        row,
+        event_type="SUCCESSOR_REVIEW_STARTED",
+        idempotency_key=idempotency_key,
+        payload=payload,
+    )
+    session.commit()
+    return get_work_package(session, work_package_id)
+
+
+def begin_rejected_findings_finalization(
+    session: Session,
+    work_package_id: str,
+    *,
+    idempotency_key: str,
+) -> RemediationWorkPackageView:
+    row = _lock_work_package(session, work_package_id)
+    payload = {
+        "review_run_id": row.review_run_id,
+        "head_sha": row.reviewed_head_sha,
+    }
+    duplicate = _command_duplicate(
+        session,
+        row,
+        event_type="REJECTED_FINDINGS_FINALIZATION_STARTED",
+        idempotency_key=idempotency_key,
+        payload=payload,
+    )
+    if duplicate is not None:
+        return duplicate
+    view = get_work_package(session, work_package_id)
+    if view.state is WorkPackageState.VERIFYING:
+        if view.successor_review_run_id is None and view.successor_head_sha is None:
+            session.commit()
+            return view
+        raise DomainError("work package is bound to a successor review")
+    if view.state is not WorkPackageState.READY:
+        raise DomainError("rejected findings can finalize only from READY")
+    if not view.findings or any(
+        finding["principal_decision"]["decision"] != PrincipalDecision.REJECTED.value
+        for finding in view.findings
+    ):
+        raise DomainError("decision-only finalization requires all findings to be rejected")
+    publication = get_view(session, row.publication_id)
+    if (
+        publication.remote_head_sha != row.reviewed_head_sha
+        or publication.automated_review_head_sha != row.reviewed_head_sha
+        or publication.automated_review_run_id != row.review_run_id
+        or publication.automated_review_status
+        not in {AutomatedReviewStatus.PASS, AutomatedReviewStatus.CHANGES_REQUIRED}
+    ):
+        raise DomainError("principal decisions are no longer current for the reviewed head")
+    _append(
+        session,
+        row,
+        event_type="REJECTED_FINDINGS_FINALIZATION_STARTED",
+        idempotency_key=idempotency_key,
+        payload=payload,
+    )
+    session.commit()
+    return get_work_package(session, work_package_id)
+
+
+def verify_finding(
+    session: Session,
+    work_package_id: str,
+    *,
+    finding_id: str,
+    outcome: str,
+    reviewer: str,
+    evidence: str,
+    idempotency_key: str,
+) -> RemediationWorkPackageView:
+    row = _lock_work_package(session, work_package_id)
+    current = get_work_package(session, work_package_id)
+    finding = next((item for item in current.findings if item["finding_id"] == finding_id), None)
+    if finding is None:
+        raise DomainError("finding does not belong to this work package")
+    if finding["principal_decision"]["decision"] != PrincipalDecision.ACCEPTED.value:
+        raise DomainError("only accepted findings require successor verification")
+    normalized_outcome = outcome.upper()
+    if normalized_outcome not in {"ABSENT", "PERSISTS"}:
+        raise DomainError("finding verification outcome must be ABSENT or PERSISTS")
+    stable_request = {
+        "finding_id": finding_id,
+        "outcome": normalized_outcome,
+        "reviewer": reviewer.strip(),
+        "evidence": evidence.strip(),
+    }
+    existing = session.scalar(
+        select(RemediationEventRow).where(
+            RemediationEventRow.work_package_id == row.id,
+            RemediationEventRow.idempotency_key == idempotency_key,
+        )
+    )
+    if existing is not None:
+        if existing.event_type != "FINDING_VERIFIED" or any(
+            existing.payload.get(key) != value
+            for key, value in stable_request.items()
+        ):
+            raise DomainError("idempotency key was already used for another command")
+        session.commit()
+        return get_work_package(session, work_package_id)
+    if current.state is not WorkPackageState.VERIFYING:
+        raise DomainError("findings can only be verified during VERIFYING")
+    payload = {
+        **stable_request,
+        "review_run_id": current.successor_review_run_id,
+        "head_sha": current.successor_head_sha,
+    }
+    if not payload["review_run_id"] or not payload["head_sha"]:
+        raise DomainError("successor review binding is required for finding verification")
+    if not idempotency_key.strip() or len(idempotency_key) > 200:
+        raise DomainError("idempotency_key must contain 1..200 characters")
+    duplicate = _command_duplicate(
+        session,
+        row,
+        event_type="FINDING_VERIFIED",
+        idempotency_key=idempotency_key,
+        payload=payload,
+    )
+    if duplicate is not None:
+        return duplicate
+    if not payload["reviewer"] or len(payload["reviewer"]) > 200:
+        raise DomainError("verification reviewer is required and bounded")
+    if not payload["evidence"] or len(payload["evidence"]) > 4000:
+        raise DomainError("verification evidence is required and bounded")
+    prior = finding.get("verification")
+    if prior is not None:
+        if prior == {
+            "outcome": payload["outcome"],
+            "review_run_id": payload["review_run_id"],
+            "head_sha": payload["head_sha"],
+            "reviewer": payload["reviewer"],
+            "evidence": payload["evidence"],
+        }:
+            session.commit()
+            return current
+        raise DomainError("finding already has a different verification result")
+    _append(
+        session,
+        row,
+        event_type="FINDING_VERIFIED",
+        idempotency_key=idempotency_key,
+        payload=payload,
+    )
+    updated = get_work_package(session, work_package_id)
+    accepted_findings = [
+        item
+        for item in updated.findings
+        if item["principal_decision"]["decision"] == PrincipalDecision.ACCEPTED.value
+    ]
+    if accepted_findings and all(item["verification"] is not None for item in accepted_findings):
+        persistent_ids = sorted(
+            item["finding_id"]
+            for item in accepted_findings
+            if item["verification"]["outcome"] == "PERSISTS"
+        )
+        if persistent_ids:
+            absent_ids = sorted(
+                item["finding_id"]
+                for item in accepted_findings
+                if item["verification"]["outcome"] == "ABSENT"
+            )
+            run_id = updated.successor_review_run_id
+            assert run_id is not None
+            _append(
+                session,
+                row,
+                event_type="WORK_PACKAGE_REWORK_REQUIRED",
+                idempotency_key=f"auto-rework:{run_id}",
+                payload={
+                    "review_run_id": run_id,
+                    "head_sha": updated.successor_head_sha,
+                    "implementation_head_sha": updated.implementation_head_sha,
+                    "persistent_finding_ids": persistent_ids,
+                    "absent_finding_ids": absent_ids,
+                },
+            )
+    session.commit()
+    return get_work_package(session, work_package_id)
+
+
+def record_github_artifact(
+    session: Session,
+    work_package_id: str,
+    *,
+    finding_id: str,
+    artifact: str,
+    remote_id: int | str,
+    idempotency_key: str,
+) -> RemediationWorkPackageView:
+    row = _lock_work_package(session, work_package_id)
+    view = get_work_package(session, work_package_id)
+    if view.state is not WorkPackageState.VERIFYING:
+        raise DomainError("GitHub finding artifacts can only be recorded during VERIFYING")
+    finding = next((item for item in view.findings if item["finding_id"] == finding_id), None)
+    if finding is None:
+        raise DomainError("finding does not belong to this work package")
+    if artifact not in {"reaction", "reply", "resolution"}:
+        raise DomainError("GitHub artifact type is invalid")
+    if finding["source"].get("provider_thread_id") is None:
+        raise DomainError("internal findings do not have GitHub thread artifacts")
+    if artifact == "reaction" and finding["desired_reaction"] == "none":
+        raise DomainError("finding decision does not request a reaction")
+    if finding["closure_state"] not in {
+        "VERIFIED_ABSENT",
+        "REJECTED_BY_PRINCIPAL",
+    }:
+        raise DomainError("finding closure evidence is required before thread materialization")
+    if isinstance(remote_id, int) and remote_id <= 0:
+        raise DomainError("GitHub materialization id must be positive")
+    payload = {"finding_id": finding_id, "artifact": artifact, "remote_id": remote_id}
+    duplicate = _command_duplicate(
+        session,
+        row,
+        event_type="GITHUB_ARTIFACT_MATERIALIZED",
+        idempotency_key=idempotency_key,
+        payload=payload,
+    )
+    if duplicate is not None:
+        return duplicate
+    if finding["materialization"][artifact] == "MATERIALIZED":
+        if finding["materialization_ids"].get(artifact) == remote_id:
+            session.commit()
+            return view
+        raise DomainError("GitHub artifact already has a different materialization")
+    _append(
+        session,
+        row,
+        event_type="GITHUB_ARTIFACT_MATERIALIZED",
+        idempotency_key=idempotency_key,
+        payload=payload,
+    )
+    session.commit()
+    return get_work_package(session, work_package_id)
+
+
+def record_summary_comment(
+    session: Session,
+    work_package_id: str,
+    *,
+    comment_id: int,
+    idempotency_key: str,
+) -> RemediationWorkPackageView:
+    row = _lock_work_package(session, work_package_id)
+    view = get_work_package(session, work_package_id)
+    if view.state is not WorkPackageState.VERIFYING or comment_id <= 0:
+        raise DomainError("work package summary comment cannot be recorded yet")
+    if any(
+        finding["closure_state"] not in {"VERIFIED_ABSENT", "REJECTED_BY_PRINCIPAL"}
+        or any(value not in {"MATERIALIZED", "NOT_APPLICABLE"} for value in finding["materialization"].values())
+        for finding in view.findings
+    ):
+        raise DomainError("all finding verification and thread artifacts must finish first")
+    payload = {"comment_id": comment_id}
+    duplicate = _command_duplicate(
+        session,
+        row,
+        event_type="WORK_PACKAGE_SUMMARY_MATERIALIZED",
+        idempotency_key=idempotency_key,
+        payload=payload,
+    )
+    if duplicate is not None:
+        return duplicate
+    if view.summary_comment_id is not None:
+        if view.summary_comment_id == comment_id:
+            session.commit()
+            return view
+        raise DomainError("work package already has a different summary comment")
+    _append(
+        session,
+        row,
+        event_type="WORK_PACKAGE_SUMMARY_MATERIALIZED",
+        idempotency_key=idempotency_key,
+        payload=payload,
+    )
+    session.commit()
+    return get_work_package(session, work_package_id)
+
+
+def record_issue_closed(
+    session: Session,
+    work_package_id: str,
+    *,
+    idempotency_key: str,
+) -> RemediationWorkPackageView:
+    row = _lock_work_package(session, work_package_id)
+    view = get_work_package(session, work_package_id)
+    if (
+        view.state is not WorkPackageState.VERIFYING
+        or view.summary_comment_id is None
+        or view.implementation_issue_number is None
+    ):
+        raise DomainError("implementation issue cannot close before the summary comment")
+    payload: dict[str, Any] = {"issue_number": view.implementation_issue_number}
+    duplicate = _command_duplicate(
+        session,
+        row,
+        event_type="IMPLEMENTATION_ISSUE_CLOSED",
+        idempotency_key=idempotency_key,
+        payload=payload,
+    )
+    if duplicate is not None:
+        return duplicate
+    if not view.issue_closed:
+        _append(
+            session,
+            row,
+            event_type="IMPLEMENTATION_ISSUE_CLOSED",
+            idempotency_key=idempotency_key,
+            payload=payload,
+        )
+    session.commit()
+    return get_work_package(session, work_package_id)
+
+
+def complete_work_package(
+    session: Session,
+    work_package_id: str,
+    *,
+    idempotency_key: str,
+) -> RemediationWorkPackageView:
+    row = _lock_work_package(session, work_package_id)
+    view = get_work_package(session, work_package_id)
+    payload: dict[str, Any] = {"implementation_issue_number": view.implementation_issue_number}
+    duplicate = _command_duplicate(
+        session,
+        row,
+        event_type="WORK_PACKAGE_COMPLETED",
+        idempotency_key=idempotency_key,
+        payload=payload,
+    )
+    if duplicate is not None:
+        return duplicate
+    if view.state is WorkPackageState.DONE:
+        session.commit()
+        return view
+    if view.state is not WorkPackageState.VERIFYING or not view.issue_closed:
+        raise DomainError("work package can only complete after verification and issue closure")
+    if view.summary_comment_id is None or any(
+        finding["closure_state"] not in {"VERIFIED_ABSENT", "REJECTED_BY_PRINCIPAL"}
+        or any(value not in {"MATERIALIZED", "NOT_APPLICABLE"} for value in finding["materialization"].values())
+        for finding in view.findings
+    ):
+        raise DomainError("work package findings are not fully closed")
+    _append(
+        session,
+        row,
+        event_type="WORK_PACKAGE_COMPLETED",
+        idempotency_key=idempotency_key,
+        payload=payload,
+    )
+    session.commit()
+    return get_work_package(session, work_package_id)
+
+
+def work_package_events(session: Session, work_package_id: str) -> list[dict[str, Any]]:
+    if session.get(RemediationWorkPackageRow, work_package_id) is None:
+        raise KeyError(work_package_id)
+    return load_work_package_events(session, work_package_id)
+
+
+def claim_github_artifact_dispatch(
+    session: Session,
+    work_package_id: str,
+    *,
+    artifact_key: str,
+    lease_id: str,
+    lease_seconds: int = 60,
+) -> bool:
+    if not artifact_key.strip() or len(artifact_key) > 300:
+        raise DomainError("artifact dispatch key is invalid")
+    if not lease_id.strip() or len(lease_id) > 36:
+        raise DomainError("artifact dispatch lease id is invalid")
+    _lock_work_package(session, work_package_id)
+    dispatch = session.scalar(
+        select(RemediationDispatchRow)
+        .where(
+            RemediationDispatchRow.work_package_id == work_package_id,
+            RemediationDispatchRow.artifact_key == artifact_key,
+        )
+        .with_for_update()
+    )
+    now = datetime.now(timezone.utc)
+    if dispatch is not None and dispatch.lease_expires_at is not None:
+        expires_at = dispatch.lease_expires_at
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if expires_at > now:
+            session.commit()
+            return False
+    if dispatch is None:
+        dispatch = RemediationDispatchRow(
+            work_package_id=work_package_id,
+            artifact_key=artifact_key,
+            lease_id=lease_id,
+            lease_expires_at=now + timedelta(seconds=lease_seconds),
+        )
+        session.add(dispatch)
+    else:
+        dispatch.lease_id = lease_id
+        dispatch.lease_expires_at = now + timedelta(seconds=lease_seconds)
+    session.commit()
+    return True
+
+
+def release_github_artifact_dispatch(
+    session: Session,
+    work_package_id: str,
+    *,
+    artifact_key: str,
+    lease_id: str,
+) -> None:
+    dispatch = session.scalar(
+        select(RemediationDispatchRow)
+        .where(
+            RemediationDispatchRow.work_package_id == work_package_id,
+            RemediationDispatchRow.artifact_key == artifact_key,
+        )
+        .with_for_update()
+    )
+    if dispatch is not None and dispatch.lease_id == lease_id:
+        dispatch.lease_id = None
+        dispatch.lease_expires_at = None
+    session.commit()

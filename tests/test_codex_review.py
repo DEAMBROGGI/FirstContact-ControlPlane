@@ -5,7 +5,10 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 from pydantic import SecretStr
+from sqlalchemy.dialects import postgresql
+from sqlalchemy.schema import CreateTable
 
+import control_plane.codex_review as codex_review_module
 from control_plane.codex_review import (
     CodexReviewBroker,
     CodexReviewError,
@@ -29,6 +32,7 @@ from control_plane.github_app import InstallationAccess
 from control_plane.github_review_auth import (
     GitHubReviewTokenProvider,
 )
+from control_plane.models import CodexReviewDispatchRow
 from control_plane.profile_registry import profile_for_repository
 from control_plane.quarantine import VerifiedCandidateSource
 from control_plane.repository import load_events
@@ -164,7 +168,7 @@ def broker(
     *,
     github=None,
     mode="required",
-    actors=("chatgpt-codex-connector",),
+    actors=(CODEX_ACTOR,),
     trigger_token="github_pat_human-review-token",
 ):
     token_provider = FakeTokenProvider()
@@ -329,6 +333,7 @@ def test_running_without_registered_trigger_recovers_dispatch_once(session):
         session,
         view.publication_id,
         mode="required",
+        expected_head_sha=view.remote_head_sha,
     )
     run_id = running.automated_review_run_id
     assert run_id is not None
@@ -364,6 +369,7 @@ def test_retry_during_active_dispatch_lease_does_not_create_second_run_or_commen
         session,
         view.publication_id,
         mode="required",
+        expected_head_sha=view.remote_head_sha,
     )
     run_id = running.automated_review_run_id
     assert run_id is not None
@@ -456,6 +462,7 @@ def test_dispatch_lease_serializes_trigger_ownership(session):
         session,
         view.publication_id,
         mode="required",
+        expected_head_sha=view.remote_head_sha,
     )
     run_id = running.automated_review_run_id
     assert run_id is not None
@@ -669,6 +676,66 @@ def test_untrusted_review_actor_does_not_complete_codex_run(session):
     ).automated_review_status is AutomatedReviewStatus.RUNNING
 
 
+@pytest.mark.parametrize("review_state", ["DISMISSED", "PENDING", "FUTURE_STATE"])
+def test_non_final_codex_review_states_never_pass(session, review_state):
+    view = published_publication(session)
+    value, _tokens, github = broker()
+    value.request(session, view.publication_id)
+    github.reviews.append(
+        PullReviewSnapshot(
+            review_id=520,
+            actor=CODEX_ACTOR,
+            body="Provider result in a non-final state.",
+            state=review_state,
+            commit_id=HEAD,
+            submitted_at="2026-09-27T20:01:00Z",
+        )
+    )
+
+    observed = value.reconcile(session, view.publication_id)
+
+    assert observed.state == "RUNNING"
+    assert get_view(session, view.publication_id).automated_review_status is AutomatedReviewStatus.RUNNING
+
+
+def test_clean_review_reaction_path_is_independent_of_review_state(session):
+    view = published_publication(session)
+    value, _tokens, github = broker()
+    running = value.request(session, view.publication_id)
+    github.reviews.append(
+        PullReviewSnapshot(
+            review_id=521,
+            actor=CODEX_ACTOR,
+            body="Not a final review state.",
+            state="PENDING",
+            commit_id=HEAD,
+            submitted_at="2026-09-27T20:01:00Z",
+        )
+    )
+    github.reactions.append(
+        IssueReactionSnapshot(
+            reaction_id=522,
+            actor=CODEX_ACTOR,
+            content="+1",
+            created_at="2026-09-27T20:01:00Z",
+        )
+    )
+
+    observed = value.reconcile(session, view.publication_id)
+
+    assert observed.state == "PASS"
+    assert observed.matching_reviews == 0
+    assert observed.matching_reactions == 1
+
+
+def test_codex_actor_matching_preserves_bot_suffix():
+    exact, _tokens, _github = broker(actors=(CODEX_ACTOR,))
+    unbot, _tokens, _github = broker(actors=("chatgpt-codex-connector",))
+
+    assert exact._is_allowed_actor(CODEX_ACTOR)
+    assert not unbot._is_allowed_actor(CODEX_ACTOR)
+
+
 def test_stale_pr_head_fails_before_review_lock(session):
     view = published_publication(session)
     github = FakeGitHub()
@@ -692,7 +759,7 @@ def test_disabled_mode_never_invokes_github(session):
     assert github.posted_bodies == []
 
 
-def test_preexisting_unmanaged_codex_invocation_blocks_governed_trigger(session):
+def test_same_second_unmanaged_codex_invocation_blocks_governed_trigger(session):
     from control_plane.repository import load_events
 
     view = published_publication(session)
@@ -708,7 +775,7 @@ def test_preexisting_unmanaged_codex_invocation_blocks_governed_trigger(session)
             comment_id=850,
             actor="DEAMBROGGI",
             body="@codex review",
-            created_at=(published_at + timedelta(seconds=1)).isoformat(),
+            created_at=published_at.replace(microsecond=0).isoformat(),
         )
     )
 
@@ -720,12 +787,71 @@ def test_preexisting_unmanaged_codex_invocation_blocks_governed_trigger(session)
     assert after.automated_review_status is AutomatedReviewStatus.UNAVAILABLE
 
 
+def test_stale_locked_codex_head_check_closes_external_verification_race(
+    session,
+    monkeypatch,
+):
+    view = published_publication(session)
+    value, _tokens, github = broker()
+    verified_head = view.remote_head_sha
+    assert verified_head is not None
+    head_b = "4" * 40
+    source_b = VerifiedCandidateSource(
+        bundle_sha256="b" * 64,
+        byte_length=2345,
+        quarantine_id="b" * 64,
+        base_sha=BASE,
+        head_sha=head_b,
+        tree_sha="5" * 40,
+    )
+    original_request = codex_review_module.request_codex_review
+
+    def request_after_successor(*args, **kwargs):
+        submitted = submit_verified_candidate(session, view.publication_id, source_b)
+        profile = profile_for_repository(view.repository)
+        for index, job in enumerate(profile.required_jobs, 1):
+            submitted = record_validation(
+                session,
+                view.publication_id,
+                job_id=job,
+                status=ValidationStatus.PASS,
+                evidence_sha256=f"{index + 10:064x}",
+            )
+        mark_remote_published(
+            session,
+            view.publication_id,
+            head_b,
+            branch=view.remote_branch,
+            base_branch=view.base_branch,
+            pull_request_number=view.pull_request_number,
+        )
+        return original_request(*args, **kwargs)
+
+    monkeypatch.setattr(
+        codex_review_module,
+        "request_codex_review",
+        request_after_successor,
+    )
+
+    with pytest.raises(CodexReviewError, match="failed closed"):
+        value.request(session, view.publication_id)
+
+    latest = get_view(session, view.publication_id)
+    assert latest.remote_head_sha == head_b
+    assert latest.automated_review_status is None
+    assert not any(
+        event["event_type"] == "CODEX_REVIEW_REQUESTED"
+        for event in load_events(session, view.publication_id)
+    )
+
+
 def test_retry_after_unavailable_creates_new_codex_attempt(session):
     view = published_publication(session)
     first = request_codex_review(
         session,
         view.publication_id,
         mode="required",
+        expected_head_sha=view.remote_head_sha,
     )
     first_run = first.automated_review_run_id
     assert first_run is not None
@@ -741,6 +867,7 @@ def test_retry_after_unavailable_creates_new_codex_attempt(session):
         session,
         view.publication_id,
         mode="required",
+        expected_head_sha=view.remote_head_sha,
     )
 
     assert second.automated_review_status is AutomatedReviewStatus.RUNNING
@@ -857,3 +984,12 @@ def test_successor_head_gets_new_codex_run_and_old_trigger_remains_historical(se
         head_b,
     ) in github.issue_comments[1].body
     assert github.issue_comments[1].comment_id != github.issue_comments[0].comment_id
+
+
+def test_dispatch_comment_id_uses_postgresql_bigint():
+    ddl = str(
+        CreateTable(CodexReviewDispatchRow.__table__).compile(
+            dialect=postgresql.dialect()
+        )
+    ).lower()
+    assert "completed_comment_id bigint" in ddl

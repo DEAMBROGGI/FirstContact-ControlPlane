@@ -434,12 +434,16 @@ def request_codex_review(
     publication_id: str,
     *,
     mode: str,
+    expected_head_sha: str,
 ) -> PublicationView:
     if mode not in {"advisory", "required"}:
         raise DomainError("Codex review mode must be advisory or required")
     view = _locked_publication_view(session, publication_id)
     if view.remote_head_sha is None:
         raise DomainError("Codex review requires published head")
+    expected_head = _sha(expected_head_sha, "expected_head_sha")
+    if view.remote_head_sha != expected_head:
+        raise DomainError("verified Codex review head is stale")
 
     if (
         view.automated_review_head_sha == view.remote_head_sha

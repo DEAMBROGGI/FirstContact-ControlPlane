@@ -42,10 +42,7 @@ def assert_no_reserved_automation_mentions(value: str) -> None:
 
 
 def _actor_key(value: str) -> str:
-    normalized = value.strip().lower()
-    if normalized.endswith("[bot]"):
-        normalized = normalized[:-5]
-    return normalized
+    return value.strip().lower()
 
 
 def _parse_time(value: str | None) -> datetime | None:
@@ -127,7 +124,11 @@ class CodexReviewBroker:
         observed = _parse_time(matches[-1].get("occurred_at"))
         if observed is None:
             raise CodexReviewError("published head timestamp is missing")
-        return observed
+        # GitHub issue comments expose second precision. Flooring the
+        # publication cutoff makes same-second invocations ambiguous and
+        # therefore fail closed, while comments from earlier seconds remain
+        # historical.
+        return observed.replace(microsecond=0)
 
     @staticmethod
     def _verify_exact_pr(view, pull) -> None:
@@ -227,6 +228,7 @@ class CodexReviewBroker:
                 session,
                 publication_id,
                 mode=self.mode,
+                expected_head_sha=pull.head_sha,
             )
             if locked.automated_review_status is not AutomatedReviewStatus.RUNNING:
                 return locked
@@ -442,6 +444,7 @@ class CodexReviewBroker:
             submitted = _parse_time(item.submitted_at)
             if (
                 self._is_allowed_actor(item.actor)
+                and item.state.strip().upper() == "COMMENTED"
                 and item.commit_id == view.automated_review_head_sha
                 and submitted is not None
                 and submitted >= trigger_time
