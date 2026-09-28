@@ -105,6 +105,8 @@ class FakeGateway:
         self.pull_head_sha = None
         self.ensure_calls = 0
         self.pull_request_calls = 0
+        self.target_sha_reads = []
+        self.pull_responses = []
 
     def repository(self, repository, token):
         assert token == "installation-secret"
@@ -114,6 +116,8 @@ class FakeGateway:
         assert token == "installation-secret"
         if branch == "master":
             return self.base_sha
+        if self.target_sha_reads:
+            return self.target_sha_reads.pop(0)
         return self.target_sha
 
     def ensure_pull_request(
@@ -144,6 +148,11 @@ class FakeGateway:
     def pull_request(self, repository, number, token):
         self.pull_request_calls += 1
         assert number == self.pull_number
+        if self.pull_responses:
+            response = self.pull_responses.pop(0)
+            if isinstance(response, Exception):
+                raise response
+            return response
         if self.pull_missing:
             raise GitHubApiError("pull request not found")
         return PullRequestSnapshot(
@@ -174,7 +183,7 @@ class FakePush:
             raise PublicationError("remote ref failed exact expected-old lease")
         self.gateway.target_sha = self.expected_head
         self.gateway.pull_head_sha = self.expected_head
-def publisher_for(view, quarantine, source, gateway=None):
+def publisher_for(view, quarantine, source, gateway=None, sleep=None):
     gateway = gateway or FakeGateway(
         base_sha=view.current_candidate.base_sha,
         head_sha=view.current_candidate.head_sha,
@@ -185,6 +194,7 @@ def publisher_for(view, quarantine, source, gateway=None):
         github=gateway,
         quarantine=quarantine,
         git_push=push,
+        sleep=sleep or (lambda _delay: None),
     )
     return publisher, gateway, push
 
@@ -356,6 +366,8 @@ def test_successor_fast_forward_reuses_same_branch_and_pull_request(session, tmp
         session,
         tmp_path,
     )
+    sleeps = []
+    publisher_b.sleep = sleeps.append
 
     published_b = publisher_b.publish(session, second.publication_id)
 
@@ -367,6 +379,7 @@ def test_successor_fast_forward_reuses_same_branch_and_pull_request(session, tmp
     assert published_b.pull_request_number == first.pull_request_number
     assert gateway.ensure_calls == 1
     assert gateway.pull_request_calls == 2
+    assert sleeps == []
     assert push_b.calls == 1
     assert push_b.expected_old_shas == [first.remote_head_sha]
     events = load_events(session, second.publication_id)
@@ -386,6 +399,203 @@ def test_successor_fast_forward_reuses_same_branch_and_pull_request(session, tmp
         [event for event in load_events(session, second.publication_id)
          if event["event_type"] == "REMOTE_PUBLISHED"]
     ) == 2
+
+
+def pull_snapshot(view, *, head_sha=None, state="open", head_ref=None, base_ref=None, number=None):
+    return PullRequestSnapshot(
+        number=number or view.pull_request_number,
+        state=state,
+        base_ref=base_ref or view.base_branch,
+        head_ref=head_ref or view.remote_branch,
+        head_sha=head_sha or view.current_candidate.head_sha,
+    )
+
+
+def remote_published_events(session, publication_id):
+    return [
+        event
+        for event in load_events(session, publication_id)
+        if event["event_type"] == "REMOTE_PUBLISHED"
+    ]
+
+
+def test_successor_retries_stale_pr_head_then_converges(session, tmp_path):
+    first, second, _quarantine, _source, gateway, publisher, _push_a, push = successor_setup(
+        session,
+        tmp_path,
+    )
+    old_head = first.remote_head_sha
+    new_head = second.current_candidate.head_sha
+    gateway.pull_responses.extend(
+        [
+            pull_snapshot(second, head_sha=old_head),  # strict pre-push read
+            pull_snapshot(second, head_sha=old_head),  # stale readback
+            pull_snapshot(second, head_sha=new_head),
+        ]
+    )
+    sleeps = []
+    publisher.sleep = sleeps.append
+
+    published = publisher.publish(session, second.publication_id)
+
+    assert published.remote_head_sha == new_head
+    assert push.calls == 1
+    assert gateway.pull_request_calls == 3
+    assert sleeps == [0.2]
+    assert len(remote_published_events(session, second.publication_id)) == 2
+
+
+def test_successor_retries_stale_branch_and_pr_then_converges(session, tmp_path):
+    first, second, _quarantine, _source, gateway, publisher, _push_a, push = successor_setup(
+        session,
+        tmp_path,
+    )
+    old_head = first.remote_head_sha
+    new_head = second.current_candidate.head_sha
+    gateway.target_sha_reads.extend([old_head, old_head, new_head])
+    gateway.pull_responses.extend(
+        [
+            pull_snapshot(second, head_sha=old_head),
+            pull_snapshot(second, head_sha=old_head),
+            pull_snapshot(second, head_sha=new_head),
+        ]
+    )
+    sleeps = []
+    publisher.sleep = sleeps.append
+
+    published = publisher.publish(session, second.publication_id)
+
+    assert published.remote_head_sha == new_head
+    assert push.calls == 1
+    assert gateway.pull_request_calls == 3
+    assert sleeps == [0.2]
+    assert len(remote_published_events(session, second.publication_id)) == 2
+
+
+def test_persistent_stale_readback_fails_after_bounded_attempts(session, tmp_path):
+    first, second, _quarantine, _source, gateway, publisher, _push_a, push = successor_setup(
+        session,
+        tmp_path,
+    )
+    stale_head = first.remote_head_sha
+    gateway.pull_responses.extend(
+        [pull_snapshot(second, head_sha=stale_head) for _ in range(5)]
+    )
+    before_events = len(remote_published_events(session, second.publication_id))
+    sleeps = []
+    publisher.sleep = sleeps.append
+
+    with pytest.raises(PublicationError, match="did not converge after 4 attempts"):
+        publisher.publish(session, second.publication_id)
+
+    assert push.calls == 1
+    assert gateway.pull_request_calls == 5
+    assert sleeps == [0.2, 0.2, 0.2]
+    assert get_view(session, second.publication_id).state is PublicationState.ADMITTED
+    assert len(remote_published_events(session, second.publication_id)) == before_events
+
+
+def test_unexpected_post_push_branch_sha_fails_without_retry(session, tmp_path):
+    first, second, _quarantine, _source, gateway, publisher, _push_a, push = successor_setup(
+        session,
+        tmp_path,
+    )
+    gateway.target_sha_reads.extend([first.remote_head_sha, "e" * 40])
+    sleeps = []
+    publisher.sleep = sleeps.append
+    before_events = len(remote_published_events(session, second.publication_id))
+
+    with pytest.raises(PublicationError, match="branch changed during readback"):
+        publisher.publish(session, second.publication_id)
+
+    assert push.calls == 1
+    assert gateway.pull_request_calls == 1
+    assert sleeps == []
+    assert len(remote_published_events(session, second.publication_id)) == before_events
+
+
+def test_unexpected_post_push_pr_sha_fails_without_retry(session, tmp_path):
+    first, second, _quarantine, _source, gateway, publisher, _push_a, push = successor_setup(
+        session,
+        tmp_path,
+    )
+    gateway.pull_responses.extend(
+        [
+            pull_snapshot(second, head_sha=first.remote_head_sha),
+            pull_snapshot(second, head_sha="e" * 40),
+        ]
+    )
+    sleeps = []
+    publisher.sleep = sleeps.append
+
+    with pytest.raises(PublicationError, match="head changed during readback"):
+        publisher.publish(session, second.publication_id)
+
+    assert push.calls == 1
+    assert gateway.pull_request_calls == 2
+    assert sleeps == []
+    assert get_view(session, second.publication_id).state is PublicationState.ADMITTED
+
+
+def test_closed_post_push_pull_request_fails_without_retry(session, tmp_path):
+    first, second, _quarantine, _source, gateway, publisher, _push_a, push = successor_setup(
+        session,
+        tmp_path,
+    )
+    gateway.pull_responses.extend(
+        [
+            pull_snapshot(second, head_sha=first.remote_head_sha),
+            pull_snapshot(second, state="closed"),
+        ]
+    )
+    sleeps = []
+    publisher.sleep = sleeps.append
+
+    with pytest.raises(PublicationError, match="not open"):
+        publisher.publish(session, second.publication_id)
+
+    assert push.calls == 1
+    assert gateway.pull_request_calls == 2
+    assert sleeps == []
+    assert get_view(session, second.publication_id).state is PublicationState.ADMITTED
+
+
+@pytest.mark.parametrize(
+    ("snapshot_kwargs", "message"),
+    [
+        ({"head_ref": "unexpected-branch"}, "branch changed"),
+        ({"base_ref": "unexpected-base"}, "base changed"),
+        ({"number": 999}, "number changed"),
+    ],
+)
+def test_changed_post_push_pull_identity_fails_without_retry(
+    session,
+    tmp_path,
+    snapshot_kwargs,
+    message,
+):
+    first, second, _quarantine, _source, gateway, publisher, _push_a, push = successor_setup(
+        session,
+        tmp_path,
+    )
+    gateway.pull_responses.extend(
+        [
+            pull_snapshot(second, head_sha=first.remote_head_sha),
+            pull_snapshot(second, **snapshot_kwargs),
+        ]
+    )
+    sleeps = []
+    publisher.sleep = sleeps.append
+    before_events = len(remote_published_events(session, second.publication_id))
+
+    with pytest.raises(PublicationError, match=message):
+        publisher.publish(session, second.publication_id)
+
+    assert push.calls == 1
+    assert gateway.pull_request_calls == 2
+    assert sleeps == []
+    assert get_view(session, second.publication_id).state is PublicationState.ADMITTED
+    assert len(remote_published_events(session, second.publication_id)) == before_events
 
 
 def test_successor_rejects_remote_branch_changed_outside_governed_head(session, tmp_path):
@@ -471,6 +681,15 @@ def test_successor_recovers_remote_candidate_without_a_second_push(session, tmp_
     )
     gateway.target_sha = second.current_candidate.head_sha
     gateway.pull_head_sha = second.current_candidate.head_sha
+    gateway.pull_responses.extend(
+        [
+            pull_snapshot(second, head_sha=first.remote_head_sha),
+            pull_snapshot(second, head_sha=first.remote_head_sha),
+            pull_snapshot(second, head_sha=second.current_candidate.head_sha),
+        ]
+    )
+    sleeps = []
+    publisher_b.sleep = sleeps.append
 
     recovered = publisher_b.publish(session, second.publication_id)
 
@@ -478,6 +697,8 @@ def test_successor_recovers_remote_candidate_without_a_second_push(session, tmp_
     assert recovered.remote_head_sha == second.current_candidate.head_sha
     assert gateway.target_sha == recovered.remote_head_sha
     assert push_b.calls == 0
+    assert gateway.pull_request_calls == 3
+    assert sleeps == [0.2]
     remote_events = [
         event for event in load_events(session, second.publication_id)
         if event["event_type"] == "REMOTE_PUBLISHED"
@@ -488,6 +709,7 @@ def test_successor_recovers_remote_candidate_without_a_second_push(session, tmp_
     retried = publisher_b.publish(session, second.publication_id)
     assert retried == recovered
     assert push_b.calls == 0
+    assert len(sleeps) == 1
     assert len(
         [event for event in load_events(session, second.publication_id)
          if event["event_type"] == "REMOTE_PUBLISHED"]

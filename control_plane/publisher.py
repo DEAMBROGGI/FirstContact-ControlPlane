@@ -4,8 +4,10 @@ import os
 import re
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 from sqlalchemy.orm import Session
 
@@ -20,6 +22,8 @@ from .service import get_view, mark_remote_published
 _REPOSITORY_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+_READBACK_ATTEMPTS = 4
+_READBACK_DELAY_SECONDS = 0.2
 
 
 class PublicationError(RuntimeError):
@@ -164,11 +168,13 @@ class GitHubPublisher:
         github: GitHubRepositoryGateway,
         quarantine: GitCandidateQuarantine,
         git_push: GitPushTransport | None = None,
+        sleep: Callable[[float], None] | None = None,
     ) -> None:
         self.token_provider = token_provider
         self.github = github
         self.quarantine = quarantine
         self.git_push = git_push or GitPushTransport()
+        self.sleep = sleep or time.sleep
 
     @staticmethod
     def publication_branch(view: PublicationView) -> str:
@@ -183,6 +189,23 @@ class GitHubPublisher:
         base_branch: str,
         expected_head_sha: str,
     ) -> None:
+        GitHubPublisher._verify_canonical_pull_request_identity(
+            pull,
+            view=view,
+            branch=branch,
+            base_branch=base_branch,
+        )
+        if pull.head_sha != expected_head_sha:
+            raise PublicationError("canonical pull request head does not match")
+
+    @staticmethod
+    def _verify_canonical_pull_request_identity(
+        pull,
+        *,
+        view: PublicationView,
+        branch: str,
+        base_branch: str,
+    ) -> None:
         if pull.state != "open":
             raise PublicationError("canonical pull request is not open")
         if pull.number != view.pull_request_number:
@@ -191,8 +214,60 @@ class GitHubPublisher:
             raise PublicationError("canonical pull request base changed")
         if pull.head_ref != branch:
             raise PublicationError("canonical pull request branch changed")
-        if pull.head_sha != expected_head_sha:
-            raise PublicationError("canonical pull request head does not match")
+
+    def _readback_published_head(
+        self,
+        *,
+        repository: str,
+        branch: str,
+        token: str,
+        view: PublicationView,
+        base_branch: str,
+        expected_head_sha: str,
+        previous_head_sha: str | None,
+    ):
+        """Poll only GitHub readbacks; never repeat a push or ledger write."""
+        allowed_heads = {expected_head_sha}
+        if previous_head_sha is not None:
+            allowed_heads.add(previous_head_sha)
+        allowed_branch_values: set[str | None] = set(allowed_heads)
+        if previous_head_sha is None:
+            allowed_branch_values.add(None)
+
+        for attempt in range(_READBACK_ATTEMPTS):
+            target_sha = self.github.ref_sha(repository, branch, token)
+            if target_sha not in allowed_branch_values:
+                raise PublicationError("publication branch changed during readback")
+
+            pull = None
+            if view.remote_head_sha is not None:
+                assert view.pull_request_number is not None
+                pull = self.github.pull_request(
+                    repository,
+                    view.pull_request_number,
+                    token,
+                )
+                self._verify_canonical_pull_request_identity(
+                    pull,
+                    view=view,
+                    branch=branch,
+                    base_branch=base_branch,
+                )
+                if pull.head_sha not in allowed_heads:
+                    raise PublicationError(
+                        "canonical pull request head changed during readback"
+                    )
+
+            branch_converged = target_sha == expected_head_sha
+            pull_converged = pull is None or pull.head_sha == expected_head_sha
+            if branch_converged and pull_converged:
+                return pull
+            if attempt + 1 < _READBACK_ATTEMPTS:
+                self.sleep(_READBACK_DELAY_SECONDS)
+
+        raise PublicationError(
+            f"remote publication readback did not converge after {_READBACK_ATTEMPTS} attempts"
+        )
 
     def _verified_source(self, session: Session, view: PublicationView):
         candidate = view.current_candidate
@@ -271,13 +346,28 @@ class GitHubPublisher:
                     view.pull_request_number,
                     token,
                 )
-                self._verify_canonical_pull_request(
-                    existing_pull,
-                    view=view,
-                    branch=branch,
-                    base_branch=base_branch,
-                    expected_head_sha=target_before,
-                )
+                if target_before == view.remote_head_sha:
+                    self._verify_canonical_pull_request(
+                        existing_pull,
+                        view=view,
+                        branch=branch,
+                        base_branch=base_branch,
+                        expected_head_sha=target_before,
+                    )
+                else:
+                    self._verify_canonical_pull_request_identity(
+                        existing_pull,
+                        view=view,
+                        branch=branch,
+                        base_branch=base_branch,
+                    )
+                    if existing_pull.head_sha not in {
+                        view.remote_head_sha,
+                        candidate.head_sha,
+                    }:
+                        raise PublicationError(
+                            "canonical pull request head does not match governed publication"
+                        )
 
             if target_before is None:
                 self.git_push.push_governed_head(
@@ -323,25 +413,16 @@ class GitHubPublisher:
             elif target_before != candidate.head_sha:
                 raise PublicationError("publication branch collision")
 
-            target_after = self.github.ref_sha(view.repository, branch, token)
-            if target_after != candidate.head_sha:
-                raise PublicationError("remote head readback does not match admitted candidate")
-
-            if view.remote_head_sha is not None:
-                assert view.pull_request_number is not None
-                pull = self.github.pull_request(
-                    view.repository,
-                    view.pull_request_number,
-                    token,
-                )
-                self._verify_canonical_pull_request(
-                    pull,
-                    view=view,
-                    branch=branch,
-                    base_branch=base_branch,
-                    expected_head_sha=candidate.head_sha,
-                )
-            else:
+            pull = self._readback_published_head(
+                repository=view.repository,
+                branch=branch,
+                token=token,
+                view=view,
+                base_branch=base_branch,
+                expected_head_sha=candidate.head_sha,
+                previous_head_sha=view.remote_head_sha,
+            )
+            if pull is None:
                 pull = self.github.ensure_pull_request(
                     view.repository,
                     base_branch=base_branch,
