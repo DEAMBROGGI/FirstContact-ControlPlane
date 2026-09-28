@@ -20,4 +20,5 @@ class ReviewRequest(BaseModel):
 
 
 class MergeabilityRequest(BaseModel):
+    head_sha: str
     mergeable: bool

@@ -288,7 +288,14 @@ def review_record(publication_id: str, request: ReviewRequest, session: Session 
 @app.post("/api/v1/internal/publications/{publication_id}/mergeability", dependencies=[Depends(require_token)])
 def mergeability_record(publication_id: str, request: MergeabilityRequest, session: Session = Depends(get_session)):
     try:
-        return _payload(record_mergeability(session, publication_id, request.mergeable))
+        return _payload(
+            record_mergeability(
+                session,
+                publication_id,
+                head_sha=request.head_sha,
+                mergeable=request.mergeable,
+            )
+        )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="publication not found") from exc
     except DomainError as exc:

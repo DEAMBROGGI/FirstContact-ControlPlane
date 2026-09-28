@@ -19,6 +19,7 @@ class PublicationState(StrEnum):
     APPROVED = "APPROVED"
     READY_TO_MERGE = "READY_TO_MERGE"
     MERGED = "MERGED"
+    SUPERSEDED = "SUPERSEDED"
 
 
 class EventType(StrEnum):
@@ -35,6 +36,7 @@ class EventType(StrEnum):
     REVIEW_RECORDED = "REVIEW_RECORDED"
     MERGEABILITY_RECORDED = "MERGEABILITY_RECORDED"
     MERGED = "MERGED"
+    PUBLICATION_SUPERSEDED = "PUBLICATION_SUPERSEDED"
 class ValidationStatus(StrEnum):
     PASS = "PASS"
     FAIL = "FAIL"
@@ -97,7 +99,9 @@ class PublicationView:
 
 
 def desired_projection(state: PublicationState) -> LifecycleProjection:
-    if state in {PublicationState.VALIDATION_FAILED, PublicationState.CHANGES_REQUIRED}:
+    if state is PublicationState.SUPERSEDED:
+        status = "Superseded"
+    elif state in {PublicationState.VALIDATION_FAILED, PublicationState.CHANGES_REQUIRED}:
         status = "Ready"
     elif state in {
         PublicationState.IN_REVIEW,
@@ -149,6 +153,8 @@ def fold_events(
     for event in events:
         event_type = EventType(event["event_type"])
         payload = event["payload"]
+        if state in {PublicationState.MERGED, PublicationState.SUPERSEDED}:
+            raise DomainError("event follows terminal publication state")
         if event_type is EventType.PUBLICATION_CREATED:
             repository = str(payload["repository"])
             issue_number = int(payload["issue_number"])
@@ -244,6 +250,8 @@ def fold_events(
             state = PublicationState.READY_TO_MERGE if mergeable else PublicationState.APPROVED
         elif event_type is EventType.MERGED:
             state = PublicationState.MERGED
+        elif event_type is EventType.PUBLICATION_SUPERSEDED:
+            state = PublicationState.SUPERSEDED
 
     if state is None:
         raise DomainError("publication has no creation event")
@@ -276,11 +284,23 @@ def validate_transition(
     payload: Mapping[str, Any],
 ) -> None:
     state = view.state
+    if state is PublicationState.SUPERSEDED and event_type is not EventType.PUBLICATION_SUPERSEDED:
+        raise DomainError(
+            f"{event_type.value} cannot mutate a SUPERSEDED publication"
+        )
+    if (
+        state is PublicationState.MERGED
+        and event_type is not EventType.PUBLICATION_SUPERSEDED
+    ):
+        raise DomainError("MERGED publication is terminal")
     if event_type is EventType.CANDIDATE_SUBMITTED:
         if state not in {
             PublicationState.CREATED,
             PublicationState.VALIDATION_FAILED,
+            PublicationState.IN_REVIEW,
             PublicationState.CHANGES_REQUIRED,
+            PublicationState.APPROVED,
+            PublicationState.READY_TO_MERGE,
         }:
             raise DomainError(f"candidate cannot be submitted from {state}")
         return
@@ -297,6 +317,17 @@ def validate_transition(
             raise DomainError("remote publication requires an admitted candidate")
         if payload.get("head_sha") != view.current_candidate.head_sha:
             raise DomainError("published head must equal admitted candidate head")
+        if view.remote_head_sha is not None:
+            if payload.get("previous_head_sha") != view.remote_head_sha:
+                raise DomainError("successor publication must name the governed prior head")
+            if not view.remote_branch or not view.base_branch or view.pull_request_number is None:
+                raise DomainError("successor publication requires complete prior PR metadata")
+            if payload.get("branch") != view.remote_branch:
+                raise DomainError("successor publication must reuse the governed branch")
+            if payload.get("base_branch") != view.base_branch:
+                raise DomainError("successor publication must reuse the governed base branch")
+            if payload.get("pull_request_number") != view.pull_request_number:
+                raise DomainError("successor publication must reuse the governed pull request")
         return
     if event_type is EventType.CODEX_REVIEW_REQUESTED:
         if state is not PublicationState.IN_REVIEW:
@@ -355,9 +386,19 @@ def validate_transition(
     if event_type is EventType.MERGEABILITY_RECORDED:
         if state is not PublicationState.APPROVED:
             raise DomainError("mergeability is evaluated only after approval")
+        if view.remote_head_sha is None or payload.get("head_sha") != view.remote_head_sha:
+            raise DomainError("mergeability result is bound to a stale head")
         return
     if event_type is EventType.MERGED:
         if state is not PublicationState.READY_TO_MERGE:
             raise DomainError("merge requires READY_TO_MERGE state")
+        return
+    if event_type is EventType.PUBLICATION_SUPERSEDED:
+        if state in {PublicationState.MERGED, PublicationState.SUPERSEDED}:
+            raise DomainError(f"publication cannot be superseded from {state}")
+        successor_id = payload.get("successor_publication_id")
+        reason = payload.get("reason")
+        if not successor_id or not isinstance(reason, str) or not reason.strip():
+            raise DomainError("publication supersession requires successor and reason")
         return
     raise DomainError(f"unsupported transition event: {event_type}")

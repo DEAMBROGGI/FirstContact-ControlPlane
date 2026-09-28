@@ -798,3 +798,62 @@ def test_unmanaged_codex_invocation_from_older_head_does_not_poison_retry(sessio
     assert requested.automated_review_trigger_comment_id is not None
     assert requested.automated_review_trigger_comment_id != 851
     assert len(github.posted_bodies) == 1
+
+
+def test_successor_head_gets_new_codex_run_and_old_trigger_remains_historical(session):
+    first = published_publication(session)
+    value, _tokens, github = broker()
+    run_a = value.request(session, first.publication_id)
+    old_comment = github.issue_comments[0]
+    github.issue_comments[0] = IssueCommentSnapshot(
+        comment_id=old_comment.comment_id,
+        actor=old_comment.actor,
+        body=old_comment.body,
+        created_at="2000-01-01T00:00:00Z",
+    )
+    head_b = "4" * 40
+    source_b = VerifiedCandidateSource(
+        bundle_sha256="b" * 64,
+        byte_length=2345,
+        quarantine_id="b" * 64,
+        base_sha=BASE,
+        head_sha=head_b,
+        tree_sha="5" * 40,
+    )
+    submitted = submit_verified_candidate(session, first.publication_id, source_b)
+    profile = profile_for_repository(first.repository)
+    for index, job in enumerate(profile.required_jobs, 1):
+        submitted = record_validation(
+            session,
+            first.publication_id,
+            job_id=job,
+            status=ValidationStatus.PASS,
+            evidence_sha256=f"{index + 10:064x}",
+        )
+    published_b = mark_remote_published(
+        session,
+        first.publication_id,
+        head_b,
+        branch=first.remote_branch,
+        base_branch=first.base_branch,
+        pull_request_number=first.pull_request_number,
+    )
+    github.head_sha = head_b
+
+    run_b = value.request(session, first.publication_id)
+
+    assert published_b.state is PublicationState.IN_REVIEW
+    assert run_a.automated_review_run_id != run_b.automated_review_run_id
+    assert run_b.automated_review_head_sha == head_b
+    assert run_b.automated_review_status is AutomatedReviewStatus.RUNNING
+    assert len(github.issue_comments) == 2
+    assert github.issue_comments[0].comment_id == old_comment.comment_id
+    assert CodexReviewBroker._marker(
+        run_a.automated_review_run_id,
+        first.remote_head_sha,
+    ) in github.issue_comments[0].body
+    assert CodexReviewBroker._marker(
+        run_b.automated_review_run_id,
+        head_b,
+    ) in github.issue_comments[1].body
+    assert github.issue_comments[1].comment_id != github.issue_comments[0].comment_id

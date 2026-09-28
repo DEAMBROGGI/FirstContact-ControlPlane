@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from .domain import (
@@ -13,6 +14,7 @@ from .domain import (
     DomainError,
     EventType,
     PublicationView,
+    PublicationState,
     ReviewDecision,
     ValidationStatus,
     fold_events,
@@ -24,6 +26,21 @@ from .quarantine import VerifiedCandidateSource
 from .repository import append_event, load_events
 
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def _lock_publication_scope(session: Session, repository: str, issue_number: int) -> None:
+    if session.get_bind().dialect.name != "postgresql":
+        return
+    # A scope row does not exist yet on first creation, so row locks alone
+    # cannot serialize concurrent requests for the same repository and issue.
+    key = hashlib.sha256(
+        f"firstcontact-publication-scope\0{repository}\0{issue_number}".encode("utf-8")
+    ).digest()[:8]
+    lock_key = int.from_bytes(key, byteorder="big", signed=True)
+    session.execute(
+        text("SELECT pg_advisory_xact_lock(:publication_scope_key)"),
+        {"publication_scope_key": lock_key},
+    )
 
 
 def _sha(value: str, field: str) -> str:
@@ -42,10 +59,68 @@ def get_view(session: Session, publication_id: str) -> PublicationView:
     return fold_events(publication_id, load_events(session, publication_id))
 
 
+def _lock_publications(
+    session: Session,
+    publication_ids: tuple[str, ...],
+    *,
+    required_publication_ids: tuple[str, ...] | None = None,
+) -> dict[str, PublicationRow]:
+    ordered_ids = tuple(sorted(set(publication_ids)))
+    rows = list(
+        session.scalars(
+            select(PublicationRow)
+            .where(PublicationRow.id.in_(ordered_ids))
+            .order_by(PublicationRow.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    )
+    by_id = {row.id: row for row in rows}
+    required_ids = ordered_ids if required_publication_ids is None else required_publication_ids
+    for publication_id in required_ids:
+        if publication_id not in by_id:
+            raise KeyError(publication_id)
+    return by_id
+
+
+def _locked_publication_view(
+    session: Session,
+    publication_id: str,
+) -> PublicationView:
+    _lock_publications(session, (publication_id,))
+    return get_view(session, publication_id)
+
+
 def create_publication(session: Session, repository: str, issue_number: int) -> PublicationView:
     if issue_number <= 0:
         raise DomainError("issue_number must be positive")
     profile_for_repository(repository)
+    _lock_publication_scope(session, repository, issue_number)
+    existing_rows = list(
+        session.scalars(
+            select(PublicationRow).where(
+                PublicationRow.repository == repository,
+                PublicationRow.issue_number == issue_number,
+            ).order_by(PublicationRow.id).with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    )
+    active_views: list[PublicationView] = []
+    for row in existing_rows:
+        existing_view = get_view(session, row.id)
+        if existing_view.state not in {
+            PublicationState.MERGED,
+            PublicationState.SUPERSEDED,
+        }:
+            active_views.append(existing_view)
+    if len(active_views) > 1:
+        raise DomainError(
+            "multiple active publications exist for repository and issue"
+        )
+    if active_views:
+        session.commit()
+        return active_views[0]
+
     publication_id = str(uuid.uuid4())
     session.add(PublicationRow(id=publication_id, repository=repository, issue_number=issue_number))
     session.flush()
@@ -53,6 +128,67 @@ def create_publication(session: Session, repository: str, issue_number: int) -> 
         "repository": repository,
         "issue_number": issue_number,
     })
+    session.commit()
+    return get_view(session, publication_id)
+
+
+def supersede_publication(
+    session: Session,
+    publication_id: str,
+    successor_publication_id: str,
+    reason: str,
+) -> PublicationView:
+    if publication_id == successor_publication_id:
+        raise DomainError("publication cannot supersede itself")
+    if not reason or not reason.strip() or len(reason) > 500:
+        raise DomainError("supersession reason must be 1..500 non-whitespace characters")
+
+    locked_rows = _lock_publications(
+        session,
+        (publication_id, successor_publication_id),
+        required_publication_ids=(publication_id,),
+    )
+
+    # The source fold happens only after both rows are locked. On PostgreSQL's
+    # READ COMMITTED transactions, subsequent event queries see a winner that
+    # committed while this call waited for either row lock.
+    view = get_view(session, publication_id)
+    prior_supersessions = [
+        event
+        for event in load_events(session, publication_id)
+        if event["event_type"] == EventType.PUBLICATION_SUPERSEDED.value
+    ]
+    if view.state is PublicationState.SUPERSEDED:
+        if len(prior_supersessions) != 1:
+            raise DomainError("superseded publication history is ambiguous")
+        prior = prior_supersessions[0]["payload"]
+        if (
+            prior.get("successor_publication_id") == successor_publication_id
+            and prior.get("reason") == reason
+        ):
+            session.commit()
+            return view
+        raise DomainError("publication is already superseded by another decision")
+    if prior_supersessions:
+        raise DomainError("publication supersession history conflicts with state")
+
+    if successor_publication_id not in locked_rows:
+        raise KeyError(successor_publication_id)
+    successor_view = get_view(session, successor_publication_id)
+    if (
+        view.repository != successor_view.repository
+        or view.issue_number != successor_view.issue_number
+    ):
+        raise DomainError("supersession successor must share repository and issue")
+    if successor_view.state is PublicationState.SUPERSEDED:
+        raise DomainError("supersession successor cannot be SUPERSEDED")
+
+    payload = {
+        "successor_publication_id": successor_publication_id,
+        "reason": reason,
+    }
+    validate_transition(view, EventType.PUBLICATION_SUPERSEDED, payload)
+    append_event(session, publication_id, EventType.PUBLICATION_SUPERSEDED, payload)
     session.commit()
     return get_view(session, publication_id)
 
@@ -73,7 +209,7 @@ def submit_verified_candidate(
     publication_id: str,
     source: VerifiedCandidateSource,
 ) -> PublicationView:
-    view = get_view(session, publication_id)
+    view = _locked_publication_view(session, publication_id)
     profile = profile_for_repository(view.repository)
     base = _sha(source.base_sha, "base_sha")
     head = _sha(source.head_sha, "head_sha")
@@ -114,6 +250,7 @@ def submit_verified_candidate(
         if observed != source_payload:
             raise DomainError("immutable candidate source conflict")
         if view.current_candidate and view.current_candidate.candidate_id == candidate_id:
+            session.commit()
             return view
         raise DomainError("candidate identity already belongs to another publication state")
 
@@ -163,7 +300,7 @@ def record_validation(
     status: ValidationStatus,
     evidence_sha256: str,
 ) -> PublicationView:
-    view = get_view(session, publication_id)
+    view = _locked_publication_view(session, publication_id)
     validate_transition(view, EventType.VALIDATION_RECORDED, {})
     if view.current_candidate is None:
         raise DomainError("validation requires a current candidate")
@@ -195,6 +332,7 @@ def record_validation(
         }
     if job_id in existing:
         if existing[job_id] == payload:
+            session.commit()
             return view
         raise DomainError("immutable validation result conflict")
     append_event(session, publication_id, EventType.VALIDATION_RECORDED, payload)
@@ -228,8 +366,10 @@ def mark_remote_published(
     base_branch: str | None = None,
     pull_request_number: int | None = None,
 ) -> PublicationView:
-    view = get_view(session, publication_id)
+    view = _locked_publication_view(session, publication_id)
     payload: dict[str, Any] = {"head_sha": _sha(head_sha, "head_sha")}
+    if view.remote_head_sha is not None:
+        payload["previous_head_sha"] = view.remote_head_sha
     if branch is not None:
         payload["branch"] = branch
     if base_branch is not None:
@@ -250,7 +390,7 @@ def record_review(
     decision: ReviewDecision,
     require_codex_review: bool = False,
 ) -> PublicationView:
-    view = get_view(session, publication_id)
+    view = _locked_publication_view(session, publication_id)
     if (
         require_codex_review
         and decision is ReviewDecision.APPROVED
@@ -267,9 +407,18 @@ def record_review(
     return get_view(session, publication_id)
 
 
-def record_mergeability(session: Session, publication_id: str, mergeable: bool) -> PublicationView:
-    view = get_view(session, publication_id)
-    payload = {"mergeable": bool(mergeable)}
+def record_mergeability(
+    session: Session,
+    publication_id: str,
+    *,
+    head_sha: str,
+    mergeable: bool,
+) -> PublicationView:
+    view = _locked_publication_view(session, publication_id)
+    payload = {
+        "head_sha": _sha(head_sha, "head_sha"),
+        "mergeable": bool(mergeable),
+    }
     validate_transition(view, EventType.MERGEABILITY_RECORDED, payload)
     append_event(session, publication_id, EventType.MERGEABILITY_RECORDED, payload)
     session.commit()
@@ -288,7 +437,7 @@ def request_codex_review(
 ) -> PublicationView:
     if mode not in {"advisory", "required"}:
         raise DomainError("Codex review mode must be advisory or required")
-    view = get_view(session, publication_id)
+    view = _locked_publication_view(session, publication_id)
     if view.remote_head_sha is None:
         raise DomainError("Codex review requires published head")
 
@@ -300,6 +449,7 @@ def request_codex_review(
             AutomatedReviewStatus.CHANGES_REQUIRED,
         }
     ):
+        session.commit()
         return view
 
     prior_attempts = [
@@ -367,7 +517,7 @@ def complete_codex_review(
             set(int(value) for value in (provider_reaction_ids or []))
         ),
     }
-    view = get_view(session, publication_id)
+    view = _locked_publication_view(session, publication_id)
     validate_transition(view, EventType.CODEX_REVIEW_COMPLETED, payload)
     append_event(session, publication_id, EventType.CODEX_REVIEW_COMPLETED, payload)
     session.commit()
@@ -388,7 +538,7 @@ def mark_codex_review_unavailable(
         "head_sha": _sha(reviewed_head_sha, "reviewed_head_sha"),
         "reason": reason,
     }
-    view = get_view(session, publication_id)
+    view = _locked_publication_view(session, publication_id)
     validate_transition(view, EventType.CODEX_REVIEW_UNAVAILABLE, payload)
     append_event(session, publication_id, EventType.CODEX_REVIEW_UNAVAILABLE, payload)
     session.commit()
