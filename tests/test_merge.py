@@ -73,9 +73,7 @@ def ready_publication(session, *, issue_number: int = 220):
 
 
 def approved_publication(session, *, issue_number: int = 221):
-    ready = ready_publication(session, issue_number=issue_number)
-    # Build a fresh publication and stop before mergeability to avoid
-    # mutating the READY fixture backwards.
+    # Build a fresh publication and stop before mergeability.
     source = VerifiedCandidateSource(
         bundle_sha256="b" * 64,
         byte_length=100,
