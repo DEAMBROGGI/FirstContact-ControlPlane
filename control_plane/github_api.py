@@ -612,19 +612,44 @@ class GitHubRepositoryGateway:
             raise GitHubApiError("GitHub sub-issue link is ambiguous")
         if sub_issue_database_id in child_ids:
             return
-        response = self._request(
-            "POST",
+        write_error: GitHubApiError | None = None
+        try:
+            self._request(
+                "POST",
+                endpoint,
+                token=token,
+                json={"sub_issue_id": sub_issue_database_id},
+            )
+        except GitHubApiError as exc:
+            # The link may have committed even if the write response was
+            # malformed or lost. The authoritative proof is the bounded
+            # sub-issue listing readback, not the POST response body.
+            write_error = exc
+
+        readback = self._paginate(
             endpoint,
             token=token,
-            json={"sub_issue_id": sub_issue_database_id},
+            params={"per_page": "100"},
         )
-        assert response is not None
-        try:
-            linked = self._issue_snapshot(response.json())
-        except (KeyError, TypeError, ValueError) as exc:
-            raise GitHubApiError("GitHub sub-issue response is invalid") from exc
-        if linked.database_id != sub_issue_database_id:
-            raise GitHubApiError("GitHub sub-issue link did not verify")
+        readback_ids: list[int] = []
+        for item in readback:
+            if not isinstance(item, dict):
+                raise GitHubApiError("GitHub sub-issue listing is invalid")
+            try:
+                child_id = int(item["id"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise GitHubApiError("GitHub sub-issue listing is invalid") from exc
+            if child_id <= 0:
+                raise GitHubApiError("GitHub sub-issue listing is invalid")
+            readback_ids.append(child_id)
+
+        if readback_ids.count(sub_issue_database_id) > 1:
+            raise GitHubApiError("GitHub sub-issue link is ambiguous")
+        if sub_issue_database_id in readback_ids:
+            return
+        if write_error is not None:
+            raise GitHubApiError("GitHub sub-issue link failed closed") from write_error
+        raise GitHubApiError("GitHub sub-issue link did not verify")
 
     def ensure_project_v2_status(
         self,
