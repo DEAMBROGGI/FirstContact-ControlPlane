@@ -605,8 +605,11 @@ La arquitectura queda apta para integrar otra API solo cuando:
 Once a Publication is `READY_TO_MERGE`, Plane owns the final write boundary.
 The merge command must re-read the canonical PR, verify repository/PR/base/head
 identity, and send GitHub the exact governed HEAD as the expected merge SHA.
-GitHub's response is evidence only after a second PR readback proves the PR is
-merged and exposes the merge commit SHA.
+GitHub's response is evidence only after a second readback proves the PR is
+merged. Plane uses the dedicated merged-status endpoint as the authoritative
+boolean. The merge commit SHA is taken from the PR payload when available and
+recovered from the native `merged` issue event when the installation-token PR
+payload omits it. If both sources expose a SHA, they must match exactly.
 
 The authoritative ledger receipt is:
 
