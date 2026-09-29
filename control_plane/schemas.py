@@ -54,6 +54,8 @@ class StartSuccessorVerificationRequest(BaseModel):
     review_run_id: str = Field(min_length=1, max_length=160)
     head_sha: str
     idempotency_key: str = Field(min_length=1, max_length=200)
+    fallback_reviewer: str | None = Field(default=None, min_length=1, max_length=200)
+    fallback_reason: str | None = Field(default=None, min_length=1, max_length=1000)
 
 
 class VerifyRemediationFindingRequest(BaseModel):

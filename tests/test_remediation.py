@@ -58,6 +58,7 @@ from control_plane.service import (
     complete_codex_review,
     create_publication,
     get_view,
+    mark_codex_review_unavailable,
     mark_remote_published,
     record_review,
     record_validation,
@@ -1461,6 +1462,139 @@ def test_publication_preflight_failure_can_rework_implemented_package_without_ov
     assert len(submissions) == 2
     assert submissions[0]["payload"]["candidate_id"] == first.current_candidate.candidate_id
     assert submissions[1]["payload"]["candidate_id"] == second.current_candidate.candidate_id
+
+
+def test_unavailable_successor_requires_audited_fallback_and_can_complete(session):
+    view, _source_run, package = create_package(session)
+    claim_work_package(
+        session,
+        package.work_package_id,
+        actor="general-implementer",
+        idempotency_key="claim-unavailable-fallback",
+    )
+    successor_head = "8" * 40
+    candidate = submit_verified_candidate(
+        session,
+        view.publication_id,
+        source(successor_head, "9" * 40, "a"),
+    )
+    submit_implementation(
+        session,
+        package.work_package_id,
+        candidate_id=candidate.current_candidate.candidate_id,
+        head_sha=successor_head,
+        summary="Candidate requires principal fallback after provider unavailability.",
+        evidence_sha256="e" * 64,
+        idempotency_key="submit-unavailable-fallback",
+    )
+    profile = profile_for_repository(REPOSITORY)
+    for index, job_id in enumerate(profile.required_jobs, 1):
+        record_validation(
+            session,
+            view.publication_id,
+            job_id=job_id,
+            status=ValidationStatus.PASS,
+            evidence_sha256=f"{index + 200:064x}",
+        )
+    mark_remote_published(
+        session,
+        view.publication_id,
+        successor_head,
+        branch=view.remote_branch,
+        base_branch=view.base_branch,
+        pull_request_number=view.pull_request_number,
+    )
+    running = request_codex_review(
+        session,
+        view.publication_id,
+        mode="required",
+        expected_head_sha=successor_head,
+    )
+    mark_codex_review_unavailable(
+        session,
+        view.publication_id,
+        run_id=running.automated_review_run_id,
+        reviewed_head_sha=successor_head,
+        reason="Correlated provider usage-limit response.",
+    )
+
+    with pytest.raises(DomainError, match="successor review is not complete"):
+        begin_successor_verification(
+            session,
+            package.work_package_id,
+            review_run_id=running.automated_review_run_id,
+            head_sha=successor_head,
+            idempotency_key="missing-unavailable-fallback",
+        )
+
+    verifying = begin_successor_verification(
+        session,
+        package.work_package_id,
+        review_run_id=running.automated_review_run_id,
+        head_sha=successor_head,
+        idempotency_key="bind-unavailable-fallback",
+        fallback_reviewer="principal-reviewer:chatgpt",
+        fallback_reason="Provider unavailable; exact-head independent review required.",
+    )
+    assert verifying.state is WorkPackageState.VERIFYING
+    assert verifying.successor_fallback == {
+        "reviewer": "principal-reviewer:chatgpt",
+        "reason": "Provider unavailable; exact-head independent review required.",
+        "provider_status": "UNAVAILABLE",
+    }
+
+    verify_finding(
+        session,
+        package.work_package_id,
+        finding_id="codex:3101:4101",
+        outcome="ABSENT",
+        reviewer="principal-reviewer:chatgpt",
+        evidence="Exact-head fallback review confirms the provider finding is absent.",
+        idempotency_key="verify-unavailable-provider-finding",
+    )
+    verify_finding(
+        session,
+        package.work_package_id,
+        finding_id="control-plane:bigint-comment-id",
+        outcome="ABSENT",
+        reviewer="principal-reviewer:chatgpt",
+        evidence="Exact-head fallback review confirms the internal finding is absent.",
+        idempotency_key="verify-unavailable-internal-finding",
+    )
+    for artifact, remote_id in (
+        ("reaction", 801),
+        ("reply", 802),
+        ("resolution", "PRRT_unavailable"),
+    ):
+        record_github_artifact(
+            session,
+            package.work_package_id,
+            finding_id="codex:3101:4101",
+            artifact=artifact,
+            remote_id=remote_id,
+            idempotency_key=f"unavailable-{artifact}",
+        )
+    record_summary_comment(
+        session,
+        package.work_package_id,
+        comment_id=803,
+        idempotency_key="unavailable-summary",
+    )
+    record_issue_closed(
+        session,
+        package.work_package_id,
+        idempotency_key="unavailable-issue-close",
+    )
+
+    done = complete_work_package(
+        session,
+        package.work_package_id,
+        idempotency_key="unavailable-done",
+    )
+    assert done.state is WorkPackageState.DONE
+    publication = get_view(session, view.publication_id)
+    assert publication.automated_review_status is AutomatedReviewStatus.UNAVAILABLE
+    assert publication.automated_review_run_id == running.automated_review_run_id
 
 
 def test_successor_review_must_match_the_submitted_implementation_head_and_candidate(session):

@@ -71,6 +71,7 @@ class RemediationWorkPackageView:
     implementation_evidence_sha256: str | None
     successor_review_run_id: str | None
     successor_head_sha: str | None
+    successor_fallback: dict[str, Any] | None
     summary_comment_id: int | None
     issue_closed: bool
 
@@ -281,6 +282,7 @@ def _fold(work_package_id: str, row: RemediationWorkPackageRow, events: list[dic
     implementation_evidence_sha256 = None
     successor_review_run_id = None
     successor_head_sha = None
+    successor_fallback = None
     implementation_issue_number = initial.get("implementation_issue_number")
     summary_comment_id = None
     issue_closed = False
@@ -306,6 +308,8 @@ def _fold(work_package_id: str, row: RemediationWorkPackageRow, events: list[dic
             state = WorkPackageState.VERIFYING
             successor_review_run_id = payload["review_run_id"]
             successor_head_sha = payload["head_sha"]
+            fallback = payload.get("fallback")
+            successor_fallback = dict(fallback) if isinstance(fallback, dict) else None
         elif event_type == "REJECTED_FINDINGS_FINALIZATION_STARTED":
             state = WorkPackageState.VERIFYING
         elif event_type == "FINDING_VERIFIED":
@@ -360,6 +364,7 @@ def _fold(work_package_id: str, row: RemediationWorkPackageRow, events: list[dic
         implementation_evidence_sha256=implementation_evidence_sha256,
         successor_review_run_id=successor_review_run_id,
         successor_head_sha=successor_head_sha,
+        successor_fallback=successor_fallback,
         summary_comment_id=summary_comment_id,
         issue_closed=issue_closed,
     )
@@ -905,9 +910,36 @@ def begin_successor_verification(
     review_run_id: str,
     head_sha: str,
     idempotency_key: str,
+    fallback_reviewer: str | None = None,
+    fallback_reason: str | None = None,
 ) -> RemediationWorkPackageView:
     row = _lock_publication_then_work_package(session, work_package_id)
-    payload = {"review_run_id": review_run_id, "head_sha": head_sha.lower()}
+    normalized_reviewer = fallback_reviewer.strip() if fallback_reviewer is not None else None
+    normalized_reason = fallback_reason.strip() if fallback_reason is not None else None
+    if (normalized_reviewer is None) != (normalized_reason is None):
+        raise DomainError("fallback reviewer and reason must be supplied together")
+    if normalized_reviewer is not None:
+        if not normalized_reviewer or len(normalized_reviewer) > 200:
+            raise DomainError("fallback reviewer is required and bounded")
+        if not normalized_reason or len(normalized_reason) > 1000:
+            raise DomainError("fallback reason is required and bounded")
+        _assert_safe_client_text(normalized_reviewer, "fallback reviewer")
+        _assert_safe_client_text(normalized_reason, "fallback reason")
+
+    fallback = (
+        {
+            "reviewer": normalized_reviewer,
+            "reason": normalized_reason,
+            "provider_status": AutomatedReviewStatus.UNAVAILABLE.value,
+        }
+        if normalized_reviewer is not None
+        else None
+    )
+    payload = {
+        "review_run_id": review_run_id,
+        "head_sha": head_sha.lower(),
+        "fallback": fallback,
+    }
     duplicate = _command_duplicate(
         session,
         row,
@@ -919,7 +951,11 @@ def begin_successor_verification(
         return duplicate
     view = get_work_package(session, work_package_id)
     if view.state is WorkPackageState.VERIFYING:
-        if view.successor_review_run_id == review_run_id and view.successor_head_sha == payload["head_sha"]:
+        if (
+            view.successor_review_run_id == review_run_id
+            and view.successor_head_sha == payload["head_sha"]
+            and view.successor_fallback == fallback
+        ):
             session.commit()
             return view
         raise DomainError("work package is already bound to another successor review")
@@ -927,20 +963,31 @@ def begin_successor_verification(
         raise DomainError("successor verification can only start from IMPLEMENTED")
     if not _SHA_RE.fullmatch(payload["head_sha"]):
         raise DomainError("successor head must be an exact 40-hex Git SHA")
+
     publication = get_view(session, row.publication_id)
-    if (
-        payload["head_sha"] == row.reviewed_head_sha
-        or payload["head_sha"] != view.implementation_head_sha
-        or publication.current_candidate is None
-        or publication.current_candidate.candidate_id != view.candidate_id
-        or publication.current_candidate.head_sha != view.implementation_head_sha
-        or publication.remote_head_sha != payload["head_sha"]
-        or publication.automated_review_head_sha != payload["head_sha"]
-        or publication.automated_review_run_id != review_run_id
-        or publication.automated_review_status
-        not in {AutomatedReviewStatus.PASS, AutomatedReviewStatus.CHANGES_REQUIRED}
-    ):
+    exact_binding = (
+        payload["head_sha"] != row.reviewed_head_sha
+        and payload["head_sha"] == view.implementation_head_sha
+        and publication.current_candidate is not None
+        and publication.current_candidate.candidate_id == view.candidate_id
+        and publication.current_candidate.head_sha == view.implementation_head_sha
+        and publication.remote_head_sha == payload["head_sha"]
+        and publication.automated_review_head_sha == payload["head_sha"]
+        and publication.automated_review_run_id == review_run_id
+    )
+    provider_terminal = publication.automated_review_status in {
+        AutomatedReviewStatus.PASS,
+        AutomatedReviewStatus.CHANGES_REQUIRED,
+    }
+    unavailable_fallback = (
+        publication.automated_review_status is AutomatedReviewStatus.UNAVAILABLE
+        and fallback is not None
+    )
+    if not exact_binding or not (provider_terminal or unavailable_fallback):
         raise DomainError("successor review is not complete for the exact published head")
+    if provider_terminal and fallback is not None:
+        raise DomainError("fallback is only valid when the provider review is unavailable")
+
     _append(
         session,
         row,
@@ -1294,12 +1341,22 @@ def complete_work_package(
     publication = get_view(session, row.publication_id)
     expected_run_id = view.successor_review_run_id or row.review_run_id
     expected_head_sha = view.successor_head_sha or row.reviewed_head_sha
+    provider_terminal = publication.automated_review_status in {
+        AutomatedReviewStatus.PASS,
+        AutomatedReviewStatus.CHANGES_REQUIRED,
+    }
+    fallback_terminal = (
+        view.successor_review_run_id is not None
+        and publication.automated_review_status is AutomatedReviewStatus.UNAVAILABLE
+        and view.successor_fallback is not None
+        and view.successor_fallback.get("provider_status")
+        == AutomatedReviewStatus.UNAVAILABLE.value
+    )
     if (
         publication.remote_head_sha != expected_head_sha
         or publication.automated_review_head_sha != expected_head_sha
         or publication.automated_review_run_id != expected_run_id
-        or publication.automated_review_status
-        not in {AutomatedReviewStatus.PASS, AutomatedReviewStatus.CHANGES_REQUIRED}
+        or not (provider_terminal or fallback_terminal)
     ):
         raise DomainError("work package completion is stale for the current review/head")
 

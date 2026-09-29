@@ -122,12 +122,16 @@ multiple packages.
    admission path. The submission must identify the publication's current
    candidate and its exact head. The normal validations and publisher then
    publish that candidate to the same canonical pull request.
-4. Bind a completed automated review to the exact published successor head.
-   That head and candidate must equal the work package's latest submitted
-   implementation and remain the publication's current candidate and published
-   head; another candidate's review cannot be borrowed. A Principal Reviewer
-   records each accepted finding as `ABSENT` or `PERSISTS`, with the review run,
-   head, reviewer, and evidence retained in the ledger.
+4. Bind a terminal automated review attempt to the exact published successor
+   head. `PASS` and `CHANGES_REQUIRED` bind directly. `UNAVAILABLE` may bind
+   only with an explicit Principal Reviewer fallback actor and bounded reason
+   recorded in the same `SUCCESSOR_REVIEW_STARTED` event; the provider result
+   remains `UNAVAILABLE` and is never rewritten as `PASS`. The head and
+   candidate must equal the work package's latest submitted implementation and
+   remain the publication's current candidate and published head; another
+   candidate's review cannot be borrowed. A Principal Reviewer records each
+   accepted finding as `ABSENT` or `PERSISTS`, with the review run, head,
+   reviewer, and evidence retained in the ledger.
 5. If every finding was rejected, use decision-only finalization from `READY`.
    It is valid only while the source review and source head remain current; it
    does not fabricate an implementation or successor review.

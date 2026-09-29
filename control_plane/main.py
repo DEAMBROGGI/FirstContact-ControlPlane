@@ -506,6 +506,8 @@ def remediation_work_package_start_verification(
             review_run_id=request.review_run_id,
             head_sha=request.head_sha,
             idempotency_key=request.idempotency_key,
+            fallback_reviewer=request.fallback_reviewer,
+            fallback_reason=request.fallback_reason,
         )
         return _work_package_payload(
             materializer.sync_issue_projection(session, view.work_package_id)
