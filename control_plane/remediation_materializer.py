@@ -21,6 +21,7 @@ from .remediation import (
     record_issue_closed,
     record_summary_comment,
     release_github_artifact_dispatch,
+    successor_review_is_terminal,
 )
 from .service import get_view
 
@@ -94,6 +95,12 @@ class GitHubRemediationMaterializer:
         else:
             expected_run_id = None
             expected_head_sha = None
+        terminal_review = successor_review_is_terminal(
+            publication.automated_review_status,
+            package.successor_fallback
+            if package.successor_review_run_id is not None
+            else None,
+        )
         if (
             package.state is not WorkPackageState.VERIFYING
             or not expected_run_id
@@ -101,11 +108,7 @@ class GitHubRemediationMaterializer:
             or publication.remote_head_sha != expected_head_sha
             or publication.automated_review_head_sha != expected_head_sha
             or publication.automated_review_run_id != expected_run_id
-            or publication.automated_review_status
-            not in {
-                AutomatedReviewStatus.PASS,
-                AutomatedReviewStatus.CHANGES_REQUIRED,
-            }
+            or not terminal_review
         ):
             raise RemediationMaterializationError(
                 "successor review is no longer current for materialization"

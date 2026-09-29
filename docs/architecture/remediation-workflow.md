@@ -126,18 +126,23 @@ multiple packages.
    head. `PASS` and `CHANGES_REQUIRED` bind directly. `UNAVAILABLE` may bind
    only with an explicit Principal Reviewer fallback actor and bounded reason
    recorded in the same `SUCCESSOR_REVIEW_STARTED` event; the provider result
-   remains `UNAVAILABLE` and is never rewritten as `PASS`. The head and
-   candidate must equal the work package's latest submitted implementation and
-   remain the publication's current candidate and published head; another
-   candidate's review cannot be borrowed. A Principal Reviewer records each
-   accepted finding as `ABSENT` or `PERSISTS`, with the review run, head,
-   reviewer, and evidence retained in the ledger.
+   remains `UNAVAILABLE` and is never rewritten as `PASS`. Every later
+   `FINDING_VERIFIED` event for that fallback must be attributed to exactly the
+   recorded fallback reviewer; another caller identity cannot inherit that
+   authority. The head and candidate must equal the work package's latest
+   submitted implementation and remain the publication's current candidate and
+   published head; another candidate's review cannot be borrowed. A Principal
+   Reviewer records each accepted finding as `ABSENT` or `PERSISTS`, with the
+   review run, head, reviewer, and evidence retained in the ledger.
 5. If every finding was rejected, use decision-only finalization from `READY`.
    It is valid only while the source review and source head remain current; it
    does not fabricate an implementation or successor review.
 6. Materialization rechecks the canonical PR number, open state, head/base
-   branches, and exact current head before each external action. It records
-   receipts only after readback or provider confirmation.
+   branches, exact current head, review run, and the same terminal-review
+   predicate used by the domain before each external action. `UNAVAILABLE`
+   remains materializable only when the persisted successor fallback is present;
+   an unbound unavailable attempt fails closed. It records receipts only after
+   readback or provider confirmation.
 7. Once all finding closure evidence and thread receipts are present, the
    Control Plane posts one work-package summary and re-locks the Publication.
    It appends authoritative `WORK_PACKAGE_COMPLETED` only while the exact review

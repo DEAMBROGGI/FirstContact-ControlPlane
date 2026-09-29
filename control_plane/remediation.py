@@ -40,6 +40,22 @@ def _assert_safe_client_text(value: str, field: str) -> None:
         raise DomainError(f"{field} contains a reserved automation mention")
 
 
+def successor_review_is_terminal(
+    status: AutomatedReviewStatus | None,
+    fallback: Mapping[str, Any] | None,
+) -> bool:
+    if status in {
+        AutomatedReviewStatus.PASS,
+        AutomatedReviewStatus.CHANGES_REQUIRED,
+    }:
+        return True
+    return (
+        status is AutomatedReviewStatus.UNAVAILABLE
+        and fallback is not None
+        and fallback.get("provider_status") == AutomatedReviewStatus.UNAVAILABLE.value
+    )
+
+
 class WorkPackageState(StrEnum):
     READY = "READY"
     IN_PROGRESS = "IN_PROGRESS"
@@ -979,11 +995,10 @@ def begin_successor_verification(
         AutomatedReviewStatus.PASS,
         AutomatedReviewStatus.CHANGES_REQUIRED,
     }
-    unavailable_fallback = (
-        publication.automated_review_status is AutomatedReviewStatus.UNAVAILABLE
-        and fallback is not None
-    )
-    if not exact_binding or not (provider_terminal or unavailable_fallback):
+    if not exact_binding or not successor_review_is_terminal(
+        publication.automated_review_status,
+        fallback,
+    ):
         raise DomainError("successor review is not complete for the exact published head")
     if provider_terminal and fallback is not None:
         raise DomainError("fallback is only valid when the provider review is unavailable")
@@ -1080,6 +1095,15 @@ def verify_finding(
     }
     _assert_safe_client_text(stable_request["reviewer"], "finding verification reviewer")
     _assert_safe_client_text(stable_request["evidence"], "finding verification evidence")
+    if current.successor_fallback is not None:
+        authorized_reviewer = str(current.successor_fallback.get("reviewer", "")).strip()
+        if (
+            not authorized_reviewer
+            or stable_request["reviewer"] != authorized_reviewer
+        ):
+            raise DomainError(
+                "finding verification reviewer does not match the authorized fallback reviewer"
+            )
     existing = session.scalar(
         select(RemediationEventRow).where(
             RemediationEventRow.work_package_id == row.id,
@@ -1341,22 +1365,15 @@ def complete_work_package(
     publication = get_view(session, row.publication_id)
     expected_run_id = view.successor_review_run_id or row.review_run_id
     expected_head_sha = view.successor_head_sha or row.reviewed_head_sha
-    provider_terminal = publication.automated_review_status in {
-        AutomatedReviewStatus.PASS,
-        AutomatedReviewStatus.CHANGES_REQUIRED,
-    }
-    fallback_terminal = (
-        view.successor_review_run_id is not None
-        and publication.automated_review_status is AutomatedReviewStatus.UNAVAILABLE
-        and view.successor_fallback is not None
-        and view.successor_fallback.get("provider_status")
-        == AutomatedReviewStatus.UNAVAILABLE.value
+    terminal_review = successor_review_is_terminal(
+        publication.automated_review_status,
+        view.successor_fallback if view.successor_review_run_id is not None else None,
     )
     if (
         publication.remote_head_sha != expected_head_sha
         or publication.automated_review_head_sha != expected_head_sha
         or publication.automated_review_run_id != expected_run_id
-        or not (provider_terminal or fallback_terminal)
+        or not terminal_review
     ):
         raise DomainError("work package completion is stale for the current review/head")
 

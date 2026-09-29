@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -1543,6 +1544,17 @@ def test_unavailable_successor_requires_audited_fallback_and_can_complete(sessio
         "provider_status": "UNAVAILABLE",
     }
 
+    with pytest.raises(DomainError, match="authorized fallback reviewer"):
+        verify_finding(
+            session,
+            package.work_package_id,
+            finding_id="codex:3101:4101",
+            outcome="ABSENT",
+            reviewer="principal-reviewer:other",
+            evidence="A different reviewer must not inherit the recorded fallback authority.",
+            idempotency_key="verify-unavailable-wrong-reviewer",
+        )
+
     verify_finding(
         session,
         package.work_package_id,
@@ -1595,6 +1607,203 @@ def test_unavailable_successor_requires_audited_fallback_and_can_complete(sessio
     publication = get_view(session, view.publication_id)
     assert publication.automated_review_status is AutomatedReviewStatus.UNAVAILABLE
     assert publication.automated_review_run_id == running.automated_review_run_id
+
+
+def test_materializer_accepts_exact_unavailable_fallback(session):
+    view, _source_run, package = create_package(session)
+    claim_work_package(
+        session,
+        package.work_package_id,
+        actor="general-implementer",
+        idempotency_key="claim-unavailable-materializer",
+    )
+    successor_head = "8" * 40
+    candidate = submit_verified_candidate(
+        session,
+        view.publication_id,
+        source(successor_head, "9" * 40, "a"),
+    )
+    submit_implementation(
+        session,
+        package.work_package_id,
+        candidate_id=candidate.current_candidate.candidate_id,
+        head_sha=successor_head,
+        summary="Exercise materialization under audited provider fallback.",
+        evidence_sha256="f" * 64,
+        idempotency_key="submit-unavailable-materializer",
+    )
+    profile = profile_for_repository(REPOSITORY)
+    for index, job_id in enumerate(profile.required_jobs, 1):
+        record_validation(
+            session,
+            view.publication_id,
+            job_id=job_id,
+            status=ValidationStatus.PASS,
+            evidence_sha256=f"{index + 300:064x}",
+        )
+    mark_remote_published(
+        session,
+        view.publication_id,
+        successor_head,
+        branch=view.remote_branch,
+        base_branch=view.base_branch,
+        pull_request_number=view.pull_request_number,
+    )
+    running = request_codex_review(
+        session,
+        view.publication_id,
+        mode="required",
+        expected_head_sha=successor_head,
+    )
+    mark_codex_review_unavailable(
+        session,
+        view.publication_id,
+        run_id=running.automated_review_run_id,
+        reviewed_head_sha=successor_head,
+        reason="Correlated provider usage-limit response.",
+    )
+    begin_successor_verification(
+        session,
+        package.work_package_id,
+        review_run_id=running.automated_review_run_id,
+        head_sha=successor_head,
+        idempotency_key="bind-unavailable-materializer",
+        fallback_reviewer="principal-reviewer:chatgpt",
+        fallback_reason="Provider unavailable; exact-head independent review required.",
+    )
+    verify_finding(
+        session,
+        package.work_package_id,
+        finding_id="codex:3101:4101",
+        outcome="ABSENT",
+        reviewer="principal-reviewer:chatgpt",
+        evidence="Provider finding is absent under the recorded fallback.",
+        idempotency_key="verify-unavailable-materializer-provider",
+    )
+    verify_finding(
+        session,
+        package.work_package_id,
+        finding_id="control-plane:bigint-comment-id",
+        outcome="ABSENT",
+        reviewer="principal-reviewer:chatgpt",
+        evidence="Internal finding is absent under the recorded fallback.",
+        idempotency_key="verify-unavailable-materializer-internal",
+    )
+
+    github = FakeRemediationGitHub(view)
+    github.head_sha = successor_head
+    github.drop_reaction_response = False
+    github.drop_reply_response = False
+    github.drop_summary_response = False
+    materializer = GitHubRemediationMaterializer(
+        token_provider=FakeRemediationTokenProvider(),
+        github=github,
+        project_token=SecretStr("project-user-token"),
+        review_thread_token=SecretStr("review-user-token"),
+    )
+
+    done = materializer.materialize(session, package.work_package_id)
+
+    assert done.state is WorkPackageState.DONE
+    assert done.issue_closed is True
+    assert get_view(session, view.publication_id).automated_review_status is AutomatedReviewStatus.UNAVAILABLE
+    assert github.resolve_calls == 1
+    assert len(github.reactions) == 1
+    assert len(github.replies) == 1
+
+
+def test_materializer_rejects_unavailable_successor_without_fallback(session, monkeypatch):
+    view, _source_run, package = create_package(session)
+    claim_work_package(
+        session,
+        package.work_package_id,
+        actor="general-implementer",
+        idempotency_key="claim-unavailable-no-fallback",
+    )
+    successor_head = "8" * 40
+    candidate = submit_verified_candidate(
+        session,
+        view.publication_id,
+        source(successor_head, "9" * 40, "a"),
+    )
+    submit_implementation(
+        session,
+        package.work_package_id,
+        candidate_id=candidate.current_candidate.candidate_id,
+        head_sha=successor_head,
+        summary="Construct unavailable state without granting fallback authority.",
+        evidence_sha256="f" * 64,
+        idempotency_key="submit-unavailable-no-fallback",
+    )
+    profile = profile_for_repository(REPOSITORY)
+    for index, job_id in enumerate(profile.required_jobs, 1):
+        record_validation(
+            session,
+            view.publication_id,
+            job_id=job_id,
+            status=ValidationStatus.PASS,
+            evidence_sha256=f"{index + 400:064x}",
+        )
+    mark_remote_published(
+        session,
+        view.publication_id,
+        successor_head,
+        branch=view.remote_branch,
+        base_branch=view.base_branch,
+        pull_request_number=view.pull_request_number,
+    )
+    running = request_codex_review(
+        session,
+        view.publication_id,
+        mode="required",
+        expected_head_sha=successor_head,
+    )
+    mark_codex_review_unavailable(
+        session,
+        view.publication_id,
+        run_id=running.automated_review_run_id,
+        reviewed_head_sha=successor_head,
+        reason="Correlated provider usage-limit response.",
+    )
+
+    package_view = get_work_package(session, package.work_package_id)
+    impossible_unbound_view = replace(
+        package_view,
+        state=WorkPackageState.VERIFYING,
+        successor_review_run_id=running.automated_review_run_id,
+        successor_head_sha=successor_head,
+        successor_fallback=None,
+    )
+
+    github = FakeRemediationGitHub(view)
+    github.head_sha = successor_head
+    materializer = GitHubRemediationMaterializer(
+        token_provider=FakeRemediationTokenProvider(),
+        github=github,
+        project_token=SecretStr("project-user-token"),
+        review_thread_token=SecretStr("review-user-token"),
+    )
+
+    import control_plane.remediation_materializer as materializer_module
+
+    original_get_work_package = materializer_module.get_work_package
+
+    def fake_get_work_package(current_session, work_package_id):
+        if work_package_id == package.work_package_id:
+            return impossible_unbound_view
+        return original_get_work_package(current_session, work_package_id)
+
+    monkeypatch.setattr(materializer_module, "get_work_package", fake_get_work_package)
+
+    with pytest.raises(
+        RemediationMaterializationError,
+        match="successor review is no longer current",
+    ):
+        materializer._verify_current_head(
+            session,
+            impossible_unbound_view,
+            "installation-token",
+        )
 
 
 def test_successor_review_must_match_the_submitted_implementation_head_and_candidate(session):
