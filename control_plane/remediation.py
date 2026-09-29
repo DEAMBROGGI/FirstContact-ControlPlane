@@ -12,7 +12,13 @@ from typing import Any, Mapping
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
-from .domain import AutomatedReviewStatus, DomainError
+from .domain import (
+    AutomatedReviewStatus,
+    DomainError,
+    EventType,
+    PublicationState,
+    validate_transition,
+)
 from .models import (
     CandidateRow,
     RemediationDispatchRow,
@@ -20,12 +26,18 @@ from .models import (
     RemediationEventRow,
     RemediationWorkPackageRow,
 )
-from .repository import ZERO_HASH
+from .repository import ZERO_HASH, append_event
 from .service import get_view
 
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _EVIDENCE_RE = re.compile(r"^[0-9a-f]{64}$")
 _BATCH_NAMESPACE = uuid.UUID("a68dd9c2-c23c-4e78-8b0c-9a2e0ef506bf")
+_RESERVED_AUTOMATION_MENTION = re.compile(r"(?i)(?<![A-Za-z0-9_])@codex\b")
+
+
+def _assert_safe_client_text(value: str, field: str) -> None:
+    if _RESERVED_AUTOMATION_MENTION.search(value):
+        raise DomainError(f"{field} contains a reserved automation mention")
 
 
 class WorkPackageState(StrEnum):
@@ -490,6 +502,15 @@ def _normalize_findings(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
             raise DomainError("Principal Reviewer decision is invalid") from exc
         reason = str(decision.get("reason") or "").strip()
         actor = str(decision.get("actor", "")).strip()
+        for field_name, value in (
+            ("finding id", finding_id),
+            ("finding identity", identity),
+            ("Principal Reviewer actor", actor),
+            ("Principal Reviewer reason", reason),
+            ("finding source kind", str(source.get("kind", ""))),
+            ("finding source provider", str(source.get("provider", ""))),
+        ):
+            _assert_safe_client_text(value, field_name)
         if not actor or len(actor) > 200:
             raise DomainError("Principal Reviewer decision actor is required and bounded")
         if decision_value is PrincipalDecision.REJECTED and not reason:
@@ -546,6 +567,8 @@ def create_work_package(
         raise DomainError("review run id is invalid")
     if not review_provider.strip() or len(review_provider) > 100:
         raise DomainError("review provider is invalid")
+    _assert_safe_client_text(review_run_id, "review run id")
+    _assert_safe_client_text(review_provider, "review provider")
     head = reviewed_head_sha.lower()
     if not _SHA_RE.fullmatch(head):
         raise DomainError("reviewed_head_sha must be an exact 40-hex Git SHA")
@@ -792,6 +815,7 @@ def submit_implementation(
         raise DomainError("implementation evidence must be a SHA-256 digest")
     if not payload["summary"] or len(payload["summary"]) > 4000:
         raise DomainError("implementation summary must contain 1..4000 characters")
+    _assert_safe_client_text(payload["summary"], "implementation summary")
     candidate = session.get(CandidateRow, candidate_id)
     publication = get_view(session, row.publication_id)
     if (
@@ -946,6 +970,8 @@ def verify_finding(
         "reviewer": reviewer.strip(),
         "evidence": evidence.strip(),
     }
+    _assert_safe_client_text(stable_request["reviewer"], "finding verification reviewer")
+    _assert_safe_client_text(stable_request["evidence"], "finding verification evidence")
     existing = session.scalar(
         select(RemediationEventRow).where(
             RemediationEventRow.work_package_id == row.id,
@@ -1203,6 +1229,26 @@ def complete_work_package(
         for finding in view.findings
     ):
         raise DomainError("work package findings are not fully closed")
+
+    publication_row = session.scalar(
+        select(PublicationRow)
+        .where(PublicationRow.id == row.publication_id)
+        .with_for_update()
+    )
+    if publication_row is None:
+        raise KeyError(row.publication_id)
+    publication = get_view(session, row.publication_id)
+    expected_run_id = view.successor_review_run_id or row.review_run_id
+    expected_head_sha = view.successor_head_sha or row.reviewed_head_sha
+    if (
+        publication.remote_head_sha != expected_head_sha
+        or publication.automated_review_head_sha != expected_head_sha
+        or publication.automated_review_run_id != expected_run_id
+        or publication.automated_review_status
+        not in {AutomatedReviewStatus.PASS, AutomatedReviewStatus.CHANGES_REQUIRED}
+    ):
+        raise DomainError("work package completion is stale for the current review/head")
+
     _append(
         session,
         row,
@@ -1210,6 +1256,20 @@ def complete_work_package(
         idempotency_key=idempotency_key,
         payload=payload,
     )
+
+    # A decision-only package (all provider findings rejected by the Principal
+    # Reviewer) has no successor review. Preserve the provider's original
+    # CHANGES_REQUIRED evidence while explicitly restoring same-head Human
+    # Review eligibility after the package is fully materialized and closed.
+    if view.successor_review_run_id is None:
+        clearance = {
+            "run_id": row.review_run_id,
+            "head_sha": row.reviewed_head_sha,
+            "work_package_id": work_package_id,
+        }
+        validate_transition(publication, EventType.REMEDIATION_CLEARED, clearance)
+        append_event(session, row.publication_id, EventType.REMEDIATION_CLEARED, clearance)
+
     session.commit()
     return get_work_package(session, work_package_id)
 

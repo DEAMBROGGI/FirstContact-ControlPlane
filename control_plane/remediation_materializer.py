@@ -35,12 +35,14 @@ class GitHubRemediationMaterializer:
         token_provider: GitHubAppTokenProvider,
         github: GitHubRepositoryGateway,
         project_token: SecretStr,
+        review_thread_token: SecretStr = SecretStr(""),
         project_number: int | None = 4,
         project_lifecycle_field: str = "Lifecycle",
     ) -> None:
         self.token_provider = token_provider
         self.github = github
         self.project_token = project_token
+        self.review_thread_token = review_thread_token
         self.project_number = project_number
         self.project_lifecycle_field = project_lifecycle_field
 
@@ -553,6 +555,11 @@ class GitHubRemediationMaterializer:
         publication = get_view(session, view.publication_id)
         if publication.pull_request_number is None:
             raise RemediationMaterializationError("publication has no canonical pull request")
+        review_thread_token = self.review_thread_token.get_secret_value().strip()
+        if not review_thread_token:
+            raise RemediationMaterializationError(
+                "remediation review-thread credential is not configured"
+            )
         comment_id = finding["source"]["provider_thread_id"]
         return self._dispatch(
             session,
@@ -564,7 +571,7 @@ class GitHubRemediationMaterializer:
                 view.repository,
                 publication.pull_request_number,
                 comment_id,
-                token,
+                review_thread_token,
             ),
         )
 

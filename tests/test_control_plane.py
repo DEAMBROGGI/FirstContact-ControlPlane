@@ -520,7 +520,7 @@ def test_merged_publication_rejects_successor_candidate(session):
         submit_verified_candidate(session, view.publication_id, successor_source())
 
 
-def test_late_codex_result_from_old_head_is_rejected_after_successor_submission(session):
+def test_successor_candidate_is_blocked_while_codex_review_is_running(session):
     first = published_publication(session, issue_number=56)
     running = request_codex_review(
         session,
@@ -528,22 +528,28 @@ def test_late_codex_result_from_old_head_is_rejected_after_successor_submission(
         mode="required",
         expected_head_sha=first.remote_head_sha,
     )
-    second = submit_verified_candidate(session, first.publication_id, successor_source())
 
-    assert second.automated_review_status is None
-    with pytest.raises(DomainError, match="active review"):
-        complete_codex_review(
-            session,
-            first.publication_id,
-            run_id=running.automated_review_run_id,
-            reviewed_head_sha=first.remote_head_sha,
-            result=AutomatedReviewStatus.PASS,
-            findings=[],
-            provider_review_ids=[],
-            provider_comment_ids=[],
-        )
-    assert get_view(session, first.publication_id).state is PublicationState.VALIDATING
+    with pytest.raises(DomainError, match="automated review is running"):
+        submit_verified_candidate(session, first.publication_id, successor_source())
 
+    current = get_view(session, first.publication_id)
+    assert current.state is PublicationState.IN_REVIEW
+    assert current.automated_review_status is AutomatedReviewStatus.RUNNING
+    assert current.automated_review_run_id == running.automated_review_run_id
+
+    completed = complete_codex_review(
+        session,
+        first.publication_id,
+        run_id=running.automated_review_run_id,
+        reviewed_head_sha=first.remote_head_sha,
+        result=AutomatedReviewStatus.PASS,
+        findings=[],
+        provider_review_ids=[],
+        provider_comment_ids=[],
+    )
+    assert completed.automated_review_status is AutomatedReviewStatus.PASS
+    successor = submit_verified_candidate(session, first.publication_id, successor_source())
+    assert successor.state is PublicationState.VALIDATING
 
 def test_codex_pass_from_old_head_does_not_satisfy_successor_review(session):
     first = published_publication(session, issue_number=57)
@@ -732,10 +738,7 @@ def test_supersession_requests_ordered_row_locks_before_rereading(session, monke
     assert trace[3][1] == old.publication_id
 
 
-def test_codex_result_is_revalidated_after_candidate_wins_lock_race(
-    session,
-    monkeypatch,
-):
+def test_codex_running_state_serializes_candidate_submission(session):
     published = published_publication(session, issue_number=72)
     running = request_codex_review(
         session,
@@ -743,43 +746,20 @@ def test_codex_result_is_revalidated_after_candidate_wins_lock_race(
         mode="required",
         expected_head_sha=published.remote_head_sha,
     )
-    state = interleave_after_first_publication_lock(
-        session,
-        monkeypatch,
-        lambda: submit_verified_candidate(
+
+    with pytest.raises(DomainError, match="automated review is running"):
+        submit_verified_candidate(
             session,
             published.publication_id,
             successor_source(),
-        ),
-    )
-
-    with pytest.raises(DomainError):
-        complete_codex_review(
-            session,
-            published.publication_id,
-            run_id=running.automated_review_run_id,
-            reviewed_head_sha=published.remote_head_sha,
-            result=AutomatedReviewStatus.PASS,
-            findings=[],
-            provider_review_ids=[],
-            provider_comment_ids=[],
         )
 
-    events = load_events(session, published.publication_id)
-    candidate_index = max(
-        index for index, event in enumerate(events)
-        if event["event_type"] == EventType.CANDIDATE_SUBMITTED.value
-    )
-    assert state["interleaved"]
-    assert not any(
-        event["event_type"] == EventType.CODEX_REVIEW_COMPLETED.value
-        for event in events[candidate_index + 1 :]
-    )
     current = get_view(session, published.publication_id)
-    assert current.state is PublicationState.VALIDATING
-    assert current.current_candidate.head_sha == "4" * 40
-    assert current.automated_review_status is None
-
+    assert current.state is PublicationState.IN_REVIEW
+    assert current.current_candidate.head_sha == HEAD
+    assert current.remote_head_sha == HEAD
+    assert current.automated_review_status is AutomatedReviewStatus.RUNNING
+    assert current.automated_review_run_id == running.automated_review_run_id
 
 def test_human_approval_is_rejected_if_successor_candidate_wins_lock_race(
     session,

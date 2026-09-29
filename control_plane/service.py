@@ -20,7 +20,14 @@ from .domain import (
     fold_events,
     validate_transition,
 )
-from .models import CandidateRow, CandidateSourceRow, CodexReviewDispatchRow, PublicationRow
+from .models import (
+    CandidateRow,
+    CandidateSourceRow,
+    CodexReviewDispatchRow,
+    PublicationRow,
+    RemediationEventRow,
+    RemediationWorkPackageRow,
+)
 from .profile_registry import DeliveryProfile, profile_for_identity, profile_for_repository
 from .quarantine import VerifiedCandidateSource
 from .repository import append_event, load_events
@@ -382,6 +389,32 @@ def mark_remote_published(
     append_event(session, publication_id, EventType.REMOTE_PUBLISHED, payload)
     session.commit()
     return get_view(session, publication_id)
+def _unfinished_remediation_work_package_ids(
+    session: Session,
+    publication_id: str,
+) -> tuple[str, ...]:
+    work_package_ids = tuple(
+        session.scalars(
+            select(RemediationWorkPackageRow.id)
+            .where(RemediationWorkPackageRow.publication_id == publication_id)
+            .order_by(RemediationWorkPackageRow.created_at, RemediationWorkPackageRow.id)
+        )
+    )
+    unfinished: list[str] = []
+    for work_package_id in work_package_ids:
+        completed = session.scalar(
+            select(RemediationEventRow.id)
+            .where(
+                RemediationEventRow.work_package_id == work_package_id,
+                RemediationEventRow.event_type == "WORK_PACKAGE_COMPLETED",
+            )
+            .limit(1)
+        )
+        if completed is None:
+            unfinished.append(work_package_id)
+    return tuple(unfinished)
+
+
 def record_review(
     session: Session,
     publication_id: str,
@@ -391,12 +424,24 @@ def record_review(
     require_codex_review: bool = False,
 ) -> PublicationView:
     view = _locked_publication_view(session, publication_id)
+    if decision is ReviewDecision.APPROVED:
+        unfinished = _unfinished_remediation_work_package_ids(session, publication_id)
+        if unfinished:
+            raise DomainError(
+                "human approval is blocked by unfinished remediation: "
+                + ", ".join(unfinished)
+            )
     if (
         require_codex_review
         and decision is ReviewDecision.APPROVED
         and view.automated_review_status is not AutomatedReviewStatus.PASS
+        and not (
+            view.automated_review_status is AutomatedReviewStatus.CHANGES_REQUIRED
+            and view.remediation_cleared_review_run_id == view.automated_review_run_id
+            and view.remediation_cleared_head_sha == view.remote_head_sha
+        )
     ):
-        raise DomainError("required Codex review has not passed")
+        raise DomainError("required Codex review has not passed or been adjudicated")
     payload = {
         "reviewed_head_sha": _sha(reviewed_head_sha, "reviewed_head_sha"),
         "decision": decision.value,

@@ -134,11 +134,13 @@ def get_codex_review_broker():
 
 def get_remediation_materializer():
     project_token = settings.remediation_project_token.get_secret_value().strip()
+    thread_token = settings.remediation_thread_token.get_secret_value().strip()
     codex_trigger_token = settings.codex_review_user_token.get_secret_value().strip()
-    if project_token and project_token == codex_trigger_token:
+    configured = [value for value in (project_token, thread_token, codex_trigger_token) if value]
+    if len(configured) != len(set(configured)):
         raise HTTPException(
             status_code=503,
-            detail="remediation Project V2 credential configuration is invalid",
+            detail="remediation credential configuration is invalid",
         )
     token_provider = GitHubAppTokenProvider(
         app_id=settings.github_app_id,
@@ -153,6 +155,7 @@ def get_remediation_materializer():
             project_number=settings.remediation_project_number,
             project_lifecycle_field=settings.remediation_project_lifecycle_field,
             project_token=settings.remediation_project_token,
+            review_thread_token=settings.remediation_thread_token,
         )
     finally:
         token_provider.close()

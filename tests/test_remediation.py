@@ -10,7 +10,13 @@ from fastapi.testclient import TestClient
 
 from control_plane.config import Settings, settings
 from control_plane.db import get_session
-from control_plane.domain import AutomatedReviewStatus, DomainError, PublicationState, ValidationStatus
+from control_plane.domain import (
+    AutomatedReviewStatus,
+    DomainError,
+    PublicationState,
+    ReviewDecision,
+    ValidationStatus,
+)
 from control_plane.github_api import (
     GitHubApiError,
     IssueCommentSnapshot,
@@ -48,7 +54,9 @@ from control_plane.repository import load_events
 from control_plane.service import (
     complete_codex_review,
     create_publication,
+    get_view,
     mark_remote_published,
+    record_review,
     record_validation,
     request_codex_review,
     submit_verified_candidate,
@@ -349,6 +357,7 @@ def test_project_v2_uses_separate_secret_and_fails_closed_when_missing(session):
         token_provider=app_credentials,
         github=github,
         project_token=SecretStr("project-user-token"),
+        review_thread_token=SecretStr("review-user-token"),
     )
 
     materializer.sync_issue_projection(session, package.work_package_id)
@@ -371,34 +380,81 @@ def test_project_v2_uses_separate_secret_and_fails_closed_when_missing(session):
     assert no_project_credential.github.project_tokens == []
 
 
+def test_review_thread_resolution_uses_separate_secret_and_fails_closed_when_missing(session):
+    view, package, _source_run, _successor_run = prepare_verifying_package(session)
+    github = FakeRemediationGitHub(view)
+    github.head_sha = get_work_package(session, package.work_package_id).successor_head_sha
+    finding = next(
+        item for item in get_work_package(session, package.work_package_id).findings
+        if item["source"].get("provider_thread_id") is not None
+    )
+    materializer = GitHubRemediationMaterializer(
+        token_provider=FakeRemediationTokenProvider(),
+        github=github,
+        project_token=SecretStr("project-user-token"),
+        review_thread_token=SecretStr(""),
+    )
+
+    with pytest.raises(
+        RemediationMaterializationError,
+        match="review-thread credential is not configured",
+    ):
+        materializer._resolve(
+            session,
+            get_work_package(session, package.work_package_id),
+            finding,
+            token="installation-token",
+        )
+    assert github.resolve_calls == 0
+    assert github.review_thread_tokens == []
+
+
 def test_project_and_codex_credentials_are_masked_and_factory_uses_project_setting(
     monkeypatch,
 ):
     configured = Settings(
         _env_file=None,
         remediation_project_token=SecretStr("project-only-secret"),
+        remediation_thread_token=SecretStr("thread-only-secret"),
         codex_review_user_token=SecretStr("codex-trigger-secret"),
     )
     assert "project-only-secret" not in repr(configured)
+    assert "thread-only-secret" not in repr(configured)
     assert "codex-trigger-secret" not in repr(configured)
-    assert Settings(_env_file=None).remediation_project_token.get_secret_value() == ""
+    defaults = Settings(_env_file=None)
+    assert defaults.remediation_project_token.get_secret_value() == ""
+    assert defaults.remediation_thread_token.get_secret_value() == ""
 
     monkeypatch.setattr(settings, "remediation_project_token", SecretStr("project-only-secret"))
+    monkeypatch.setattr(settings, "remediation_thread_token", SecretStr("thread-only-secret"))
     monkeypatch.setattr(settings, "codex_review_user_token", SecretStr("codex-trigger-secret"))
     dependency = get_remediation_materializer()
     materializer = next(dependency)
     try:
         assert materializer.project_token.get_secret_value() == "project-only-secret"
-        assert materializer.project_token.get_secret_value() != settings.codex_review_user_token.get_secret_value()
+        assert materializer.review_thread_token.get_secret_value() == "thread-only-secret"
+        secrets = {
+            materializer.project_token.get_secret_value(),
+            materializer.review_thread_token.get_secret_value(),
+            settings.codex_review_user_token.get_secret_value(),
+        }
+        assert len(secrets) == 3
     finally:
         dependency.close()
 
     monkeypatch.setattr(settings, "remediation_project_token", SecretStr("same-secret"))
+    monkeypatch.setattr(settings, "remediation_thread_token", SecretStr("thread-only-secret"))
     monkeypatch.setattr(settings, "codex_review_user_token", SecretStr("same-secret"))
     with pytest.raises(HTTPException) as error:
         next(get_remediation_materializer())
     assert error.value.status_code == 503
     assert "same-secret" not in str(error.value.detail)
+
+    monkeypatch.setattr(settings, "remediation_project_token", SecretStr("project-only-secret"))
+    monkeypatch.setattr(settings, "remediation_thread_token", SecretStr("same-thread-secret"))
+    monkeypatch.setattr(settings, "codex_review_user_token", SecretStr("same-thread-secret"))
+    with pytest.raises(HTTPException):
+        next(get_remediation_materializer())
 
 
 class FakeRemediationGitHub:
@@ -420,6 +476,7 @@ class FakeRemediationGitHub:
         self.issue_labels = set()
         self.project_statuses = []
         self.project_tokens = []
+        self.review_thread_tokens = []
         self.sub_issue_links = set()
         self.fail_sub_issue_once = False
         self.drop_reaction_response = True
@@ -481,6 +538,8 @@ class FakeRemediationGitHub:
         return reply
 
     def resolve_pull_review_thread(self, repository, pull_number, comment_id, token):
+        assert token == "review-user-token"
+        self.review_thread_tokens.append(token)
         self.resolve_calls += 1
         self.resolved.add(comment_id)
         return f"PRRT_{comment_id}"
@@ -587,6 +646,7 @@ def test_materializer_recovers_lost_responses_without_duplicate_artifacts(sessio
         token_provider=FakeRemediationTokenProvider(),
         github=github,
         project_token=SecretStr("project-user-token"),
+        review_thread_token=SecretStr("review-user-token"),
     )
 
     result = None
@@ -645,6 +705,7 @@ def test_issue_creation_is_marker_recoverable_and_links_parent_and_project(sessi
         token_provider=FakeRemediationTokenProvider(),
         github=github,
         project_token=SecretStr("project-user-token"),
+        review_thread_token=SecretStr("review-user-token"),
     )
 
     with pytest.raises(RemediationMaterializationError):
@@ -680,6 +741,7 @@ def test_issue_projection_retry_recovers_parent_link_and_releases_lease(session)
         token_provider=FakeRemediationTokenProvider(),
         github=github,
         project_token=SecretStr("project-user-token"),
+        review_thread_token=SecretStr("review-user-token"),
     )
 
     with pytest.raises(RemediationMaterializationError):
@@ -828,6 +890,7 @@ def test_rejected_only_package_finalizes_without_candidate_or_successor_review(s
         token_provider=FakeRemediationTokenProvider(),
         github=github,
         project_token=SecretStr("project-user-token"),
+        review_thread_token=SecretStr("review-user-token"),
     )
     result = None
     for _ in range(5):
@@ -846,6 +909,150 @@ def test_rejected_only_package_finalizes_without_candidate_or_successor_review(s
     assert len(github.replies) == 1
     assert github.resolved == {4101}
     assert github.issue_state == "closed"
+
+    publication = get_view(session, view.publication_id)
+    assert publication.state is PublicationState.IN_REVIEW
+    assert publication.automated_review_status is AutomatedReviewStatus.CHANGES_REQUIRED
+    assert publication.remediation_cleared_review_run_id == source_run
+    assert publication.remediation_cleared_head_sha == HEAD
+    approved = record_review(
+        session,
+        view.publication_id,
+        reviewed_head_sha=HEAD,
+        decision=ReviewDecision.APPROVED,
+        require_codex_review=True,
+    )
+    assert approved.state is PublicationState.APPROVED
+
+
+def test_rejected_reason_rejects_reserved_automation_mentions(session):
+    view = publish(session, issue_number=811)
+    source_run = add_completed_review(session, view)
+    findings = initial_findings()
+    findings[0]["principal_decision"] = {
+        "decision": "REJECTED",
+        "actor": "principal-reviewer",
+        "reason": "Do not run @codex review from materialized feedback.",
+    }
+    findings[0]["desired_reaction"] = "-1"
+
+    with pytest.raises(DomainError, match="reserved automation mention"):
+        create_work_package(
+            session,
+            publication_id=view.publication_id,
+            implementation_issue_number=811,
+            review_run_id=source_run,
+            review_provider="CODEX_CODE_REVIEW",
+            provider_review_id=3101,
+            reviewed_head_sha=HEAD,
+            findings=findings,
+            idempotency_key="reserved-mention-reason",
+        )
+
+
+def test_human_approval_is_blocked_while_required_remediation_is_unfinished(session):
+    view, _source_run, package = create_package(session, issue_number=812)
+    claim_work_package(
+        session,
+        package.work_package_id,
+        actor="general-implementer",
+        idempotency_key="claim-open-remediation",
+    )
+    successor_head = "4" * 40
+    candidate = submit_verified_candidate(
+        session,
+        view.publication_id,
+        source(successor_head, "5" * 40, "b"),
+    )
+    submit_implementation(
+        session,
+        package.work_package_id,
+        candidate_id=candidate.current_candidate.candidate_id,
+        head_sha=successor_head,
+        summary="Implementation remains awaiting Principal Reviewer verification.",
+        evidence_sha256="d" * 64,
+        idempotency_key="implemented-open-remediation",
+    )
+    profile = profile_for_repository(REPOSITORY)
+    for index, job_id in enumerate(profile.required_jobs, 1):
+        record_validation(
+            session,
+            view.publication_id,
+            job_id=job_id,
+            status=ValidationStatus.PASS,
+            evidence_sha256=f"{index + 30:064x}",
+        )
+    mark_remote_published(
+        session,
+        view.publication_id,
+        successor_head,
+        branch=view.remote_branch,
+        base_branch=view.base_branch,
+        pull_request_number=view.pull_request_number,
+    )
+    running = request_codex_review(
+        session,
+        view.publication_id,
+        mode="required",
+        expected_head_sha=successor_head,
+    )
+    complete_codex_review(
+        session,
+        view.publication_id,
+        run_id=running.automated_review_run_id,
+        reviewed_head_sha=successor_head,
+        result=AutomatedReviewStatus.PASS,
+        findings=[],
+        provider_review_ids=[3201],
+        provider_comment_ids=[],
+    )
+
+    with pytest.raises(DomainError, match="unfinished remediation"):
+        record_review(
+            session,
+            view.publication_id,
+            reviewed_head_sha=successor_head,
+            decision=ReviewDecision.APPROVED,
+            require_codex_review=True,
+        )
+
+
+def test_work_package_completion_rechecks_current_review_and_head_under_lock(session):
+    view, package, _source_run, _successor_run = prepare_verifying_package(session)
+    for artifact, remote_id in (("reaction", 701), ("reply", 702), ("resolution", "PRRT_stale")):
+        record_github_artifact(
+            session,
+            package.work_package_id,
+            finding_id="codex:3101:4101",
+            artifact=artifact,
+            remote_id=remote_id,
+            idempotency_key=f"stale-{artifact}",
+        )
+    record_summary_comment(
+        session,
+        package.work_package_id,
+        comment_id=703,
+        idempotency_key="stale-summary",
+    )
+    record_issue_closed(
+        session,
+        package.work_package_id,
+        idempotency_key="stale-issue-close",
+    )
+
+    submit_verified_candidate(
+        session,
+        view.publication_id,
+        source("6" * 40, "7" * 40, "c"),
+    )
+
+    with pytest.raises(DomainError, match="completion is stale"):
+        complete_work_package(
+            session,
+            package.work_package_id,
+            idempotency_key="stale-done",
+        )
+    assert get_work_package(session, package.work_package_id).state is WorkPackageState.VERIFYING
 
 
 def test_ready_work_package_persists_exact_review_decisions_and_is_idempotent(session):

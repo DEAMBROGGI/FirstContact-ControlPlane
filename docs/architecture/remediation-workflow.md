@@ -148,10 +148,17 @@ marker. The Project V2 number is configured with
 `CONTROL_PLANE_REMEDIATION_PROJECT_NUMBER`, and its field name is explicitly
 configured by `CONTROL_PLANE_REMEDIATION_PROJECT_LIFECYCLE_FIELD=Lifecycle`.
 Project #4 is user-owned, so its GraphQL mutations use the separate runtime
-secret `CONTROL_PLANE_REMEDIATION_PROJECT_TOKEN`, configured for Project write
-access only. It is never reused for Issues or pull-request operations, which
-continue to use the GitHub App installation token. This Project credential is
-also separate from the Codex trigger credential. An empty Project credential
+secret `CONTROL_PLANE_REMEDIATION_PROJECT_TOKEN`. For the current private
+repository + user-owned Project combination, GitHub requires a dedicated classic
+PAT with `project` plus `repo` scope so the Project mutation can resolve private
+Issue content. It is never reused for normal Issues or pull-request operations,
+which continue to use the GitHub App installation token. Review-thread resolution
+uses the additional user secret `CONTROL_PLANE_REMEDIATION_THREAD_TOKEN`, because
+GitHub returns `Resource not accessible by integration` for `resolveReviewThread`
+with the installation token. The Project, thread-resolution and Codex trigger
+credentials are pairwise distinct. Project owner lookup uses GraphQL
+`repositoryOwner(login:)` with User/Organization fragments so an invalid
+organization lookup cannot poison a valid user-owned Project response. An empty Project credential
 makes projection fail closed after retaining the ledger event for retry. The
 Project adapter reads the item before adding it and reads back mutation results,
 so retries recover without duplicate Project items.
@@ -235,8 +242,12 @@ rules do not define the generic remediation package contract.
   `CONTROL_PLANE_REMEDIATION_PROJECT_LIFECYCLE_FIELD=Lifecycle` for Project #4.
   Grant the GitHub App only required repository `issues:write` /
   `pull_requests:write` permissions. Configure the dedicated
-  `CONTROL_PLANE_REMEDIATION_PROJECT_TOKEN` runtime secret with Project write
-  access only; do not reuse the Codex trigger credential.
+  `CONTROL_PLANE_REMEDIATION_PROJECT_TOKEN` runtime secret. For a user-owned
+  Project containing private-repository Issues, the current GitHub classic PAT
+  contract requires `project` + `repo`; do not reuse the Codex trigger credential.
+  Configure `CONTROL_PLANE_REMEDIATION_THREAD_TOKEN` separately for review-thread
+  resolution; for the current private repository a dedicated classic PAT with
+  `repo` is sufficient. Do not reuse the Project or Codex trigger credentials.
 - Route issue, label, Project, reaction, reply, thread-resolution, summary, and
   closure effects through Control Plane commands. Do not add direct-write
   helpers in the consumer API or candidate.
@@ -244,3 +255,23 @@ rules do not define the generic remediation package contract.
   actor/id mismatches, exact-head changes, and ambiguous concurrent activity;
   run the shared Control Plane and publisher regression gates before enabling
   the integration.
+
+### Review/remediation safety invariants proven by dogfood
+
+- A candidate cannot be submitted while an automated review is `RUNNING`; this
+  serializes successor publication against trigger dispatch and prevents the
+  governed marker from invoking Codex on a moved PR head.
+- Human `APPROVED` fails closed while any remediation package for the Publication
+  is unfinished, even when the exact-head automated review itself reports PASS.
+- Final remediation completion re-locks the Publication and revalidates the
+  current review run and exact remote/review head before appending `DONE`.
+- A rejected-only package preserves the provider `CHANGES_REQUIRED` evidence but
+  appends an explicit `REMEDIATION_CLEARED` Publication event after all GitHub
+  artifacts and issue closure are complete. That restores same-head `IN_REVIEW`
+  eligibility without fabricating a provider PASS.
+- Client-controlled text that can be persisted/materialized is rejected when it
+  contains the reserved `@codex` automation mention.
+- Required automated review remains fail-closed when the provider is unavailable.
+  Emergency implementation may continue and be validated locally, but no PASS is
+  synthesized and no governed merge gate is satisfied until independent review
+  evidence is available or a separately audited future override policy applies.

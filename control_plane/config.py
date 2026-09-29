@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     remediation_project_number: int | None = None
     remediation_project_lifecycle_field: str = "Lifecycle"
     remediation_project_token: SecretStr = SecretStr("")
+    remediation_thread_token: SecretStr = SecretStr("")
     codex_review_user_token: SecretStr = SecretStr("")
     codex_review_trigger_login: str = ""
     codex_review_mode: str = "disabled"

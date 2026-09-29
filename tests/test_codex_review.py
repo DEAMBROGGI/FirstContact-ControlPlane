@@ -931,6 +931,10 @@ def test_successor_head_gets_new_codex_run_and_old_trigger_remains_historical(se
     first = published_publication(session)
     value, _tokens, github = broker()
     run_a = value.request(session, first.publication_id)
+    add_codex_review(github, review_id=901)
+    observed_a = value.reconcile(session, first.publication_id)
+    assert observed_a.state == "PASS"
+
     old_comment = github.issue_comments[0]
     github.issue_comments[0] = IssueCommentSnapshot(
         comment_id=old_comment.comment_id,

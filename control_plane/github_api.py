@@ -550,31 +550,34 @@ class GitHubRepositoryGateway:
 
         project_query = """
         query($owner: String!, $number: Int!) {
-          organization(login: $owner) {
-            projectV2(number: $number) {
-              id
-              fields(first: 100) {
-                nodes {
-                  __typename
-                  ... on ProjectV2SingleSelectField {
-                    id
-                    name
-                    options { id name }
+          repositoryOwner(login: $owner) {
+            __typename
+            ... on Organization {
+              projectV2(number: $number) {
+                id
+                fields(first: 100) {
+                  nodes {
+                    __typename
+                    ... on ProjectV2SingleSelectField {
+                      id
+                      name
+                      options { id name }
+                    }
                   }
                 }
               }
             }
-          }
-          user(login: $owner) {
-            projectV2(number: $number) {
-              id
-              fields(first: 100) {
-                nodes {
-                  __typename
-                  ... on ProjectV2SingleSelectField {
-                    id
-                    name
-                    options { id name }
+            ... on User {
+              projectV2(number: $number) {
+                id
+                fields(first: 100) {
+                  nodes {
+                    __typename
+                    ... on ProjectV2SingleSelectField {
+                      id
+                      name
+                      options { id name }
+                    }
                   }
                 }
               }
@@ -583,7 +586,9 @@ class GitHubRepositoryGateway:
         }
         """
         data = graphql(project_query, {"owner": owner, "number": project_number})
-        owner_data = data.get("organization") or data.get("user") or {}
+        owner_data = data.get("repositoryOwner") or {}
+        if owner_data.get("__typename") not in {"User", "Organization"}:
+            raise GitHubApiError("configured GitHub Project V2 owner was not found")
         project = owner_data.get("projectV2") or {}
         project_id = str(project.get("id") or "")
         if not project_id:
@@ -835,6 +840,49 @@ class GitHubRepositoryGateway:
             params={"per_page": "100"},
         )
         return [self._issue_comment_snapshot(item) for item in payload]
+    @staticmethod
+    def _issue_reaction_snapshot(payload: dict) -> IssueReactionSnapshot:
+        try:
+            reaction_id = int(payload["id"])
+            actor = str(payload["user"]["login"])
+            content = str(payload["content"])
+            created_at = str(payload["created_at"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise GitHubApiError("GitHub issue reaction response is invalid") from exc
+        if reaction_id <= 0 or not actor or not created_at or content not in {
+            "+1",
+            "-1",
+            "laugh",
+            "confused",
+            "heart",
+            "hooray",
+            "rocket",
+            "eyes",
+        }:
+            raise GitHubApiError("GitHub issue reaction response is invalid")
+        return IssueReactionSnapshot(
+            reaction_id=reaction_id,
+            actor=actor,
+            content=content,
+            created_at=created_at,
+        )
+
+    def list_issue_comment_reactions(
+        self,
+        repository: str,
+        comment_id: int,
+        token: str,
+    ) -> list[IssueReactionSnapshot]:
+        if comment_id <= 0:
+            raise GitHubApiError("issue comment id must be positive")
+        owner, name = self._parts(repository)
+        payload = self._paginate(
+            f"{self.api_url}/repos/{owner}/{name}/issues/comments/{comment_id}/reactions",
+            token=token,
+            params={"per_page": "100"},
+        )
+        return [self._issue_reaction_snapshot(item) for item in payload]
+
     @staticmethod
     def _pull_review_snapshot(payload: dict) -> PullReviewSnapshot:
         try:

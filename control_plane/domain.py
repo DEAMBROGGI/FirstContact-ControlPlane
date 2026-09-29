@@ -33,6 +33,7 @@ class EventType(StrEnum):
     CODEX_REVIEW_TRIGGERED = "CODEX_REVIEW_TRIGGERED"
     CODEX_REVIEW_COMPLETED = "CODEX_REVIEW_COMPLETED"
     CODEX_REVIEW_UNAVAILABLE = "CODEX_REVIEW_UNAVAILABLE"
+    REMEDIATION_CLEARED = "REMEDIATION_CLEARED"
     REVIEW_RECORDED = "REVIEW_RECORDED"
     MERGEABILITY_RECORDED = "MERGEABILITY_RECORDED"
     MERGED = "MERGED"
@@ -93,6 +94,8 @@ class PublicationView:
     automated_review_triggered_at: str | None
     automated_review_mode: str | None
     automated_review_findings_count: int
+    remediation_cleared_review_run_id: str | None
+    remediation_cleared_head_sha: str | None
     review_decision: ReviewDecision | None
     mergeable: bool | None
     projection: LifecycleProjection
@@ -147,6 +150,8 @@ def fold_events(
     automated_review_triggered_at: str | None = None
     automated_review_mode: str | None = None
     automated_review_findings_count = 0
+    remediation_cleared_review_run_id: str | None = None
+    remediation_cleared_head_sha: str | None = None
     review_decision: ReviewDecision | None = None
     mergeable: bool | None = None
 
@@ -171,6 +176,8 @@ def fold_events(
             automated_review_triggered_at = None
             automated_review_mode = None
             automated_review_findings_count = 0
+            remediation_cleared_review_run_id = None
+            remediation_cleared_head_sha = None
             review_decision = None
             mergeable = None
         elif event_type is EventType.CANDIDATE_ADMITTED:
@@ -203,6 +210,8 @@ def fold_events(
             automated_review_triggered_at = None
             automated_review_mode = None
             automated_review_findings_count = 0
+            remediation_cleared_review_run_id = None
+            remediation_cleared_head_sha = None
             state = PublicationState.IN_REVIEW
         elif event_type is EventType.CODEX_REVIEW_REQUESTED:
             automated_reviewer = "CODEX_CODE_REVIEW"
@@ -214,6 +223,8 @@ def fold_events(
             automated_review_trigger_actor = None
             automated_review_triggered_at = None
             automated_review_findings_count = 0
+            remediation_cleared_review_run_id = None
+            remediation_cleared_head_sha = None
         elif event_type is EventType.CODEX_REVIEW_TRIGGERED:
             automated_review_trigger_comment_id = int(payload["comment_id"])
             automated_review_trigger_actor = (
@@ -238,6 +249,10 @@ def fold_events(
         elif event_type is EventType.CODEX_REVIEW_UNAVAILABLE:
             automated_review_status = AutomatedReviewStatus.UNAVAILABLE
             automated_reviewer = None
+        elif event_type is EventType.REMEDIATION_CLEARED:
+            remediation_cleared_review_run_id = str(payload["run_id"])
+            remediation_cleared_head_sha = str(payload["head_sha"])
+            state = PublicationState.IN_REVIEW
         elif event_type is EventType.REVIEW_RECORDED:
             review_decision = ReviewDecision(payload["decision"])
             state = (
@@ -274,6 +289,8 @@ def fold_events(
         automated_review_triggered_at=automated_review_triggered_at,
         automated_review_mode=automated_review_mode,
         automated_review_findings_count=automated_review_findings_count,
+        remediation_cleared_review_run_id=remediation_cleared_review_run_id,
+        remediation_cleared_head_sha=remediation_cleared_head_sha,
         review_decision=review_decision,
         mergeable=mergeable,
         projection=desired_projection(state),
@@ -294,6 +311,8 @@ def validate_transition(
     ):
         raise DomainError("MERGED publication is terminal")
     if event_type is EventType.CANDIDATE_SUBMITTED:
+        if view.automated_review_status is AutomatedReviewStatus.RUNNING:
+            raise DomainError("candidate cannot be submitted while automated review is running")
         if state not in {
             PublicationState.CREATED,
             PublicationState.VALIDATION_FAILED,
@@ -368,6 +387,16 @@ def validate_transition(
             }:
                 raise DomainError("invalid Codex review result")
         return
+    if event_type is EventType.REMEDIATION_CLEARED:
+        if state is not PublicationState.CHANGES_REQUIRED:
+            raise DomainError("remediation clearance requires CHANGES_REQUIRED state")
+        if view.automated_review_status is not AutomatedReviewStatus.CHANGES_REQUIRED:
+            raise DomainError("remediation clearance requires a completed changes-required review")
+        if payload.get("run_id") != view.automated_review_run_id:
+            raise DomainError("remediation clearance review run is stale")
+        if payload.get("head_sha") != view.automated_review_head_sha or payload.get("head_sha") != view.remote_head_sha:
+            raise DomainError("remediation clearance head is stale")
+        return
     if event_type is EventType.REVIEW_RECORDED:
         if state is not PublicationState.IN_REVIEW:
             raise DomainError("review requires IN_REVIEW state")
@@ -377,8 +406,13 @@ def validate_transition(
             payload.get("decision") == ReviewDecision.APPROVED.value
             and view.automated_review_mode == "required"
             and view.automated_review_status is not AutomatedReviewStatus.PASS
+            and not (
+                view.automated_review_status is AutomatedReviewStatus.CHANGES_REQUIRED
+                and view.remediation_cleared_review_run_id == view.automated_review_run_id
+                and view.remediation_cleared_head_sha == view.remote_head_sha
+            )
         ):
-            raise DomainError("required Codex review has not passed")
+            raise DomainError("required Codex review has not passed or been adjudicated")
         if payload.get("reviewed_head_sha") != view.remote_head_sha:
             raise DomainError("reviewed head is stale")
         ReviewDecision(payload["decision"])

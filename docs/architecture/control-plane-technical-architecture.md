@@ -503,9 +503,9 @@ Invariantes de proyeccion:
 | Principal Review Decision and Remediation Batch ledger | Implementado en #14 |
 | automatic Implementation Fix Issue with marker recovery | Implementado en #14 |
 | parent sub-issue and managed labels | Implementado en #14 |
-| Project V2 lifecycle projection | Implementado en #14; Project #4 usa field `Lifecycle`, option `Review` para IMPLEMENTED/VERIFYING/REWORK_REQUIRED y label `status:review`; configura `CONTROL_PLANE_REMEDIATION_PROJECT_NUMBER`, `CONTROL_PLANE_REMEDIATION_PROJECT_LIFECYCLE_FIELD` y el secreto Project-only `CONTROL_PLANE_REMEDIATION_PROJECT_TOKEN`; smoke live pendiente |
+| Project V2 lifecycle projection | Implementado y smoke live validado; Project #4 usa field `Lifecycle`, option `Review` para IMPLEMENTED/VERIFYING/REWORK_REQUIRED y label `status:review`; configura `CONTROL_PLANE_REMEDIATION_PROJECT_NUMBER`, `CONTROL_PLANE_REMEDIATION_PROJECT_LIFECYCLE_FIELD` y el secreto dedicado `CONTROL_PLANE_REMEDIATION_PROJECT_TOKEN`; para Project personal + repo privado el PAT classic requiere `project` + `repo`; lookup por `repositoryOwner` |
 | implementer claim/completion API | Implementado en #14 |
-| reaction/reply/Resolve Conversation materialization | Implementado en #14; Issues/PR usan GitHub App (`issues:write`, `pull_requests:write`); Project V2 usa el secreto de usuario Project-only separado |
+| reaction/reply/Resolve Conversation materialization | Reactions/replies e Issues usan GitHub App; GitHub no permite `resolveReviewThread` con installation token en este repositorio, por lo que Resolve Conversation usa el secreto de usuario dedicado `CONTROL_PLANE_REMEDIATION_THREAD_TOKEN`; Project V2 usa `CONTROL_PLANE_REMEDIATION_PROJECT_TOKEN`. Los tres caminos quedan separados del PAT de Codex |
 | verified finding closure | Implementado en #14; requiere successor review corriente y verificacion del Principal Reviewer |
 | remediation UI | posterior al contrato domain/API |
 | reusable integration guide | entregable #14 |
@@ -552,8 +552,9 @@ El repositorio consumidor aporta/configura:
 8. mergeability adapter;
 9. integracion Review Run/Finding/Decision/Batch.
 10. `CONTROL_PLANE_REMEDIATION_PROJECT_NUMBER`, GitHub App con `issues:write` y
-    `pull_requests:write`, y `CONTROL_PLANE_REMEDIATION_PROJECT_TOKEN` con
-    Project write solamente para proyecciones de Project V2.
+    `pull_requests:write`, y `CONTROL_PLANE_REMEDIATION_PROJECT_TOKEN` dedicado
+    a Project V2. Para el Project personal actual con Issues de repo privado,
+    GitHub requiere PAT classic `project` + `repo`; no se reutiliza para Codex.
 11. un validador CI reproducible que emita evidencia ligada al candidate exacto.
 
 La API consumidora NO implementa su propia:
@@ -853,3 +854,25 @@ Key invariants:
 - controlled policy migrations prove the old policy on the base, the proposed policy on the candidate, persist the semantic diff and require an explicit authorized decision when obligations are removed/replaced;
 - proposed config becomes ACTIVE only after it reaches the default branch and Plane reads back the expected digest;
 - existing Publications remain pinned to the configuration version/digest with which they started.
+
+## 29. Provider unavailability and emergency implementation
+
+Provider availability is not lifecycle authority. If Codex implementation or
+Codex Code Review is unavailable, the authoritative work package remains in the
+Control Plane ledger. An explicitly audited fallback implementer may continue the
+implementation and local validation, but role separation still applies: the same
+actor must not self-approve the resulting implementation.
+
+For a required automated review, unavailability is fail-closed. The system does
+not manufacture PASS evidence, does not satisfy the Human Review prerequisite,
+and does not advance the governed merge gate. Existing `CODEX_REVIEW_UNAVAILABLE`
+evidence records trigger-level failures; provider non-response remains RUNNING
+until a bounded timeout/availability policy is introduced. This timeout policy is
+a concrete future hardening item and must not be emulated by chat memory.
+
+The #17 dogfood also established these exact-head invariants: candidate submission
+is rejected while automated review is RUNNING; Human APPROVED is rejected while
+any Publication remediation package is unfinished; work-package DONE revalidates
+the current Publication review/head under lock; and rejected-only adjudication
+uses `REMEDIATION_CLEARED` to restore same-head Human Review without rewriting the
+provider result.

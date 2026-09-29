@@ -154,6 +154,52 @@ def test_review_comment_listing_exhausts_github_pagination():
     assert [item.comment_id for item in comments] == [1, 2]
 
 
+def test_issue_comment_reactions_are_paginated_and_validated():
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        assert request.method == "GET"
+        assert request.url.path == "/repos/DEAMBROGGI/FirstContact/issues/comments/7001/reactions"
+        if "page=2" in str(request.url):
+            return httpx.Response(
+                200,
+                json=[{
+                    "id": 702,
+                    "user": {"login": "chatgpt-codex-connector[bot]"},
+                    "content": "+1",
+                    "created_at": "2026-09-28T12:02:00Z",
+                }],
+            )
+        return httpx.Response(
+            200,
+            json=[{
+                "id": 701,
+                "user": {"login": "someone"},
+                "content": "eyes",
+                "created_at": "2026-09-28T12:01:00Z",
+            }],
+            headers={
+                "Link": '<https://api.github.test/repos/DEAMBROGGI/FirstContact/issues/comments/7001/reactions?per_page=100&page=2>; rel="next"'
+            },
+        )
+
+    github = GitHubRepositoryGateway(
+        api_url="https://api.github.test",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    reactions = github.list_issue_comment_reactions(
+        "DEAMBROGGI/FirstContact", 7001, "installation-token"
+    )
+
+    assert [(item.reaction_id, item.content) for item in reactions] == [
+        (701, "eyes"),
+        (702, "+1"),
+    ]
+    assert len(seen) == 2
+
+
 def test_pull_review_comment_reaction_uses_pull_request_endpoint_and_readback():
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.method == "POST"
@@ -270,12 +316,15 @@ def test_project_v2_projection_adds_issue_and_sets_lifecycle_field():
         variables = body["variables"]
         calls.append((query, variables))
         if "projectV2(number: $number)" in query:
+            assert "repositoryOwner(login: $owner)" in query
+            assert "organization(login: $owner)" not in query
+            assert "user(login: $owner)" not in query
             return httpx.Response(
                 200,
                 json={
                     "data": {
-                        "organization": None,
-                        "user": {
+                        "repositoryOwner": {
+                            "__typename": "User",
                             "projectV2": {
                                 "id": "PVT_project4",
                                 "fields": {
@@ -369,12 +418,15 @@ def test_project_v2_retry_recovers_lost_add_response_without_duplicate_item():
         query = body["query"]
         calls.append(query)
         if "projectV2(number: $number)" in query:
+            assert "repositoryOwner(login: $owner)" in query
+            assert "organization(login: $owner)" not in query
+            assert "user(login: $owner)" not in query
             return httpx.Response(
                 200,
                 json={
                     "data": {
-                        "organization": None,
-                        "user": {
+                        "repositoryOwner": {
+                            "__typename": "User",
                             "projectV2": {
                                 "id": "PVT_project4",
                                 "fields": {
