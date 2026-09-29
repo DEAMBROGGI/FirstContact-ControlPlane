@@ -40,6 +40,7 @@ from control_plane.remediation import (
     create_work_package,
     get_work_package,
     load_work_package_events,
+    mark_implementation_rework_required,
     record_github_artifact,
     record_issue_closed,
     record_summary_comment,
@@ -1258,6 +1259,81 @@ def test_claim_and_implementation_submission_are_idempotent_and_candidate_bound(
     assert submitted.state is WorkPackageState.IMPLEMENTED
     assert repeated.implementation_head_sha == "4" * 40
     assert len(load_work_package_events(session, package.work_package_id)) == 3
+
+
+def test_publication_preflight_failure_can_rework_implemented_package_without_overwrite(session):
+    view, _source_run, package = create_package(session, issue_number=813)
+    claim_work_package(
+        session,
+        package.work_package_id,
+        actor="general-implementer",
+        idempotency_key="claim-preflight-rework",
+    )
+    first_head = "4" * 40
+    first = submit_verified_candidate(
+        session,
+        view.publication_id,
+        source(first_head, "5" * 40, "b"),
+    )
+    submit_implementation(
+        session,
+        package.work_package_id,
+        candidate_id=first.current_candidate.candidate_id,
+        head_sha=first_head,
+        summary="First implementation candidate before publication preflight.",
+        evidence_sha256="d" * 64,
+        idempotency_key="implemented-before-preflight",
+    )
+    profile = profile_for_repository(REPOSITORY)
+    record_validation(
+        session,
+        view.publication_id,
+        job_id=profile.required_jobs[0],
+        status=ValidationStatus.FAIL,
+        evidence_sha256="e" * 64,
+    )
+    assert get_view(session, view.publication_id).state is PublicationState.VALIDATION_FAILED
+
+    rework = mark_implementation_rework_required(
+        session,
+        package.work_package_id,
+        reason="Publication preflight rejected the admitted candidate metadata.",
+        idempotency_key="publication-preflight-rework",
+    )
+    assert rework.state is WorkPackageState.REWORK_REQUIRED
+    reclaimed = claim_work_package(
+        session,
+        package.work_package_id,
+        actor="general-implementer",
+        idempotency_key="claim-preflight-rework-2",
+    )
+    assert reclaimed.state is WorkPackageState.IN_PROGRESS
+
+    second_head = "6" * 40
+    second = submit_verified_candidate(
+        session,
+        view.publication_id,
+        source(second_head, "7" * 40, "c"),
+    )
+    replaced = submit_implementation(
+        session,
+        package.work_package_id,
+        candidate_id=second.current_candidate.candidate_id,
+        head_sha=second_head,
+        summary="Corrected implementation candidate after publication preflight.",
+        evidence_sha256="f" * 64,
+        idempotency_key="implemented-after-preflight",
+    )
+    assert replaced.state is WorkPackageState.IMPLEMENTED
+    assert replaced.candidate_id == second.current_candidate.candidate_id
+    assert replaced.implementation_head_sha == second_head
+    submissions = [
+        event for event in load_work_package_events(session, package.work_package_id)
+        if event["event_type"] == "IMPLEMENTATION_SUBMITTED"
+    ]
+    assert len(submissions) == 2
+    assert submissions[0]["payload"]["candidate_id"] == first.current_candidate.candidate_id
+    assert submissions[1]["payload"]["candidate_id"] == second.current_candidate.candidate_id
 
 
 def test_successor_review_must_match_the_submitted_implementation_head_and_candidate(session):

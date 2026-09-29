@@ -837,6 +837,49 @@ def submit_implementation(
     return get_work_package(session, work_package_id)
 
 
+def mark_implementation_rework_required(
+    session: Session,
+    work_package_id: str,
+    *,
+    reason: str,
+    idempotency_key: str,
+) -> RemediationWorkPackageView:
+    row = _lock_work_package(session, work_package_id)
+    bounded_reason = reason.strip()
+    if not bounded_reason or len(bounded_reason) > 1000:
+        raise DomainError("implementation rework reason is required and bounded")
+    _assert_safe_client_text(bounded_reason, "implementation rework reason")
+    view = get_work_package(session, work_package_id)
+    payload = {
+        "reason": bounded_reason,
+        "candidate_id": view.candidate_id,
+        "implementation_head_sha": view.implementation_head_sha,
+    }
+    duplicate = _command_duplicate(
+        session,
+        row,
+        event_type="WORK_PACKAGE_REWORK_REQUIRED",
+        idempotency_key=idempotency_key,
+        payload=payload,
+    )
+    if duplicate is not None:
+        return duplicate
+    if view.state is WorkPackageState.REWORK_REQUIRED:
+        session.commit()
+        return view
+    if view.state is not WorkPackageState.IMPLEMENTED:
+        raise DomainError("implementation rework requires IMPLEMENTED state")
+    _append(
+        session,
+        row,
+        event_type="WORK_PACKAGE_REWORK_REQUIRED",
+        idempotency_key=idempotency_key,
+        payload=payload,
+    )
+    session.commit()
+    return get_work_package(session, work_package_id)
+
+
 def begin_successor_verification(
     session: Session,
     work_package_id: str,

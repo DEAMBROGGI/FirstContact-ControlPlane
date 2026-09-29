@@ -321,7 +321,17 @@ def test_stale_remote_base_fails_before_push(session, tmp_path):
         publisher.publish(session, view.publication_id)
 
     assert push.calls == 0
-    assert get_view(session, view.publication_id).state is PublicationState.ADMITTED
+    recovered = get_view(session, view.publication_id)
+    assert recovered.state is PublicationState.VALIDATION_FAILED
+    rejected = [
+        event for event in load_events(session, view.publication_id)
+        if event["event_type"] == "CANDIDATE_REJECTED"
+    ]
+    assert rejected[-1]["payload"] == {
+        "candidate_id": view.current_candidate.candidate_id,
+        "reason": "REMOTE_BASE_MOVED_AFTER_ADMISSION",
+    }
+
 def test_branch_collision_fails_closed(session, tmp_path):
     view, quarantine, source = admitted_publication(session, tmp_path)
     publisher, gateway, push = publisher_for(view, quarantine, source)

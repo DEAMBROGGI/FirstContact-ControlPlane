@@ -876,3 +876,12 @@ any Publication remediation package is unfinished; work-package DONE revalidates
 the current Publication review/head under lock; and rejected-only adjudication
 uses `REMEDIATION_CLEARED` to restore same-head Human Review without rewriting the
 provider result.
+
+Publication preflight recovery is compensating and append-only: if an ADMITTED
+candidate is rejected before any remote push because the configured base no
+longer matches the remote base, Plane appends `CANDIDATE_REJECTED` with
+`REMOTE_BASE_MOVED_AFTER_ADMISSION` and returns the Publication to
+`VALIDATION_FAILED`. A remediation package already bound to that candidate uses
+`WORK_PACKAGE_REWORK_REQUIRED -> IN_PROGRESS` before a corrected candidate is
+submitted. Prior candidate, validation and implementation events are retained;
+no candidate identity or prior event is overwritten.

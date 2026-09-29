@@ -327,9 +327,17 @@ def validate_transition(
         if state is not PublicationState.VALIDATING:
             raise DomainError("validation result requires VALIDATING state")
         return
-    if event_type in {EventType.CANDIDATE_ADMITTED, EventType.CANDIDATE_REJECTED}:
+    if event_type is EventType.CANDIDATE_ADMITTED:
         if state is not PublicationState.VALIDATING:
-            raise DomainError("admission result requires VALIDATING state")
+            raise DomainError("candidate admission requires VALIDATING state")
+        return
+    if event_type is EventType.CANDIDATE_REJECTED:
+        if state not in {PublicationState.VALIDATING, PublicationState.ADMITTED}:
+            raise DomainError("candidate rejection requires VALIDATING or ADMITTED state")
+        if view.current_candidate is None or payload.get("candidate_id") != view.current_candidate.candidate_id:
+            raise DomainError("candidate rejection must target the current candidate")
+        if state is PublicationState.ADMITTED and payload.get("reason") != "REMOTE_BASE_MOVED_AFTER_ADMISSION":
+            raise DomainError("admitted candidate rejection reason is invalid")
         return
     if event_type is EventType.REMOTE_PUBLISHED:
         if state is not PublicationState.ADMITTED or view.current_candidate is None:

@@ -17,7 +17,7 @@ from .github_app import GitHubAppTokenProvider, GitHubAuthError
 from .models import CandidateSourceRow
 from .profile_registry import profile_for_repository
 from .quarantine import CandidateQuarantineError, GitCandidateQuarantine
-from .service import get_view, mark_remote_published
+from .service import get_view, mark_remote_published, reject_admitted_candidate
 
 _REPOSITORY_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
@@ -329,6 +329,12 @@ class GitHubPublisher:
             if view.state is PublicationState.ADMITTED:
                 remote_base = self.github.ref_sha(view.repository, base_branch, token)
                 if remote_base != candidate.base_sha:
+                    reject_admitted_candidate(
+                        session,
+                        publication_id,
+                        candidate_id=candidate.candidate_id,
+                        reason="REMOTE_BASE_MOVED_AFTER_ADMISSION",
+                    )
                     raise PublicationError("remote base moved after candidate admission")
 
             target_before = self.github.ref_sha(view.repository, branch, token)

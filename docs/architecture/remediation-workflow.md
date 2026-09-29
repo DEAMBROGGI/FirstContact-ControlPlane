@@ -275,3 +275,12 @@ rules do not define the generic remediation package contract.
   Emergency implementation may continue and be validated locally, but no PASS is
   synthesized and no governed merge gate is satisfied until independent review
   evidence is available or a separately audited future override policy applies.
+
+Publication preflight recovery is compensating and append-only: if an ADMITTED
+candidate is rejected before any remote push because the configured base no
+longer matches the remote base, Plane appends `CANDIDATE_REJECTED` with
+`REMOTE_BASE_MOVED_AFTER_ADMISSION` and returns the Publication to
+`VALIDATION_FAILED`. A remediation package already bound to that candidate uses
+`WORK_PACKAGE_REWORK_REQUIRED -> IN_PROGRESS` before a corrected candidate is
+submitted. Prior candidate, validation and implementation events are retained;
+no candidate identity or prior event is overwritten.

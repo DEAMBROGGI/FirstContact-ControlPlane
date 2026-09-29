@@ -364,6 +364,30 @@ def record_validation(
     return get_view(session, publication_id)
 
 
+def reject_admitted_candidate(
+    session: Session,
+    publication_id: str,
+    *,
+    candidate_id: str,
+    reason: str,
+) -> PublicationView:
+    view = _locked_publication_view(session, publication_id)
+    if (
+        view.state is PublicationState.VALIDATION_FAILED
+        and view.current_candidate is not None
+        and view.current_candidate.candidate_id == candidate_id
+    ):
+        session.commit()
+        return view
+    if view.state is not PublicationState.ADMITTED:
+        raise DomainError("only an admitted unpublished candidate can be rejected")
+    payload = {"candidate_id": candidate_id, "reason": reason}
+    validate_transition(view, EventType.CANDIDATE_REJECTED, payload)
+    append_event(session, publication_id, EventType.CANDIDATE_REJECTED, payload)
+    session.commit()
+    return get_view(session, publication_id)
+
+
 def mark_remote_published(
     session: Session,
     publication_id: str,
