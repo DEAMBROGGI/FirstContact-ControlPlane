@@ -20,6 +20,7 @@ from control_plane.github_api import (
 )
 from control_plane.github_app import InstallationAccess
 from control_plane.plane_review import (
+    PlaneReviewError,
     PlaneReviewPublisher,
     record_plane_review,
 )
@@ -375,3 +376,225 @@ def test_github_gateway_creates_native_pull_review():
     )
     assert review.review_id == 9101
     assert review.commit_id == HEAD
+
+
+def _materialized_plane_source(session, *, run_id: str):
+    view = publish(session)
+    record_plane_review(
+        session,
+        view.publication_id,
+        run_id=run_id,
+        reviewer_kind="PRINCIPAL_REVIEWER",
+        reviewer="principal-reviewer:chatgpt",
+        reviewed_head_sha=HEAD,
+        body="Independent exact-head review.",
+        comments=principal_comments(),
+        idempotency_key=f"{run_id}:record",
+    )
+    github = FakeGitHub(view)
+    github.drop_response_once = False
+    materialized = PlaneReviewPublisher(
+        token_provider=FakeTokenProvider(),
+        github=github,
+    ).materialize(session, view.publication_id, run_id)
+    return view, materialized
+
+
+def _package_finding(source):
+    return {
+        "finding_id": source["finding_id"],
+        "normalized_identity": source["normalized_identity"],
+        "priority": source["priority"],
+        "source": {
+            "kind": "PROVIDER_THREAD",
+            "provider": "PLANE_REVIEW",
+            "provider_review_id": source["provider_review_id"],
+            "provider_thread_id": source["provider_comment_id"],
+        },
+        "principal_decision": {
+            "decision": "ACCEPTED",
+            "actor": "principal-reviewer:chatgpt",
+            "reason": None,
+        },
+        "desired_reaction": "+1",
+    }
+
+
+def test_plane_review_work_package_binds_priority_and_reviewer_authority(session):
+    view, materialized = _materialized_plane_source(
+        session,
+        run_id="principal-review:authority",
+    )
+    source = materialized["findings"][0]
+
+    wrong_priority = _package_finding(source)
+    wrong_priority["priority"] = "P0"
+    with pytest.raises(DomainError, match="priority differs"):
+        create_work_package(
+            session,
+            publication_id=view.publication_id,
+            implementation_issue_number=31,
+            review_run_id=materialized["run_id"],
+            review_provider="PLANE_REVIEW",
+            provider_review_id=source["provider_review_id"],
+            reviewed_head_sha=HEAD,
+            findings=[wrong_priority],
+            idempotency_key="plane-wrong-priority",
+        )
+
+    wrong_actor = _package_finding(source)
+    wrong_actor["principal_decision"]["actor"] = "different-principal-reviewer"
+    with pytest.raises(DomainError, match="decision differs"):
+        create_work_package(
+            session,
+            publication_id=view.publication_id,
+            implementation_issue_number=32,
+            review_run_id=materialized["run_id"],
+            review_provider="PLANE_REVIEW",
+            provider_review_id=source["provider_review_id"],
+            reviewed_head_sha=HEAD,
+            findings=[wrong_actor],
+            idempotency_key="plane-wrong-reviewer",
+        )
+
+    rejected = _package_finding(source)
+    rejected["principal_decision"] = {
+        "decision": "REJECTED",
+        "actor": "principal-reviewer:chatgpt",
+        "reason": "Attempted source reinterpretation.",
+    }
+    rejected["desired_reaction"] = "-1"
+    with pytest.raises(DomainError, match="decision differs"):
+        create_work_package(
+            session,
+            publication_id=view.publication_id,
+            implementation_issue_number=33,
+            review_run_id=materialized["run_id"],
+            review_provider="PLANE_REVIEW",
+            provider_review_id=source["provider_review_id"],
+            reviewed_head_sha=HEAD,
+            findings=[rejected],
+            idempotency_key="plane-rejected-reinterpretation",
+        )
+
+
+def test_plane_review_rejects_control_plane_marker_namespace(session):
+    view = publish(session)
+    marker = (
+        "<!-- firstcontact-control-plane:plane-review "
+        f"run=forged head={HEAD} -->"
+    )
+    with pytest.raises(DomainError, match="reserved Control Plane marker namespace"):
+        record_plane_review(
+            session,
+            view.publication_id,
+            run_id="principal-review:marker-injection",
+            reviewer_kind="PRINCIPAL_REVIEWER",
+            reviewer="principal-reviewer:chatgpt",
+            reviewed_head_sha=HEAD,
+            body=f"Attempted marker injection. {marker}",
+            comments=[],
+            idempotency_key="marker-injection",
+        )
+
+    injected_comment = principal_comments()
+    injected_comment[0] = {
+        **injected_comment[0],
+        "body": f"{injected_comment[0]['body']} {marker}",
+    }
+    with pytest.raises(DomainError, match="reserved Control Plane marker namespace"):
+        record_plane_review(
+            session,
+            view.publication_id,
+            run_id="principal-review:comment-marker-injection",
+            reviewer_kind="PRINCIPAL_REVIEWER",
+            reviewer="principal-reviewer:chatgpt",
+            reviewed_head_sha=HEAD,
+            body="Independent exact-head review.",
+            comments=injected_comment,
+            idempotency_key="comment-marker-injection",
+        )
+
+
+def test_plane_review_recovery_requires_exact_review_body(session):
+    view = publish(session)
+    run_id = "principal-review:tampered-review"
+    recorded = record_plane_review(
+        session,
+        view.publication_id,
+        run_id=run_id,
+        reviewer_kind="PRINCIPAL_REVIEWER",
+        reviewer="principal-reviewer:chatgpt",
+        reviewed_head_sha=HEAD,
+        body="Independent exact-head review.",
+        comments=principal_comments(),
+        idempotency_key="tampered-review",
+    )
+    github = FakeGitHub(view)
+    publisher = PlaneReviewPublisher(
+        token_provider=FakeTokenProvider(),
+        github=github,
+    )
+    marker = publisher._review_marker(run_id, HEAD)
+    github.reviews = [
+        PullReviewSnapshot(
+            review_id=9101,
+            actor="firstcontact-control-plane[bot]",
+            body=f"tampered body\n\n{marker}",
+            state="COMMENTED",
+            commit_id=HEAD,
+            submitted_at="2026-09-29T17:00:00Z",
+        )
+    ]
+
+    with pytest.raises(PlaneReviewError, match="identity is ambiguous"):
+        publisher.materialize(session, view.publication_id, recorded["run_id"])
+
+
+def test_plane_review_recovery_requires_exact_comment_body(session):
+    view = publish(session)
+    run_id = "principal-review:tampered-comment"
+    recorded = record_plane_review(
+        session,
+        view.publication_id,
+        run_id=run_id,
+        reviewer_kind="PRINCIPAL_REVIEWER",
+        reviewer="principal-reviewer:chatgpt",
+        reviewed_head_sha=HEAD,
+        body="Independent exact-head review.",
+        comments=principal_comments(),
+        idempotency_key="tampered-comment",
+    )
+    github = FakeGitHub(view)
+    publisher = PlaneReviewPublisher(
+        token_provider=FakeTokenProvider(),
+        github=github,
+    )
+    review_marker = publisher._review_marker(run_id, HEAD)
+    source = recorded["comments"][0]
+    finding_marker = publisher._finding_marker(run_id, source["finding_id"])
+    github.reviews = [
+        PullReviewSnapshot(
+            review_id=9101,
+            actor="firstcontact-control-plane[bot]",
+            body=f"{recorded['body']}\n\n{review_marker}",
+            state="COMMENTED",
+            commit_id=HEAD,
+            submitted_at="2026-09-29T17:00:00Z",
+        )
+    ]
+    github.comments = [
+        PullReviewCommentSnapshot(
+            comment_id=9201,
+            review_id=9101,
+            actor="firstcontact-control-plane[bot]",
+            body=f"tampered comment\n\n{finding_marker}",
+            commit_id=HEAD,
+            path=source["path"],
+            line=source["line"],
+            created_at="2026-09-29T17:00:00Z",
+        )
+    ]
+
+    with pytest.raises(PlaneReviewError, match="receipt identity changed"):
+        publisher.materialize(session, view.publication_id, recorded["run_id"])

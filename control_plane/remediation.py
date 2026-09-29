@@ -517,6 +517,29 @@ def _validate_review_findings(
         else:
             expected_id = str(trusted.get("finding_id") or "")
             expected_identity = str(trusted.get("normalized_identity") or "")
+            expected_priority = str(trusted.get("priority") or "").upper()
+            expected_reviewer = str(source_review.get("reviewer") or "").strip()
+            if not expected_reviewer or expected_priority not in {
+                "P0",
+                "P1",
+                "P2",
+                "P3",
+                "P4",
+            }:
+                raise DomainError("Plane review source authority is incomplete")
+            if finding["priority"] != expected_priority:
+                raise DomainError(
+                    "Plane review finding priority differs from the source review"
+                )
+            principal_decision = finding["principal_decision"]
+            if (
+                principal_decision["actor"] != expected_reviewer
+                or principal_decision["decision"]
+                != PrincipalDecision.ACCEPTED.value
+            ):
+                raise DomainError(
+                    "Plane review Principal Reviewer decision differs from the source review"
+                )
 
         if (
             finding["finding_id"] != expected_id

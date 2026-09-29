@@ -364,3 +364,17 @@ is recovered through the stable review/finding markers rather than issuing a
 second review. Current PR/head identity and reviewer-controlled reserved
 automation mentions fail closed. Native Codex continues through its own adapter;
 neither source may masquerade as the other.
+
+
+### Plane review authority and receipt integrity
+
+For `PLANE_REVIEW` remediation sources, the materialized source review is
+authoritative for finding priority and Principal Reviewer identity. A work
+package may not reinterpret a Plane-origin finding as a different priority,
+different reviewer, or rejected finding.
+
+The `firstcontact-control-plane` HTML marker namespace is reserved and rejected
+from reviewer-controlled fields. Recovery still locates candidate GitHub
+artifacts by their stable markers, but accepts them only when the complete
+expected review/comment body and exact review/head/path/line identities match.
+This prevents cross-run marker injection from becoming valid receipt evidence.

@@ -19,6 +19,9 @@ _PROVIDER = "PLANE_REVIEW"
 _RUN_RE = re.compile(r"^[A-Za-z0-9._:-]{1,160}$")
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _RESERVED_AUTOMATION_MENTION = re.compile(r"(?i)(?<![A-Za-z0-9_])@codex\b")
+_RESERVED_MARKER_NAMESPACE = re.compile(
+    r"(?i)<!--\s*firstcontact-control-plane:"
+)
 _ALLOWED_REVIEWER_KINDS = {"PRINCIPAL_REVIEWER", "FALLBACK_REVIEWER"}
 
 
@@ -36,6 +39,10 @@ def _safe_text(value: str, field: str, maximum: int) -> str:
         raise DomainError(f"{field} is required and bounded")
     if _RESERVED_AUTOMATION_MENTION.search(normalized):
         raise DomainError(f"{field} contains a reserved automation mention")
+    if _RESERVED_MARKER_NAMESPACE.search(normalized):
+        raise DomainError(
+            f"{field} contains the reserved Control Plane marker namespace"
+        )
     return normalized
 
 
@@ -322,11 +329,13 @@ class PlaneReviewPublisher:
         pull_number: int,
         head_sha: str,
         run_id: str,
+        review_body: str,
         comments: list[dict[str, Any]],
         token: str,
         bot_login: str,
     ) -> tuple[int, list[dict[str, Any]]] | None:
         review_marker = self._review_marker(run_id, head_sha)
+        expected_review_body = f"{review_body}\n\n{review_marker}"
         reviews = [
             item
             for item in self.github.list_pull_reviews(repository, pull_number, token)
@@ -341,6 +350,7 @@ class PlaneReviewPublisher:
             review.actor.strip().lower() != bot_login.strip().lower()
             or review.commit_id != head_sha
             or review.state.strip().upper() != "COMMENTED"
+            or review.body != expected_review_body
         ):
             raise PlaneReviewError("existing Plane review identity is ambiguous")
 
@@ -352,6 +362,7 @@ class PlaneReviewPublisher:
         receipts: list[dict[str, Any]] = []
         for source in comments:
             marker = self._finding_marker(run_id, source["finding_id"])
+            expected_comment_body = f"{source['body']}\n\n{marker}"
             matches = [
                 item
                 for item in remote_comments
@@ -368,6 +379,7 @@ class PlaneReviewPublisher:
                 or item.commit_id != head_sha
                 or item.path != source["path"]
                 or item.line != source["line"]
+                or item.body != expected_comment_body
             ):
                 raise PlaneReviewError("Plane review finding receipt identity changed")
             receipts.append(
@@ -439,6 +451,7 @@ class PlaneReviewPublisher:
                 pull_number=view.pull_request_number,
                 head_sha=recorded["head_sha"],
                 run_id=run_id,
+                review_body=recorded["body"],
                 comments=recorded["comments"],
                 token=access.token,
                 bot_login=bot_login,
@@ -477,6 +490,7 @@ class PlaneReviewPublisher:
                     pull_number=view.pull_request_number,
                     head_sha=recorded["head_sha"],
                     run_id=run_id,
+                    review_body=recorded["body"],
                     comments=recorded["comments"],
                     token=access.token,
                     bot_login=bot_login,
