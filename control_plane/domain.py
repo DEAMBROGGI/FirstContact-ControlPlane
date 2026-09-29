@@ -273,8 +273,16 @@ def fold_events(
             mergeable = bool(payload["mergeable"])
             state = PublicationState.READY_TO_MERGE if mergeable else PublicationState.APPROVED
         elif event_type is EventType.MERGED:
-            merge_commit_sha = str(payload["merge_commit_sha"])
-            merge_source = str(payload["source"])
+            merge_commit_sha = (
+                str(payload["merge_commit_sha"])
+                if payload.get("merge_commit_sha") is not None
+                else merge_commit_sha
+            )
+            merge_source = (
+                str(payload["source"])
+                if payload.get("source") is not None
+                else merge_source
+            )
             state = PublicationState.MERGED
         elif event_type is EventType.MERGE_POLICY_VIOLATION:
             merge_policy_violation = True
