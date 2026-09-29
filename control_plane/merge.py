@@ -248,11 +248,25 @@ class MergeCoordinator:
                 view.pull_request_number,
                 access.token,
             )
-            if not merged or readback.merge_commit_sha is None:
+            merge_event = self.github.pull_request_merge_event(
+                view.repository,
+                view.pull_request_number,
+                access.token,
+            )
+            if not merged:
                 if merge_error is not None:
                     raise MergeError("GitHub merge failed closed") from merge_error
                 raise MergeError("GitHub merge did not converge on readback")
-            if merge_sha is not None and readback.merge_commit_sha != merge_sha:
+            merge_commit_sha = self._verified_merge_commit(
+                readback,
+                merged=merged,
+                event_commit_sha=(
+                    merge_event.commit_id
+                    if merge_event is not None
+                    else None
+                ),
+            )
+            if merge_sha is not None and merge_commit_sha != merge_sha:
                 raise MergeError("GitHub merge receipt changed during readback")
 
             return record_merged(
@@ -260,7 +274,7 @@ class MergeCoordinator:
                 publication_id,
                 head_sha=view.remote_head_sha,
                 pull_request_number=view.pull_request_number,
-                merge_commit_sha=readback.merge_commit_sha,
+                merge_commit_sha=merge_commit_sha,
                 source="PLANE_MERGE",
             )
         except (GitHubAuthError, GitHubApiError) as exc:
