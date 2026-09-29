@@ -47,6 +47,13 @@ class IssueCommentSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class PullMergeEventSnapshot:
+    commit_id: str
+    actor: str | None
+    created_at: str
+
+
+@dataclass(frozen=True, slots=True)
 class PullReviewSnapshot:
     review_id: int
     actor: str
@@ -309,6 +316,52 @@ class GitHubRepositoryGateway:
         )
         assert response is not None
         return self._pull_snapshot(response.json())
+
+    def pull_request_merge_event(
+        self,
+        repository: str,
+        number: int,
+        token: str,
+    ) -> PullMergeEventSnapshot | None:
+        if number <= 0:
+            raise GitHubApiError("pull request number is invalid")
+        owner, name = self._parts(repository)
+        payload = self._paginate(
+            f"{self.api_url}/repos/{owner}/{name}/issues/{number}/events",
+            token=token,
+            params={"per_page": "100"},
+        )
+        merged_events = [
+            item
+            for item in payload
+            if isinstance(item, dict) and item.get("event") == "merged"
+        ]
+        if not merged_events:
+            return None
+        if len(merged_events) != 1:
+            raise GitHubApiError("GitHub merged event is ambiguous")
+        item = merged_events[0]
+        try:
+            commit_id = str(item["commit_id"]).lower()
+            created_at = str(item["created_at"])
+            actor = (
+                str(item["actor"]["login"])
+                if item.get("actor") is not None
+                else None
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise GitHubApiError("GitHub merged event is invalid") from exc
+        if len(commit_id) != 40 or any(
+            char not in "0123456789abcdef" for char in commit_id
+        ):
+            raise GitHubApiError("GitHub merged event commit SHA is invalid")
+        if not created_at.strip():
+            raise GitHubApiError("GitHub merged event timestamp is invalid")
+        return PullMergeEventSnapshot(
+            commit_id=commit_id,
+            actor=actor,
+            created_at=created_at,
+        )
 
     def pull_request_merged(
         self,
