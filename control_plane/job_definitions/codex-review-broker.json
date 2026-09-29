@@ -1,0 +1,13 @@
+{
+  "job_id": "codex-review-broker",
+  "version": 2,
+  "implementation": "controlplane.pytest",
+  "parameters": {
+    "targets": [
+      "tests/test_github_review_auth.py",
+      "tests/test_codex_review.py"
+    ],
+    "quiet": true
+  },
+  "result_schema": "evidence-log/v1"
+}

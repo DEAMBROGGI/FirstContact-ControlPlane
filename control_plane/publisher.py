@@ -4,8 +4,10 @@ import os
 import re
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 from sqlalchemy.orm import Session
 
@@ -15,10 +17,13 @@ from .github_app import GitHubAppTokenProvider, GitHubAuthError
 from .models import CandidateSourceRow
 from .profile_registry import profile_for_repository
 from .quarantine import CandidateQuarantineError, GitCandidateQuarantine
-from .service import get_view, mark_remote_published
+from .service import get_view, mark_remote_published, reject_admitted_candidate
 
 _REPOSITORY_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
+_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+_READBACK_ATTEMPTS = 4
+_READBACK_DELAY_SECONDS = 0.2
 
 
 class PublicationError(RuntimeError):
@@ -91,41 +96,57 @@ class GitPushTransport:
             helper.chmod(0o700)
         return helper
 
-    def push_exact_head(
+    def push_governed_head(
         self,
         *,
         repo_path: Path,
         repository: str,
         branch: str,
         token: str,
+        expected_old_sha: str | None = None,
     ) -> None:
+        """Push only if the destination ref still has its governed value.
+
+        Successor callers must prove expected_old_sha is an ancestor of the
+        candidate before using the lease. The lease closes the race between
+        that proof and GitHub's ref update; it is not authority to rewrite
+        history. None means the initial destination ref must still be absent.
+        """
         if not _REPOSITORY_RE.fullmatch(repository):
             raise PublicationError("publisher repository identity is invalid")
         if not _BRANCH_RE.fullmatch(branch) or ".." in branch or branch.endswith("/"):
             raise PublicationError("publisher branch identity is invalid")
         if not token:
             raise PublicationError("publisher installation token is unavailable")
+        if expected_old_sha is not None and not _SHA_RE.fullmatch(
+            expected_old_sha
+        ):
+            raise PublicationError("expected old publication head is invalid")
 
         remote_url = f"https://github.com/{repository}.git"
         refspec = f"refs/controlplane/head:refs/heads/{branch}"
+        push_args = [
+            self.git_executable,
+            "-c",
+            "credential.helper=",
+            "-C",
+            str(repo_path),
+            "push",
+            "--porcelain",
+            "--no-verify",
+            "--no-tags",
+        ]
+        expected_ref_value = expected_old_sha or ""
+        push_args.append(
+            f"--force-with-lease=refs/heads/{branch}:{expected_ref_value}"
+        )
+        push_args.extend((remote_url, refspec))
         with tempfile.TemporaryDirectory(prefix="fc-controlplane-askpass-") as raw:
             askpass = self._write_askpass(Path(raw))
             environment = self._safe_environment(token, askpass)
             try:
                 result = subprocess.run(
-                    [
-                        self.git_executable,
-                        "-c",
-                        "credential.helper=",
-                        "-C",
-                        str(repo_path),
-                        "push",
-                        "--porcelain",
-                        "--no-verify",
-                        "--no-tags",
-                        remote_url,
-                        refspec,
-                    ],
+                    push_args,
                     check=False,
                     capture_output=True,
                     text=True,
@@ -139,6 +160,67 @@ class GitPushTransport:
                 raise PublicationError("bounded Git publication failed") from exc
         if result.returncode != 0:
             raise PublicationError("GitHub rejected exact-head publication")
+    def restore_governed_head(
+        self,
+        *,
+        repo_path: Path,
+        repository: str,
+        branch: str,
+        token: str,
+        expected_current_sha: str,
+        restore_sha: str | None,
+    ) -> None:
+        """Compensate a rejected remote write under an exact ref lease."""
+        if not _REPOSITORY_RE.fullmatch(repository):
+            raise PublicationError("publisher repository identity is invalid")
+        if not _BRANCH_RE.fullmatch(branch) or ".." in branch or branch.endswith("/"):
+            raise PublicationError("publisher branch identity is invalid")
+        if not token:
+            raise PublicationError("publisher installation token is unavailable")
+        if not _SHA_RE.fullmatch(expected_current_sha):
+            raise PublicationError("expected rejected publication head is invalid")
+        if restore_sha is not None and not _SHA_RE.fullmatch(restore_sha):
+            raise PublicationError("restore publication head is invalid")
+
+        remote_url = f"https://github.com/{repository}.git"
+        destination = f"refs/heads/{branch}"
+        refspec = (
+            f"{restore_sha}:{destination}" if restore_sha is not None else f":{destination}"
+        )
+        push_args = [
+            self.git_executable,
+            "-c",
+            "credential.helper=",
+            "-C",
+            str(repo_path),
+            "push",
+            "--porcelain",
+            "--no-verify",
+            "--no-tags",
+            f"--force-with-lease={destination}:{expected_current_sha}",
+            remote_url,
+            refspec,
+        ]
+        with tempfile.TemporaryDirectory(prefix="fc-controlplane-askpass-") as raw:
+            askpass = self._write_askpass(Path(raw))
+            environment = self._safe_environment(token, askpass)
+            try:
+                result = subprocess.run(
+                    push_args,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=120,
+                    shell=False,
+                    env=environment,
+                )
+            except (OSError, subprocess.SubprocessError) as exc:
+                raise PublicationError("bounded Git publication recovery failed") from exc
+        if result.returncode != 0:
+            raise PublicationError("GitHub rejected exact-head publication recovery")
+
 class GitHubPublisher:
     def __init__(
         self,
@@ -147,15 +229,106 @@ class GitHubPublisher:
         github: GitHubRepositoryGateway,
         quarantine: GitCandidateQuarantine,
         git_push: GitPushTransport | None = None,
+        sleep: Callable[[float], None] | None = None,
     ) -> None:
         self.token_provider = token_provider
         self.github = github
         self.quarantine = quarantine
         self.git_push = git_push or GitPushTransport()
+        self.sleep = sleep or time.sleep
 
     @staticmethod
     def publication_branch(view: PublicationView) -> str:
         return f"control-plane/issue-{view.issue_number}-{view.publication_id[:8]}"
+
+    @staticmethod
+    def _verify_canonical_pull_request(
+        pull,
+        *,
+        view: PublicationView,
+        branch: str,
+        base_branch: str,
+        expected_head_sha: str,
+    ) -> None:
+        GitHubPublisher._verify_canonical_pull_request_identity(
+            pull,
+            view=view,
+            branch=branch,
+            base_branch=base_branch,
+        )
+        if pull.head_sha != expected_head_sha:
+            raise PublicationError("canonical pull request head does not match")
+
+    @staticmethod
+    def _verify_canonical_pull_request_identity(
+        pull,
+        *,
+        view: PublicationView,
+        branch: str,
+        base_branch: str,
+    ) -> None:
+        if pull.state != "open":
+            raise PublicationError("canonical pull request is not open")
+        if pull.number != view.pull_request_number:
+            raise PublicationError("canonical pull request number changed")
+        if pull.base_ref != base_branch:
+            raise PublicationError("canonical pull request base changed")
+        if pull.head_ref != branch:
+            raise PublicationError("canonical pull request branch changed")
+
+    def _readback_published_head(
+        self,
+        *,
+        repository: str,
+        branch: str,
+        token: str,
+        view: PublicationView,
+        base_branch: str,
+        expected_head_sha: str,
+        previous_head_sha: str | None,
+    ):
+        """Poll only GitHub readbacks; never repeat a push or ledger write."""
+        allowed_heads = {expected_head_sha}
+        if previous_head_sha is not None:
+            allowed_heads.add(previous_head_sha)
+        allowed_branch_values: set[str | None] = set(allowed_heads)
+        if previous_head_sha is None:
+            allowed_branch_values.add(None)
+
+        for attempt in range(_READBACK_ATTEMPTS):
+            target_sha = self.github.ref_sha(repository, branch, token)
+            if target_sha not in allowed_branch_values:
+                raise PublicationError("publication branch changed during readback")
+
+            pull = None
+            if view.remote_head_sha is not None:
+                assert view.pull_request_number is not None
+                pull = self.github.pull_request(
+                    repository,
+                    view.pull_request_number,
+                    token,
+                )
+                self._verify_canonical_pull_request_identity(
+                    pull,
+                    view=view,
+                    branch=branch,
+                    base_branch=base_branch,
+                )
+                if pull.head_sha not in allowed_heads:
+                    raise PublicationError(
+                        "canonical pull request head changed during readback"
+                    )
+
+            branch_converged = target_sha == expected_head_sha
+            pull_converged = pull is None or pull.head_sha == expected_head_sha
+            if branch_converged and pull_converged:
+                return pull
+            if attempt + 1 < _READBACK_ATTEMPTS:
+                self.sleep(_READBACK_DELAY_SECONDS)
+
+        raise PublicationError(
+            f"remote publication readback did not converge after {_READBACK_ATTEMPTS} attempts"
+        )
 
     def _verified_source(self, session: Session, view: PublicationView):
         candidate = view.current_candidate
@@ -186,6 +359,63 @@ class GitHubPublisher:
         ):
             raise PublicationError("quarantine readback does not match admitted candidate")
         return source, verified
+    def _compensate_rejected_candidate_write(
+        self,
+        *,
+        view: PublicationView,
+        source: CandidateSourceRow,
+        branch: str,
+        token: str,
+        candidate_head_sha: str,
+    ) -> None:
+        current = self.github.ref_sha(view.repository, branch, token)
+        expected_restored = view.remote_head_sha
+        if current == expected_restored:
+            return
+        if current != candidate_head_sha:
+            raise PublicationError(
+                "rejected publication branch changed before compensation"
+            )
+        self.git_push.restore_governed_head(
+            repo_path=self.quarantine.repo_path(source.quarantine_id),
+            repository=view.repository,
+            branch=branch,
+            token=token,
+            expected_current_sha=candidate_head_sha,
+            restore_sha=expected_restored,
+        )
+        restored = self.github.ref_sha(view.repository, branch, token)
+        if restored != expected_restored:
+            raise PublicationError("publication branch compensation readback failed")
+
+    def _reject_stale_base_candidate(
+        self,
+        session: Session,
+        publication_id: str,
+        *,
+        view: PublicationView,
+        source: CandidateSourceRow,
+        branch: str,
+        token: str,
+        candidate_id: str,
+        candidate_head_sha: str,
+        message: str,
+    ) -> None:
+        self._compensate_rejected_candidate_write(
+            view=view,
+            source=source,
+            branch=branch,
+            token=token,
+            candidate_head_sha=candidate_head_sha,
+        )
+        reject_admitted_candidate(
+            session,
+            publication_id,
+            candidate_id=candidate_id,
+            reason="REMOTE_BASE_MOVED_AFTER_ADMISSION",
+        )
+        raise PublicationError(message)
+
     def publish(self, session: Session, publication_id: str) -> PublicationView:
         view = get_view(session, publication_id)
         candidate = view.current_candidate
@@ -197,68 +427,181 @@ class GitHubPublisher:
         profile_for_repository(view.repository)
         source, _verified = self._verified_source(session, view)
         branch = self.publication_branch(view)
+        if view.remote_head_sha is not None and (
+            not view.remote_branch
+            or not view.base_branch
+            or view.pull_request_number is None
+        ):
+            raise PublicationError(
+                "successor publication is missing governed PR metadata"
+            )
+        if view.remote_branch is not None and view.remote_branch != branch:
+            raise PublicationError("published branch metadata is inconsistent")
 
         try:
             access = self.token_provider.installation_access(view.repository)
             token = access.token
             repository = self.github.repository(view.repository, token)
-            base_branch = repository.default_branch
+            base_branch = view.base_branch or repository.default_branch
 
             if view.state is PublicationState.ADMITTED:
                 remote_base = self.github.ref_sha(view.repository, base_branch, token)
                 if remote_base != candidate.base_sha:
-                    raise PublicationError("remote base moved after candidate admission")
+                    self._reject_stale_base_candidate(
+                        session,
+                        publication_id,
+                        view=view,
+                        source=source,
+                        branch=branch,
+                        token=token,
+                        candidate_id=candidate.candidate_id,
+                        candidate_head_sha=candidate.head_sha,
+                        message="remote base moved after candidate admission",
+                    )
 
             target_before = self.github.ref_sha(view.repository, branch, token)
-            if target_before is None:
-                if view.state is PublicationState.IN_REVIEW:
+            if view.remote_head_sha is not None:
+                if target_before is None:
                     raise PublicationError("published branch disappeared")
-                self.git_push.push_exact_head(
+                if target_before not in {
+                    view.remote_head_sha,
+                    candidate.head_sha,
+                }:
+                    raise PublicationError("publication branch collision")
+                assert view.pull_request_number is not None
+                existing_pull = self.github.pull_request(
+                    view.repository,
+                    view.pull_request_number,
+                    token,
+                )
+                if target_before == view.remote_head_sha:
+                    self._verify_canonical_pull_request(
+                        existing_pull,
+                        view=view,
+                        branch=branch,
+                        base_branch=base_branch,
+                        expected_head_sha=target_before,
+                    )
+                else:
+                    self._verify_canonical_pull_request_identity(
+                        existing_pull,
+                        view=view,
+                        branch=branch,
+                        base_branch=base_branch,
+                    )
+                    if existing_pull.head_sha not in {
+                        view.remote_head_sha,
+                        candidate.head_sha,
+                    }:
+                        raise PublicationError(
+                            "canonical pull request head does not match governed publication"
+                        )
+
+            if view.state is PublicationState.ADMITTED:
+                remote_base_before_write = self.github.ref_sha(
+                    view.repository, base_branch, token
+                )
+                if remote_base_before_write != candidate.base_sha:
+                    self._reject_stale_base_candidate(
+                        session,
+                        publication_id,
+                        view=view,
+                        source=source,
+                        branch=branch,
+                        token=token,
+                        candidate_id=candidate.candidate_id,
+                        candidate_head_sha=candidate.head_sha,
+                        message="remote base moved at publication write boundary",
+                    )
+
+            if target_before is None:
+                self.git_push.push_governed_head(
                     repo_path=self.quarantine.repo_path(source.quarantine_id),
                     repository=view.repository,
                     branch=branch,
                     token=token,
                 )
-            elif target_before != candidate.head_sha:
-                if (
-                    view.state is PublicationState.ADMITTED
-                    and view.remote_head_sha is not None
-                    and target_before == view.remote_head_sha
-                    and self.quarantine.is_ancestor(
+            elif (
+                view.state is PublicationState.ADMITTED
+                and view.remote_head_sha is not None
+                and view.remote_head_sha != candidate.head_sha
+            ):
+                if target_before == view.remote_head_sha:
+                    if not self.quarantine.is_ancestor(
                         source.quarantine_id,
                         target_before,
                         candidate.head_sha,
-                    )
-                ):
-                    self.git_push.push_exact_head(
+                    ):
+                        raise PublicationError(
+                            "successor candidate is not a fast-forward"
+                        )
+                    self.git_push.push_governed_head(
                         repo_path=self.quarantine.repo_path(source.quarantine_id),
                         repository=view.repository,
                         branch=branch,
                         token=token,
+                        expected_old_sha=view.remote_head_sha,
                     )
+                elif target_before == candidate.head_sha:
+                    # Recover the exact readback after a push whose ledger
+                    # append was interrupted, while still proving its ancestry.
+                    if not self.quarantine.is_ancestor(
+                        source.quarantine_id,
+                        view.remote_head_sha,
+                        candidate.head_sha,
+                    ):
+                        raise PublicationError(
+                            "successor candidate is not a fast-forward"
+                        )
                 else:
                     raise PublicationError("publication branch collision")
+            elif target_before != candidate.head_sha:
+                raise PublicationError("publication branch collision")
 
-            target_after = self.github.ref_sha(view.repository, branch, token)
-            if target_after != candidate.head_sha:
-                raise PublicationError("remote head readback does not match admitted candidate")
-
-            pull = self.github.ensure_pull_request(
-                view.repository,
-                base_branch=base_branch,
-                head_branch=branch,
-                expected_head_sha=candidate.head_sha,
-                issue_number=view.issue_number,
+            pull = self._readback_published_head(
+                repository=view.repository,
+                branch=branch,
                 token=token,
+                view=view,
+                base_branch=base_branch,
+                expected_head_sha=candidate.head_sha,
+                previous_head_sha=view.remote_head_sha,
             )
+            if pull is None:
+                pull = self.github.ensure_pull_request(
+                    view.repository,
+                    base_branch=base_branch,
+                    head_branch=branch,
+                    expected_head_sha=candidate.head_sha,
+                    issue_number=view.issue_number,
+                    token=token,
+                )
         except (GitHubAuthError, GitHubApiError, CandidateQuarantineError) as exc:
             raise PublicationError("GitHub publication failed closed") from exc
+
+        if view.state is PublicationState.ADMITTED:
+            try:
+                remote_base_after_write = self.github.ref_sha(
+                    view.repository, base_branch, token
+                )
+            except GitHubApiError as exc:
+                raise PublicationError("GitHub publication failed closed") from exc
+            if remote_base_after_write != candidate.base_sha:
+                self._reject_stale_base_candidate(
+                    session,
+                    publication_id,
+                    view=view,
+                    source=source,
+                    branch=branch,
+                    token=token,
+                    candidate_id=candidate.candidate_id,
+                    candidate_head_sha=candidate.head_sha,
+                    message="remote base moved before publication authority was recorded",
+                )
 
         if view.state is PublicationState.IN_REVIEW:
             if view.remote_head_sha != candidate.head_sha:
                 raise PublicationError("published state is stale")
-            if view.remote_branch is not None and view.remote_branch != branch:
-                raise PublicationError("published branch metadata is inconsistent")
             if view.base_branch is not None and view.base_branch != base_branch:
                 raise PublicationError("published base metadata is inconsistent")
             if (

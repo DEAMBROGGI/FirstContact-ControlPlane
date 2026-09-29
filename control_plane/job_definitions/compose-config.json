@@ -1,0 +1,9 @@
+{
+  "job_id": "compose-config",
+  "version": 1,
+  "implementation": "controlplane.compose-config",
+  "parameters": {
+    "compose_file": "docker-compose.yml"
+  },
+  "result_schema": "evidence-log/v1"
+}

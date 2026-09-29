@@ -2,7 +2,15 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, ForeignKey, Integer, JSON, String, UniqueConstraint
+from sqlalchemy import (
+    BigInteger,
+    DateTime,
+    ForeignKey,
+    Integer,
+    JSON,
+    String,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .db import Base
@@ -55,6 +63,33 @@ class CandidateSourceRow(Base):
     )
 
 
+class CodexReviewDispatchRow(Base):
+    __tablename__ = "codex_review_dispatches"
+
+    run_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    publication_id: Mapped[str] = mapped_column(
+        ForeignKey("publications.id"),
+        nullable=False,
+        index=True,
+    )
+    state: Mapped[str] = mapped_column(String(24), nullable=False)
+    lease_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    completed_comment_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        nullable=True,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utcnow,
+        onupdate=utcnow,
+        nullable=False,
+    )
+
+
 class EventRow(Base):
     __tablename__ = "publication_events"
     __table_args__ = (UniqueConstraint("publication_id", "sequence", name="uq_publication_event_sequence"),)
@@ -67,3 +102,97 @@ class EventRow(Base):
     payload: Mapped[dict] = mapped_column(JSON, nullable=False)
     previous_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     event_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+
+
+class RemediationWorkPackageRow(Base):
+    """Aggregate identity and issue-link index; the event ledger is authoritative."""
+
+    __tablename__ = "remediation_work_packages"
+    __table_args__ = (
+        UniqueConstraint(
+            "repository",
+            "implementation_issue_number",
+            name="uq_remediation_repository_issue",
+        ),
+        UniqueConstraint(
+            "publication_id",
+            "review_run_id",
+            name="uq_remediation_publication_review_run",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    publication_id: Mapped[str] = mapped_column(
+        ForeignKey("publications.id"),
+        nullable=False,
+        index=True,
+    )
+    repository: Mapped[str] = mapped_column(String(200), nullable=False)
+    review_run_id: Mapped[str] = mapped_column(String(160), nullable=False)
+    reviewed_head_sha: Mapped[str] = mapped_column(String(40), nullable=False)
+    implementation_issue_number: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utcnow,
+        nullable=False,
+    )
+
+
+class RemediationEventRow(Base):
+    __tablename__ = "remediation_events"
+    __table_args__ = (
+        UniqueConstraint(
+            "work_package_id",
+            "sequence",
+            name="uq_remediation_event_sequence",
+        ),
+        UniqueConstraint(
+            "work_package_id",
+            "idempotency_key",
+            name="uq_remediation_event_idempotency",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    work_package_id: Mapped[str] = mapped_column(
+        ForeignKey("remediation_work_packages.id"),
+        nullable=False,
+        index=True,
+    )
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utcnow,
+        nullable=False,
+    )
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(200), nullable=False)
+    payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    previous_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    event_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+
+
+class RemediationDispatchRow(Base):
+    """Expiring coordination lease; the event log remains authoritative."""
+
+    __tablename__ = "remediation_dispatches"
+
+    work_package_id: Mapped[str] = mapped_column(
+        ForeignKey("remediation_work_packages.id"),
+        primary_key=True,
+    )
+    artifact_key: Mapped[str] = mapped_column(String(300), primary_key=True)
+    lease_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utcnow,
+        onupdate=utcnow,
+        nullable=False,
+    )

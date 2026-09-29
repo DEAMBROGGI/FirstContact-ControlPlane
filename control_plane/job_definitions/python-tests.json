@@ -1,0 +1,12 @@
+{
+  "job_id": "python-tests",
+  "version": 1,
+  "implementation": "controlplane.pytest",
+  "parameters": {
+    "targets": [
+      "tests"
+    ],
+    "quiet": true
+  },
+  "result_schema": "evidence-log/v1"
+}

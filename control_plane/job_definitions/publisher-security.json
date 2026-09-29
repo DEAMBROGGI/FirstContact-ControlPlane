@@ -1,0 +1,14 @@
+{
+  "job_id": "publisher-security",
+  "version": 1,
+  "implementation": "controlplane.pytest",
+  "parameters": {
+    "targets": [
+      "tests/test_github_app.py",
+      "tests/test_github_api.py",
+      "tests/test_publisher.py"
+    ],
+    "quiet": true
+  },
+  "result_schema": "evidence-log/v1"
+}

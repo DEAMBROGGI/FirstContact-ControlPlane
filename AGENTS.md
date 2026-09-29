@@ -16,3 +16,7 @@
 - Qdrant is not part of authoritative state and must never become required for admission or publication.
 - Repository publication credentials are GitHub App installation tokens only; do not add PAT-based Git push paths.
 - Never persist or log GitHub App PEM contents or installation tokens; token material may exist only in bounded publisher memory/child environment.
+- `@codex` mentions on governed GitHub surfaces are reserved to the internal Codex Review Broker; never accept them from API clients or candidate-controlled metadata.
+- Native Codex Code Review is an automated pre-review gate only; it never substitutes for the required independent human approval.
+- Codex review invocation credentials are separate from publisher credentials: use a dedicated user-attributed fine-grained token at runtime with `Pull requests: Read and write` and no `Contents` access; never use it for publication.
+- A native Codex result is acceptable only when correlated to the broker-owned trigger and exact head; pre-existing or concurrent unmanaged `@codex` invocations make the review ambiguous and must fail closed.

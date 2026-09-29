@@ -31,3 +31,4 @@ testpaths = ["tests"]
 
 [tool.setuptools.package-data]
 "control_plane.policies" = ["*.json"]
+"control_plane.job_definitions" = ["*.json"]

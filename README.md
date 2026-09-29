@@ -116,3 +116,68 @@ CONTROL_PLANE_GITHUB_APP_PRIVATE_KEY_PATH=C:\absolute\secure\path\app.pem
 ```
 
 The default remains `CONTROL_PLANE_PUBLISHER_MODE=disabled`.
+
+
+## Native Codex Code Review broker
+
+Issue #10 governs native Codex Code Review as a pre-review gate.
+
+The Control Plane owns the governed invocation. API clients cannot provide
+review text or reserved `@codex` mentions. For an exact published head the
+broker acquires a persistent dispatch lease before it emits `@codex review`.
+
+Live characterization established two separate GitHub identities:
+
+- repository publication uses a repository-scoped GitHub App installation token;
+- native Codex invocation must be user-attributed. GitHub App bot-authored
+  `@codex review` comments are ignored by Codex, while a user-attributed
+  trigger is accepted.
+
+The Codex trigger uses a dedicated fine-grained user token supplied only at
+runtime. It is used only to create the governed trigger comment. Before posting,
+the broker calls `GET /user` and checks that the token belongs to the configured
+login. The separate publisher GitHub App installation token continues to
+perform repository reads and publication.
+
+Configuration:
+
+```env
+CONTROL_PLANE_CODEX_REVIEW_MODE=disabled
+CONTROL_PLANE_CODEX_REVIEW_ACTORS=chatgpt-codex-connector[bot]
+CONTROL_PLANE_CODEX_REVIEW_USER_TOKEN=
+CONTROL_PLANE_CODEX_REVIEW_TRIGGER_LOGIN=DEAMBROGGI
+```
+
+Create the fine-grained token later for user `DEAMBROGGI`, restrict it to the
+selected governed repositories, and grant **Pull requests: Read and write** with
+**Contents: no access**. GitHub documents the required [pull request comment
+permission](https://docs.github.com/en/rest/issues/comments#create-an-issue-comment)
+and the `github_pat_` [fine-grained token prefix](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/about-authentication-to-github).
+Provide it to the API process through `CONTROL_PLANE_CODEX_REVIEW_USER_TOKEN`.
+Do not put a real token in the repository or pass it in a command argument.
+`SecretStr` masks it in settings representations; the provider keeps it in
+memory, verifies its owner before dispatch, and does not add it to event data.
+
+Modes are `disabled`, `advisory`, and `required`. In `required` mode a
+human APPROVED decision cannot be recorded until the exact-head native Codex
+review has completed with PASS. A human may still record CHANGES_REQUIRED.
+While Codex is RUNNING, human review is locked. Advisory findings are recorded
+without moving the publication out of IN_REVIEW.
+
+The broker accepts only evidence bound to the governed trigger and exact head.
+It rejects unmanaged `@codex` invocations, stale/foreign actors and ambiguous
+review evidence. GitHub pagination is exhausted before deciding PASS.
+
+Native completion is recognized in either form observed/documented by Codex:
+
+- a Codex pull-request review, with inline comments normalized as findings;
+- a Codex thumbs-up reaction on the governed trigger when there are no findings.
+
+The observed native actor for this repository is
+`chatgpt-codex-connector[bot]`. It remains an explicit allowlist value rather
+than a hard-coded trust assumption.
+
+Delivery profiles are immutable historical contracts. A candidate continues to
+validate against its pinned profile id/version/digest even after a newer profile
+becomes active. Admission-critical jobs in schema-v2 profiles are additionally
+bound to versioned JobDefinitions and their digests.
