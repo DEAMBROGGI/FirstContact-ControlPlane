@@ -78,11 +78,22 @@ class MergeCoordinator:
         view: PublicationView,
         pull: PullRequestSnapshot,
         merged: bool,
+        token: str,
     ) -> PublicationView:
         self._verify_identity(view, pull)
+        merge_event = self.github.pull_request_merge_event(
+            view.repository,
+            pull.number,
+            token,
+        )
         merge_commit_sha = self._verified_merge_commit(
             pull,
             merged=merged,
+            event_commit_sha=(
+                merge_event.commit_id
+                if merge_event is not None
+                else None
+            ),
         )
         assert view.pull_request_number is not None
         assert view.remote_head_sha is not None
