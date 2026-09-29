@@ -127,11 +127,14 @@ class MergeCoordinator:
             raise MergeError("GitHub merge reconciliation failed closed") from exc
 
         self._verify_identity(view, pull)
-        merged = self.github.pull_request_merged(
-            view.repository,
-            view.pull_request_number,
-            access.token,
-        )
+        try:
+            merged = self.github.pull_request_merged(
+                view.repository,
+                view.pull_request_number,
+                access.token,
+            )
+        except GitHubApiError as exc:
+            raise MergeError("GitHub merge reconciliation failed closed") from exc
         if not merged:
             if view.state is PublicationState.MERGED:
                 raise MergeError("Plane says MERGED but GitHub does not")
