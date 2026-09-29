@@ -141,7 +141,8 @@ class MergeCoordinator:
         if view.state is not PublicationState.READY_TO_MERGE:
             # Readback is still authoritative enough to detect and audit an
             # out-of-band merge before rejecting this command.
-            return self.reconcile(session, publication_id)
+            self.reconcile(session, publication_id)
+            raise DomainError("merge requires READY_TO_MERGE state")
         if view.pull_request_number is None or view.remote_head_sha is None:
             raise DomainError("merge requires published PR metadata")
 
