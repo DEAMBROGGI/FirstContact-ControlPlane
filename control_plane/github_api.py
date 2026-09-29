@@ -310,6 +310,29 @@ class GitHubRepositoryGateway:
         assert response is not None
         return self._pull_snapshot(response.json())
 
+    def pull_request_merged(
+        self,
+        repository: str,
+        number: int,
+        token: str,
+    ) -> bool:
+        if number <= 0:
+            raise GitHubApiError("pull request number is invalid")
+        owner, name = self._parts(repository)
+        response = self._request(
+            "GET",
+            f"{self.api_url}/repos/{owner}/{name}/pulls/{number}/merge",
+            token=token,
+            allow_404=True,
+        )
+        if response is None:
+            return False
+        if response.status_code != 204:
+            raise GitHubApiError(
+                "GitHub merged-status response is invalid"
+            )
+        return True
+
     def merge_pull_request(
         self,
         repository: str,
