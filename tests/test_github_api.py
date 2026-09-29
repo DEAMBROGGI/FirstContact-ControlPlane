@@ -794,3 +794,41 @@ def test_pull_request_merged_uses_dedicated_status_endpoint():
         "/repos/DEAMBROGGI/FirstContact/pulls/13/merge",
         "/repos/DEAMBROGGI/FirstContact/pulls/14/merge",
     ]
+
+
+def test_pull_request_merge_event_recovers_commit_sha():
+    merge_sha = "6" * 40
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == (
+            "/repos/DEAMBROGGI/FirstContact/issues/13/events"
+        )
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "id": 99,
+                    "event": "merged",
+                    "commit_id": merge_sha,
+                    "created_at": "2026-09-29T20:48:12Z",
+                    "actor": {"login": "DEAMBROGGI"},
+                }
+            ],
+        )
+
+    github = GitHubRepositoryGateway(
+        api_url="https://api.github.test",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    event = github.pull_request_merge_event(
+        "DEAMBROGGI/FirstContact",
+        13,
+        "installation-token",
+    )
+
+    assert event is not None
+    assert event.commit_id == merge_sha
+    assert event.actor == "DEAMBROGGI"
+    assert event.created_at == "2026-09-29T20:48:12Z"
