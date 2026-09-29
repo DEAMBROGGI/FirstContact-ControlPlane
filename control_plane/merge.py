@@ -63,14 +63,9 @@ class MergeCoordinator:
         *,
         view: PublicationView,
         pull: PullRequestSnapshot,
-        token: str,
+        merged: bool,
     ) -> PublicationView:
         self._verify_identity(view, pull)
-        merged = self.github.pull_request_merged(
-            view.repository,
-            pull.number,
-            token,
-        )
         merge_commit_sha = self._verified_merge_commit(
             pull,
             merged=merged,
@@ -146,7 +141,7 @@ class MergeCoordinator:
             publication_id,
             view=view,
             pull=pull,
-            token=access.token,
+            merged=merged,
         )
 
     def merge(
@@ -191,7 +186,7 @@ class MergeCoordinator:
                     publication_id,
                     view=view,
                     pull=pull,
-                    token=access.token,
+                    merged=True,
                 )
             if pull.state != "open":
                 raise MergeError("canonical pull request is not open")
