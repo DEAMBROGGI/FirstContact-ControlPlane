@@ -267,7 +267,11 @@ def test_plane_merge_executes_exact_head_and_records_native_receipt(session):
         }
     ]
     assert token_provider.permissions == [
-        {"contents": "write", "pull_requests": "write"}
+        {
+            "contents": "write",
+            "issues": "read",
+            "pull_requests": "write",
+        }
     ]
 
 
