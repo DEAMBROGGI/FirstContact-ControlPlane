@@ -733,6 +733,55 @@ def claim_codex_review_trigger_dispatch(
     return True
 
 
+def fence_codex_review_trigger_dispatch(
+    session: Session,
+    publication_id: str,
+    *,
+    run_id: str,
+    lease_id: str,
+    lease_seconds: int = 120,
+) -> bool:
+    """Fence the final provider-trigger side effect with database row locks.
+
+    The caller must perform only the final bounded remote verification/write and
+    complete/release the dispatch before the transaction ends. A superseding
+    claimant cannot acquire the dispatch row while this fence is held.
+    """
+    publication = session.scalar(
+        select(PublicationRow)
+        .where(PublicationRow.id == publication_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if publication is None:
+        raise KeyError(publication_id)
+    row = session.scalar(
+        select(CodexReviewDispatchRow)
+        .where(CodexReviewDispatchRow.run_id == run_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if row is None or row.publication_id != publication_id:
+        session.commit()
+        return False
+    if row.state == "COMPLETED":
+        session.commit()
+        return False
+    if row.state != "CLAIMED" or row.lease_id != lease_id:
+        session.commit()
+        return False
+    view = get_view(session, publication_id)
+    if (
+        view.automated_review_status is not AutomatedReviewStatus.RUNNING
+        or view.automated_review_run_id != run_id
+    ):
+        session.commit()
+        return False
+    row.lease_expires_at = datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)
+    session.flush()
+    return True
+
+
 def complete_codex_review_trigger_dispatch(
     session: Session,
     publication_id: str,

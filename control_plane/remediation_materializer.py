@@ -14,6 +14,7 @@ from .remediation import (
     WorkPackageState,
     claim_github_artifact_dispatch,
     complete_work_package,
+    fence_github_artifact_dispatch,
     get_work_package,
     record_implementation_issue_linked,
     record_github_artifact,
@@ -296,6 +297,13 @@ class GitHubRemediationMaterializer:
                 view.implementation_issue_number,
                 access.token,
             )
+            if not fence_github_artifact_dispatch(
+                session,
+                work_package_id,
+                artifact_key=artifact_key,
+                lease_id=lease_id,
+            ):
+                return get_work_package(session, work_package_id)
             self._ensure_issue_projections(session, view, issue, access.token)
             return view
         except (GitHubApiError, GitHubAuthError, DomainError) as exc:
@@ -347,6 +355,13 @@ class GitHubRemediationMaterializer:
                 raise RemediationMaterializationError(
                     "duplicate GitHub issues exist for this remediation batch"
                 )
+            if not fence_github_artifact_dispatch(
+                session,
+                work_package_id,
+                artifact_key=artifact_key,
+                lease_id=lease_id,
+            ):
+                return get_work_package(session, work_package_id)
             if matches:
                 issue = matches[0]
             else:
@@ -409,7 +424,23 @@ class GitHubRemediationMaterializer:
             return False
         try:
             self._verify_current_head(session, view, token)
+            if not fence_github_artifact_dispatch(
+                session,
+                view.work_package_id,
+                artifact_key=artifact_key,
+                lease_id=lease_id,
+            ):
+                return False
             remote_id = operation()
+            if not fence_github_artifact_dispatch(
+                session,
+                view.work_package_id,
+                artifact_key=artifact_key,
+                lease_id=lease_id,
+            ):
+                raise RemediationMaterializationError(
+                    "artifact dispatch ownership changed before receipt"
+                )
             record_github_artifact(
                 session,
                 view.work_package_id,
@@ -600,6 +631,13 @@ class GitHubRemediationMaterializer:
             ):
                 return get_work_package(session, view.work_package_id)
             try:
+                if not fence_github_artifact_dispatch(
+                    session,
+                    view.work_package_id,
+                    artifact_key=artifact_key,
+                    lease_id=lease_id,
+                ):
+                    return get_work_package(session, view.work_package_id)
                 closed = self.github.close_issue(
                     view.repository,
                     view.implementation_issue_number,
@@ -738,6 +776,13 @@ class GitHubRemediationMaterializer:
                         raise RemediationMaterializationError(
                             "duplicate work package summary comments exist"
                         )
+                    if not fence_github_artifact_dispatch(
+                        session,
+                        work_package_id,
+                        artifact_key=artifact_key,
+                        lease_id=lease_id,
+                    ):
+                        return get_work_package(session, work_package_id)
                     if matches:
                         comment = matches[0]
                         if comment.actor.strip().lower() != bot_login.strip().lower():
@@ -775,6 +820,15 @@ class GitHubRemediationMaterializer:
                             raise RemediationMaterializationError(
                                 "summary comment actor does not match the Control Plane App"
                             )
+                    if not fence_github_artifact_dispatch(
+                        session,
+                        work_package_id,
+                        artifact_key=artifact_key,
+                        lease_id=lease_id,
+                    ):
+                        raise RemediationMaterializationError(
+                            "summary dispatch ownership changed before receipt"
+                        )
                     record_summary_comment(
                         session,
                         work_package_id,

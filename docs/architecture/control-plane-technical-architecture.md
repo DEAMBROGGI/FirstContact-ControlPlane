@@ -899,3 +899,16 @@ no candidate identity or prior event is overwritten.
   incomplete observation never authorizes `addProjectV2ItemById`.
 - Codex/provider trigger dispatch performs a final canonical PR exact-head readback
   immediately before posting the reserved trigger comment.
+
+## Dispatch fencing and remote compensation
+
+- Lease expiry never authorizes a stale worker to perform an irreversible remote
+  side effect. The final mutation phase is fenced by row ownership held through
+  remote write and receipt persistence.
+- Provider trigger dispatch and remediation artifact dispatch share that rule;
+  takeover is allowed only before the stale owner enters the fenced mutation
+  section.
+- Publication base drift detected after a successful branch push triggers exact-ref
+  compensation before candidate rejection. The previous governed ref is restored
+  (or the initial ref removed) only while the remote ref still equals the rejected
+  candidate SHA.

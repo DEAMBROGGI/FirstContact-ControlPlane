@@ -301,3 +301,28 @@ Project V2 item discovery is bounded but fail-closed: reaching the configured
 100-page safety cap while GitHub still reports `hasNextPage=true` is not treated
 as authoritative absence. No add mutation is permitted until the scan proves
 that pagination is exhausted.
+
+### Dispatch fencing discovered by deep review
+
+Expiring dispatch leases are recovery metadata, not sufficient mutation fences on
+their own. Before an irreversible provider/GitHub write, Plane re-locks the
+authoritative dispatch row under the current lease id and holds the database
+transaction lock across the final bounded write plus receipt persistence. A worker
+whose lease expired and was superseded therefore cannot continue into the remote
+side effect. Long discovery may occur before this final fence; ownership is
+revalidated immediately afterward.
+
+This applies to Codex trigger dispatch and remediation artifact dispatch. Recovery
+workers may reclaim expired leases, but stale workers fail before mutation and may
+not mark an active replacement dispatch unavailable.
+
+### Post-write publication compensation
+
+If the canonical base moves after the final pre-write read but before the governed
+branch mutation, the post-write check detects the drift. Before rejecting the
+candidate, Plane compensates the remote branch under an exact force-with-lease:
+restore the previous governed head for successors, or delete the just-created
+branch for an initial publication. Compensation is accepted only if the remote ref
+still equals the rejected candidate SHA, and its readback must converge before
+`CANDIDATE_REJECTED` is appended. This prevents a rejected candidate from becoming
+an orphan remote head that blocks the next publication.

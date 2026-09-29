@@ -35,9 +35,11 @@ from control_plane.remediation import (
     WorkPackageState,
     begin_rejected_findings_finalization,
     begin_successor_verification,
+    claim_github_artifact_dispatch,
     claim_work_package,
     complete_work_package,
     create_work_package,
+    fence_github_artifact_dispatch,
     get_work_package,
     load_work_package_events,
     mark_implementation_rework_required,
@@ -368,6 +370,45 @@ def test_candidate_submission_is_blocked_while_remediation_is_verifying(session)
     after = get_view(session, view.publication_id)
     assert after.current_candidate == before.current_candidate
     assert get_work_package(session, package.work_package_id).state is WorkPackageState.VERIFYING
+
+
+def test_expired_artifact_dispatch_owner_is_fenced_before_remote_write(session):
+    view, _source_run, package = create_package(session)
+    artifact_key = "finding:codex:3101:4101:reply"
+    assert claim_github_artifact_dispatch(
+        session,
+        package.work_package_id,
+        artifact_key=artifact_key,
+        lease_id="lease-a",
+        lease_seconds=1,
+    )
+    from control_plane.models import RemediationDispatchRow
+    from datetime import datetime, timedelta, timezone
+    row = session.query(RemediationDispatchRow).filter_by(
+        work_package_id=package.work_package_id, artifact_key=artifact_key
+    ).one()
+    row.lease_expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+    session.commit()
+    assert claim_github_artifact_dispatch(
+        session,
+        package.work_package_id,
+        artifact_key=artifact_key,
+        lease_id="lease-b",
+        lease_seconds=60,
+    )
+    assert not fence_github_artifact_dispatch(
+        session,
+        package.work_package_id,
+        artifact_key=artifact_key,
+        lease_id="lease-a",
+    )
+    assert fence_github_artifact_dispatch(
+        session,
+        package.work_package_id,
+        artifact_key=artifact_key,
+        lease_id="lease-b",
+    )
+    session.rollback()
 
 
 def test_project_v2_uses_separate_secret_and_fails_closed_when_missing(session):

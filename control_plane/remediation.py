@@ -1378,6 +1378,38 @@ def claim_github_artifact_dispatch(
     return True
 
 
+def fence_github_artifact_dispatch(
+    session: Session,
+    work_package_id: str,
+    *,
+    artifact_key: str,
+    lease_id: str,
+    lease_seconds: int = 60,
+) -> bool:
+    """Hold package + dispatch row locks across the final remote artifact write.
+
+    This converts the expiring recovery lease into an actual mutation fence:
+    ownership may expire during discovery, but a stale worker cannot write after
+    another worker has reclaimed the dispatch.
+    """
+    _lock_work_package(session, work_package_id)
+    dispatch = session.scalar(
+        select(RemediationDispatchRow)
+        .where(
+            RemediationDispatchRow.work_package_id == work_package_id,
+            RemediationDispatchRow.artifact_key == artifact_key,
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if dispatch is None or dispatch.lease_id != lease_id:
+        session.commit()
+        return False
+    dispatch.lease_expires_at = datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)
+    session.flush()
+    return True
+
+
 def release_github_artifact_dispatch(
     session: Session,
     work_package_id: str,

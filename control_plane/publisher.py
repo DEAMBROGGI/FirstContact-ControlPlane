@@ -160,6 +160,67 @@ class GitPushTransport:
                 raise PublicationError("bounded Git publication failed") from exc
         if result.returncode != 0:
             raise PublicationError("GitHub rejected exact-head publication")
+    def restore_governed_head(
+        self,
+        *,
+        repo_path: Path,
+        repository: str,
+        branch: str,
+        token: str,
+        expected_current_sha: str,
+        restore_sha: str | None,
+    ) -> None:
+        """Compensate a rejected remote write under an exact ref lease."""
+        if not _REPOSITORY_RE.fullmatch(repository):
+            raise PublicationError("publisher repository identity is invalid")
+        if not _BRANCH_RE.fullmatch(branch) or ".." in branch or branch.endswith("/"):
+            raise PublicationError("publisher branch identity is invalid")
+        if not token:
+            raise PublicationError("publisher installation token is unavailable")
+        if not _SHA_RE.fullmatch(expected_current_sha):
+            raise PublicationError("expected rejected publication head is invalid")
+        if restore_sha is not None and not _SHA_RE.fullmatch(restore_sha):
+            raise PublicationError("restore publication head is invalid")
+
+        remote_url = f"https://github.com/{repository}.git"
+        destination = f"refs/heads/{branch}"
+        refspec = (
+            f"{restore_sha}:{destination}" if restore_sha is not None else f":{destination}"
+        )
+        push_args = [
+            self.git_executable,
+            "-c",
+            "credential.helper=",
+            "-C",
+            str(repo_path),
+            "push",
+            "--porcelain",
+            "--no-verify",
+            "--no-tags",
+            f"--force-with-lease={destination}:{expected_current_sha}",
+            remote_url,
+            refspec,
+        ]
+        with tempfile.TemporaryDirectory(prefix="fc-controlplane-askpass-") as raw:
+            askpass = self._write_askpass(Path(raw))
+            environment = self._safe_environment(token, askpass)
+            try:
+                result = subprocess.run(
+                    push_args,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=120,
+                    shell=False,
+                    env=environment,
+                )
+            except (OSError, subprocess.SubprocessError) as exc:
+                raise PublicationError("bounded Git publication recovery failed") from exc
+        if result.returncode != 0:
+            raise PublicationError("GitHub rejected exact-head publication recovery")
+
 class GitHubPublisher:
     def __init__(
         self,
@@ -298,6 +359,63 @@ class GitHubPublisher:
         ):
             raise PublicationError("quarantine readback does not match admitted candidate")
         return source, verified
+    def _compensate_rejected_candidate_write(
+        self,
+        *,
+        view: PublicationView,
+        source: CandidateSourceRow,
+        branch: str,
+        token: str,
+        candidate_head_sha: str,
+    ) -> None:
+        current = self.github.ref_sha(view.repository, branch, token)
+        expected_restored = view.remote_head_sha
+        if current == expected_restored:
+            return
+        if current != candidate_head_sha:
+            raise PublicationError(
+                "rejected publication branch changed before compensation"
+            )
+        self.git_push.restore_governed_head(
+            repo_path=self.quarantine.repo_path(source.quarantine_id),
+            repository=view.repository,
+            branch=branch,
+            token=token,
+            expected_current_sha=candidate_head_sha,
+            restore_sha=expected_restored,
+        )
+        restored = self.github.ref_sha(view.repository, branch, token)
+        if restored != expected_restored:
+            raise PublicationError("publication branch compensation readback failed")
+
+    def _reject_stale_base_candidate(
+        self,
+        session: Session,
+        publication_id: str,
+        *,
+        view: PublicationView,
+        source: CandidateSourceRow,
+        branch: str,
+        token: str,
+        candidate_id: str,
+        candidate_head_sha: str,
+        message: str,
+    ) -> None:
+        self._compensate_rejected_candidate_write(
+            view=view,
+            source=source,
+            branch=branch,
+            token=token,
+            candidate_head_sha=candidate_head_sha,
+        )
+        reject_admitted_candidate(
+            session,
+            publication_id,
+            candidate_id=candidate_id,
+            reason="REMOTE_BASE_MOVED_AFTER_ADMISSION",
+        )
+        raise PublicationError(message)
+
     def publish(self, session: Session, publication_id: str) -> PublicationView:
         view = get_view(session, publication_id)
         candidate = view.current_candidate
@@ -329,13 +447,17 @@ class GitHubPublisher:
             if view.state is PublicationState.ADMITTED:
                 remote_base = self.github.ref_sha(view.repository, base_branch, token)
                 if remote_base != candidate.base_sha:
-                    reject_admitted_candidate(
+                    self._reject_stale_base_candidate(
                         session,
                         publication_id,
+                        view=view,
+                        source=source,
+                        branch=branch,
+                        token=token,
                         candidate_id=candidate.candidate_id,
-                        reason="REMOTE_BASE_MOVED_AFTER_ADMISSION",
+                        candidate_head_sha=candidate.head_sha,
+                        message="remote base moved after candidate admission",
                     )
-                    raise PublicationError("remote base moved after candidate admission")
 
             target_before = self.github.ref_sha(view.repository, branch, token)
             if view.remote_head_sha is not None:
@@ -380,14 +502,16 @@ class GitHubPublisher:
                     view.repository, base_branch, token
                 )
                 if remote_base_before_write != candidate.base_sha:
-                    reject_admitted_candidate(
+                    self._reject_stale_base_candidate(
                         session,
                         publication_id,
+                        view=view,
+                        source=source,
+                        branch=branch,
+                        token=token,
                         candidate_id=candidate.candidate_id,
-                        reason="REMOTE_BASE_MOVED_AFTER_ADMISSION",
-                    )
-                    raise PublicationError(
-                        "remote base moved at publication write boundary"
+                        candidate_head_sha=candidate.head_sha,
+                        message="remote base moved at publication write boundary",
                     )
 
             if target_before is None:
@@ -463,14 +587,16 @@ class GitHubPublisher:
             except GitHubApiError as exc:
                 raise PublicationError("GitHub publication failed closed") from exc
             if remote_base_after_write != candidate.base_sha:
-                reject_admitted_candidate(
+                self._reject_stale_base_candidate(
                     session,
                     publication_id,
+                    view=view,
+                    source=source,
+                    branch=branch,
+                    token=token,
                     candidate_id=candidate.candidate_id,
-                    reason="REMOTE_BASE_MOVED_AFTER_ADMISSION",
-                )
-                raise PublicationError(
-                    "remote base moved before publication authority was recorded"
+                    candidate_head_sha=candidate.head_sha,
+                    message="remote base moved before publication authority was recorded",
                 )
 
         if view.state is PublicationState.IN_REVIEW:

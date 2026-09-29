@@ -38,6 +38,7 @@ from control_plane.quarantine import VerifiedCandidateSource
 from control_plane.repository import load_events
 from control_plane.service import (
     claim_codex_review_trigger_dispatch,
+    fence_codex_review_trigger_dispatch,
     create_publication,
     get_view,
     mark_remote_published,
@@ -768,6 +769,36 @@ def test_remote_pr_move_after_review_run_creation_blocks_trigger_comment(session
     latest = get_view(session, view.publication_id)
     assert latest.automated_review_status is AutomatedReviewStatus.UNAVAILABLE
     assert latest.automated_review_trigger_comment_id is None
+
+
+def test_expired_codex_dispatch_owner_is_fenced_before_remote_trigger(session):
+    view = published_publication(session)
+    running = request_codex_review(
+        session,
+        view.publication_id,
+        mode="required",
+        expected_head_sha=HEAD,
+    )
+    run_id = running.automated_review_run_id
+    assert run_id is not None
+    assert claim_codex_review_trigger_dispatch(
+        session, view.publication_id, run_id=run_id, lease_id="lease-a", lease_seconds=1
+    )
+    from control_plane.models import CodexReviewDispatchRow
+    from datetime import datetime, timedelta, timezone
+    row = session.get(CodexReviewDispatchRow, run_id)
+    row.lease_expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+    session.commit()
+    assert claim_codex_review_trigger_dispatch(
+        session, view.publication_id, run_id=run_id, lease_id="lease-b", lease_seconds=120
+    )
+    assert not fence_codex_review_trigger_dispatch(
+        session, view.publication_id, run_id=run_id, lease_id="lease-a"
+    )
+    assert fence_codex_review_trigger_dispatch(
+        session, view.publication_id, run_id=run_id, lease_id="lease-b"
+    )
+    session.rollback()
 
 
 def test_disabled_mode_never_invokes_github(session):

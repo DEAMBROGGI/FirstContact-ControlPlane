@@ -23,6 +23,7 @@ from .service import (
     claim_codex_review_trigger_dispatch,
     complete_codex_review,
     complete_codex_review_trigger_dispatch,
+    fence_codex_review_trigger_dispatch,
     get_view,
     mark_codex_review_unavailable,
     release_codex_review_trigger_dispatch,
@@ -279,6 +280,14 @@ class CodexReviewBroker:
                 )
             if len(existing) > 1:
                 raise CodexReviewError("multiple Codex trigger comments exist")
+
+            if not fence_codex_review_trigger_dispatch(
+                session,
+                publication_id,
+                run_id=run_id,
+                lease_id=lease_id,
+            ):
+                return get_view(session, publication_id)
 
             if existing:
                 comment = existing[0]

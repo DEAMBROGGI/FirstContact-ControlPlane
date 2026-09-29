@@ -174,6 +174,8 @@ class FakePush:
         self.calls = 0
         self.expected_old_shas = []
         self.race_remote_sha = None
+        self.race_base_sha = None
+        self.restore_calls = []
 
     def push_governed_head(self, **kwargs):
         assert kwargs["token"] == "installation-secret"
@@ -186,6 +188,19 @@ class FakePush:
             raise PublicationError("remote ref failed exact expected-old lease")
         self.gateway.target_sha = self.expected_head
         self.gateway.pull_head_sha = self.expected_head
+        if self.race_base_sha is not None:
+            self.gateway.base_sha = self.race_base_sha
+
+    def restore_governed_head(self, **kwargs):
+        assert kwargs["token"] == "installation-secret"
+        expected_current_sha = kwargs["expected_current_sha"]
+        restore_sha = kwargs["restore_sha"]
+        self.restore_calls.append((expected_current_sha, restore_sha))
+        if self.gateway.target_sha != expected_current_sha:
+            raise PublicationError("remote ref failed recovery lease")
+        self.gateway.target_sha = restore_sha
+        self.gateway.pull_head_sha = restore_sha
+
 def publisher_for(view, quarantine, source, gateway=None, sleep=None):
     gateway = gateway or FakeGateway(
         base_sha=view.current_candidate.base_sha,
@@ -358,6 +373,27 @@ def test_remote_base_change_after_preflight_fails_before_governed_push(session, 
     assert push.calls == 0
     assert get_view(session, view.publication_id).state is PublicationState.VALIDATION_FAILED
     assert remote_published_events(session, view.publication_id) == []
+
+
+def test_post_write_base_drift_restores_governed_branch_before_rejecting_candidate(
+    session, tmp_path
+):
+    first, second, _quarantine, _source, gateway, publisher_b, _push_a, push_b = successor_setup(
+        session, tmp_path
+    )
+    push_b.race_base_sha = "f" * 40
+
+    with pytest.raises(PublicationError, match="before publication authority"):
+        publisher_b.publish(session, second.publication_id)
+
+    assert push_b.calls == 1
+    assert push_b.restore_calls == [(second.current_candidate.head_sha, first.remote_head_sha)]
+    assert gateway.target_sha == first.remote_head_sha
+    recovered = get_view(session, second.publication_id)
+    assert recovered.state is PublicationState.VALIDATION_FAILED
+    remote_events = remote_published_events(session, second.publication_id)
+    assert len(remote_events) == 1
+    assert remote_events[-1]["payload"]["head_sha"] == first.remote_head_sha
 
 
 def test_branch_collision_fails_closed(session, tmp_path):
