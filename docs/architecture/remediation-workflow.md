@@ -378,3 +378,24 @@ from reviewer-controlled fields. Recovery still locates candidate GitHub
 artifacts by their stable markers, but accepts them only when the complete
 expected review/comment body and exact review/head/path/line identities match.
 This prevents cross-run marker injection from becoming valid receipt evidence.
+
+
+### Required-mode Human Review after provider unavailability
+
+A publication whose exact-head Codex run was requested in `required` mode does
+not bypass the automated-review gate merely because Codex is unavailable.
+Human `APPROVED` is admitted only when Control Plane can derive authoritative
+adjudication from its own ledger:
+
+- exact-head Codex `PASS`;
+- exact-head Codex `CHANGES_REQUIRED` with remediation clearance; or
+- exact-head Codex `UNAVAILABLE` plus a materialized `PLANE_REVIEW` from a
+  `FALLBACK_REVIEWER` whose result is `PASS` with zero findings.
+
+For the fallback path, both the recorded Plane contract and materialized receipt
+must agree on reviewer, reviewer kind and current HEAD, and both must occur
+after the current exact-head `CODEX_REVIEW_UNAVAILABLE` event. A prior clean
+Plane review on the same commit is not reusable as current fallback evidence.
+The native provider review receipt is persisted into the Human Review event's
+`required_review_adjudication` evidence. Caller-controlled Human Review input
+cannot supply or invent that evidence.

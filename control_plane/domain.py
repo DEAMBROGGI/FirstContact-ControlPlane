@@ -297,6 +297,50 @@ def fold_events(
         mergeable=mergeable,
         projection=desired_projection(state),
     )
+def _required_review_adjudication_matches(
+    view: PublicationView,
+    payload: Mapping[str, Any],
+) -> bool:
+    evidence = payload.get("required_review_adjudication")
+    if not isinstance(evidence, Mapping):
+        return False
+    run_id = view.automated_review_run_id
+    head_sha = view.remote_head_sha
+    if (
+        not run_id
+        or not head_sha
+        or view.automated_review_head_sha != head_sha
+        or evidence.get("codex_run_id") != run_id
+        or evidence.get("head_sha") != head_sha
+    ):
+        return False
+
+    kind = evidence.get("kind")
+    if kind == "CODEX_PASS":
+        return view.automated_review_status is AutomatedReviewStatus.PASS
+
+    if kind == "REMEDIATION_CLEARED":
+        return (
+            view.automated_review_status is AutomatedReviewStatus.CHANGES_REQUIRED
+            and view.remediation_cleared_review_run_id == run_id
+            and view.remediation_cleared_head_sha == head_sha
+        )
+
+    if kind == "PLANE_FALLBACK":
+        provider_review_id = evidence.get("provider_review_id")
+        return (
+            view.automated_review_status is AutomatedReviewStatus.UNAVAILABLE
+            and isinstance(evidence.get("plane_run_id"), str)
+            and bool(str(evidence.get("plane_run_id") or "").strip())
+            and isinstance(evidence.get("plane_reviewer"), str)
+            and bool(str(evidence.get("plane_reviewer") or "").strip())
+            and isinstance(provider_review_id, int)
+            and provider_review_id > 0
+        )
+
+    return False
+
+
 def validate_transition(
     view: PublicationView,
     event_type: EventType,
@@ -415,12 +459,7 @@ def validate_transition(
         if (
             payload.get("decision") == ReviewDecision.APPROVED.value
             and view.automated_review_mode == "required"
-            and view.automated_review_status is not AutomatedReviewStatus.PASS
-            and not (
-                view.automated_review_status is AutomatedReviewStatus.CHANGES_REQUIRED
-                and view.remediation_cleared_review_run_id == view.automated_review_run_id
-                and view.remediation_cleared_head_sha == view.remote_head_sha
-            )
+            and not _required_review_adjudication_matches(view, payload)
         ):
             raise DomainError("required Codex review has not passed or been adjudicated")
         if payload.get("reviewed_head_sha") != view.remote_head_sha:

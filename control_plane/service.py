@@ -488,6 +488,111 @@ def _unfinished_remediation_work_package_ids(
     return tuple(unfinished)
 
 
+def _required_review_adjudication(
+    session: Session,
+    publication_id: str,
+    view: PublicationView,
+) -> dict[str, Any] | None:
+    run_id = view.automated_review_run_id
+    review_head = view.automated_review_head_sha
+    remote_head = view.remote_head_sha
+    if (
+        not run_id
+        or not review_head
+        or not remote_head
+        or review_head != remote_head
+    ):
+        return None
+
+    if view.automated_review_status is AutomatedReviewStatus.PASS:
+        return {
+            "kind": "CODEX_PASS",
+            "codex_run_id": run_id,
+            "head_sha": remote_head,
+        }
+
+    if (
+        view.automated_review_status is AutomatedReviewStatus.CHANGES_REQUIRED
+        and view.remediation_cleared_review_run_id == run_id
+        and view.remediation_cleared_head_sha == remote_head
+    ):
+        return {
+            "kind": "REMEDIATION_CLEARED",
+            "codex_run_id": run_id,
+            "head_sha": remote_head,
+        }
+
+    if view.automated_review_status is not AutomatedReviewStatus.UNAVAILABLE:
+        return None
+
+    events = load_events(session, publication_id)
+    unavailable_position: int | None = None
+    recorded_by_run: dict[str, tuple[dict[str, Any], int]] = {}
+    materialized: list[tuple[dict[str, Any], int]] = []
+    for position, event in enumerate(events):
+        payload = event["payload"]
+        if (
+            event["event_type"] == EventType.CODEX_REVIEW_UNAVAILABLE.value
+            and payload.get("run_id") == run_id
+            and payload.get("head_sha") == remote_head
+        ):
+            unavailable_position = position
+        elif event["event_type"] == EventType.PLANE_REVIEW_RECORDED.value:
+            recorded_by_run[str(payload.get("run_id") or "")] = (
+                payload,
+                position,
+            )
+        elif event["event_type"] == EventType.PLANE_REVIEW_MATERIALIZED.value:
+            materialized.append((payload, position))
+
+    if unavailable_position is None:
+        return None
+
+    qualifying: list[tuple[dict[str, Any], int]] = []
+    for payload, materialized_position in materialized:
+        plane_run_id = str(payload.get("run_id") or "")
+        recorded_entry = recorded_by_run.get(plane_run_id)
+        if recorded_entry is None:
+            continue
+        recorded, recorded_position = recorded_entry
+        review_ids = payload.get("provider_review_ids")
+        if (
+            recorded_position <= unavailable_position
+            or materialized_position <= unavailable_position
+            or payload.get("provider") != "PLANE_REVIEW"
+            or payload.get("reviewer_kind") != "FALLBACK_REVIEWER"
+            or payload.get("head_sha") != remote_head
+            or payload.get("result") != "PASS"
+            or payload.get("findings_count") != 0
+            or payload.get("findings") != []
+            or payload.get("provider_comment_ids") != []
+            or not isinstance(review_ids, list)
+            or len(review_ids) != 1
+            or not isinstance(review_ids[0], int)
+            or review_ids[0] <= 0
+            or recorded.get("provider") != "PLANE_REVIEW"
+            or recorded.get("reviewer_kind") != "FALLBACK_REVIEWER"
+            or recorded.get("reviewer") != payload.get("reviewer")
+            or recorded.get("head_sha") != remote_head
+            or recorded.get("comments") != []
+        ):
+            continue
+        qualifying.append((payload, review_ids[0]))
+
+    if not qualifying:
+        return None
+
+    selected, provider_review_id = qualifying[-1]
+    return {
+        "kind": "PLANE_FALLBACK",
+        "codex_run_id": run_id,
+        "head_sha": remote_head,
+        "plane_run_id": selected["run_id"],
+        "plane_reviewer": selected["reviewer"],
+        "provider_review_id": provider_review_id,
+    }
+
+
 def record_review(
     session: Session,
     publication_id: str,
@@ -504,21 +609,26 @@ def record_review(
                 "human approval is blocked by unfinished remediation: "
                 + ", ".join(unfinished)
             )
+    required_adjudication = None
+    required_mode = require_codex_review or view.automated_review_mode == "required"
     if (
-        require_codex_review
-        and decision is ReviewDecision.APPROVED
-        and view.automated_review_status is not AutomatedReviewStatus.PASS
-        and not (
-            view.automated_review_status is AutomatedReviewStatus.CHANGES_REQUIRED
-            and view.remediation_cleared_review_run_id == view.automated_review_run_id
-            and view.remediation_cleared_head_sha == view.remote_head_sha
-        )
+        decision is ReviewDecision.APPROVED
+        and required_mode
+        and view.automated_review_status is not AutomatedReviewStatus.RUNNING
     ):
-        raise DomainError("required Codex review has not passed or been adjudicated")
+        required_adjudication = _required_review_adjudication(
+            session,
+            publication_id,
+            view,
+        )
+        if required_adjudication is None:
+            raise DomainError("required Codex review has not passed or been adjudicated")
     payload = {
         "reviewed_head_sha": _sha(reviewed_head_sha, "reviewed_head_sha"),
         "decision": decision.value,
     }
+    if required_adjudication is not None:
+        payload["required_review_adjudication"] = required_adjudication
     validate_transition(view, EventType.REVIEW_RECORDED, payload)
     append_event(session, publication_id, EventType.REVIEW_RECORDED, payload)
     session.commit()

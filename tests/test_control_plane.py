@@ -13,6 +13,10 @@ from control_plane.domain import (
     ValidationStatus,
 )
 from control_plane.models import CandidateRow, CandidateSourceRow, EventRow, PublicationRow
+from control_plane.plane_review import (
+    complete_plane_review_materialization,
+    record_plane_review,
+)
 from control_plane.profile_registry import all_profiles, profile_for_repository
 from control_plane.repository import append_event, load_events
 from control_plane.quarantine import VerifiedCandidateSource
@@ -20,6 +24,7 @@ from control_plane.service import (
     create_publication,
     complete_codex_review,
     get_view,
+    mark_codex_review_unavailable,
     mark_remote_published,
     record_mergeability,
     record_review,
@@ -1238,3 +1243,207 @@ def test_merged_is_inactive_for_canonical_publication_resolution(session):
 
     assert replacement.publication_id != original.publication_id
     assert replacement.state is PublicationState.CREATED
+
+
+def _mark_required_codex_unavailable(session, view):
+    running = request_codex_review(
+        session,
+        view.publication_id,
+        mode="required",
+        expected_head_sha=view.remote_head_sha,
+    )
+    return mark_codex_review_unavailable(
+        session,
+        view.publication_id,
+        run_id=running.automated_review_run_id,
+        reviewed_head_sha=view.remote_head_sha,
+        reason="provider unavailable for test",
+    )
+
+
+def _materialize_plane_fallback(
+    session,
+    view,
+    *,
+    run_id,
+    reviewer_kind="FALLBACK_REVIEWER",
+    comments=None,
+    provider_review_id=9101,
+):
+    comments = [] if comments is None else comments
+    record_plane_review(
+        session,
+        view.publication_id,
+        run_id=run_id,
+        reviewer_kind=reviewer_kind,
+        reviewer="principal-reviewer:test",
+        reviewed_head_sha=view.remote_head_sha,
+        body="Exact-head Plane fallback test review.",
+        comments=comments,
+        idempotency_key=f"{run_id}:record",
+    )
+    receipts = [
+        {
+            "finding_id": item["finding_id"],
+            "provider_comment_id": provider_review_id + index + 1,
+            "provider_review_id": provider_review_id,
+            "path": item["path"],
+            "line": item["line"],
+        }
+        for index, item in enumerate(comments)
+    ]
+    return complete_plane_review_materialization(
+        session,
+        view.publication_id,
+        run_id=run_id,
+        provider_review_id=provider_review_id,
+        receipts=receipts,
+    )
+
+
+def test_required_human_approval_accepts_exact_head_clean_plane_fallback(session):
+    published = published_publication(session, issue_number=90)
+    unavailable = _mark_required_codex_unavailable(session, published)
+    materialized = _materialize_plane_fallback(
+        session,
+        unavailable,
+        run_id="principal-review:test-required-fallback",
+        provider_review_id=9201,
+    )
+    assert materialized["result"] == "PASS"
+    assert materialized["findings_count"] == 0
+
+    approved = record_review(
+        session,
+        published.publication_id,
+        reviewed_head_sha=published.remote_head_sha,
+        decision=ReviewDecision.APPROVED,
+        require_codex_review=True,
+    )
+
+    assert approved.state is PublicationState.APPROVED
+    review_event = [
+        event
+        for event in load_events(session, published.publication_id)
+        if event["event_type"] == EventType.REVIEW_RECORDED.value
+    ][-1]
+    assert review_event["payload"]["required_review_adjudication"] == {
+        "kind": "PLANE_FALLBACK",
+        "codex_run_id": unavailable.automated_review_run_id,
+        "head_sha": published.remote_head_sha,
+        "plane_run_id": "principal-review:test-required-fallback",
+        "plane_reviewer": "principal-reviewer:test",
+        "provider_review_id": 9201,
+    }
+
+
+def test_required_human_approval_rejects_stale_plane_fallback(session):
+    first = published_publication(session, issue_number=91)
+    unavailable = _mark_required_codex_unavailable(session, first)
+    _materialize_plane_fallback(
+        session,
+        unavailable,
+        run_id="principal-review:test-stale-fallback",
+        provider_review_id=9301,
+    )
+
+    submit_verified_candidate(
+        session,
+        first.publication_id,
+        successor_source(),
+    )
+    admitted = admit_current_candidate(session, first.publication_id)
+    successor = mark_remote_published(
+        session,
+        first.publication_id,
+        admitted.current_candidate.head_sha,
+        branch=first.remote_branch,
+        base_branch=first.base_branch,
+        pull_request_number=first.pull_request_number,
+    )
+    _mark_required_codex_unavailable(session, successor)
+
+    with pytest.raises(DomainError, match="required Codex review has not passed"):
+        record_review(
+            session,
+            first.publication_id,
+            reviewed_head_sha=successor.remote_head_sha,
+            decision=ReviewDecision.APPROVED,
+            require_codex_review=True,
+        )
+
+
+def test_required_human_approval_rejects_nonclean_plane_fallback(session):
+    published = published_publication(session, issue_number=92)
+    unavailable = _mark_required_codex_unavailable(session, published)
+    finding = {
+        "finding_id": "principal:test:required-fallback-finding",
+        "normalized_identity": "principal:test:required-fallback-finding:v1",
+        "priority": "P1",
+        "path": "control_plane/service.py",
+        "line": 500,
+        "side": "RIGHT",
+        "body": "Test finding keeps fallback non-clean.",
+    }
+    materialized = _materialize_plane_fallback(
+        session,
+        unavailable,
+        run_id="principal-review:test-nonclean-fallback",
+        comments=[finding],
+        provider_review_id=9401,
+    )
+    assert materialized["result"] == "CHANGES_REQUIRED"
+
+    with pytest.raises(DomainError, match="required Codex review has not passed"):
+        record_review(
+            session,
+            published.publication_id,
+            reviewed_head_sha=published.remote_head_sha,
+            decision=ReviewDecision.APPROVED,
+            require_codex_review=True,
+        )
+
+
+def test_required_human_approval_rejects_nonfallback_plane_pass(session):
+    published = published_publication(session, issue_number=93)
+    unavailable = _mark_required_codex_unavailable(session, published)
+    materialized = _materialize_plane_fallback(
+        session,
+        unavailable,
+        run_id="principal-review:test-principal-not-fallback",
+        reviewer_kind="PRINCIPAL_REVIEWER",
+        provider_review_id=9501,
+    )
+    assert materialized["result"] == "PASS"
+
+    with pytest.raises(DomainError, match="required Codex review has not passed"):
+        record_review(
+            session,
+            published.publication_id,
+            reviewed_head_sha=published.remote_head_sha,
+            decision=ReviewDecision.APPROVED,
+            require_codex_review=True,
+        )
+
+
+def test_required_human_approval_rejects_preexisting_same_head_plane_fallback(session):
+    published = published_publication(session, issue_number=94)
+    materialized = _materialize_plane_fallback(
+        session,
+        published,
+        run_id="principal-review:test-preexisting-fallback",
+        provider_review_id=9601,
+    )
+    assert materialized["result"] == "PASS"
+
+    unavailable = _mark_required_codex_unavailable(session, published)
+    assert unavailable.automated_review_status is AutomatedReviewStatus.UNAVAILABLE
+
+    with pytest.raises(DomainError, match="required Codex review has not passed"):
+        record_review(
+            session,
+            published.publication_id,
+            reviewed_head_sha=published.remote_head_sha,
+            decision=ReviewDecision.APPROVED,
+            require_codex_review=True,
+        )
