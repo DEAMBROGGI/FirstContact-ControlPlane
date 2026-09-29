@@ -125,11 +125,17 @@ class GitHub:
         pulls,
         *,
         merged_statuses,
+        merge_events=None,
         merge_result=MERGE_SHA,
         merge_error=None,
     ):
         self.pulls = list(pulls)
         self.merged_statuses = list(merged_statuses)
+        self.merge_events = list(
+            merge_events
+            if merge_events is not None
+            else [SimpleNamespace(commit_id=MERGE_SHA)] * 4
+        )
         self.merge_result = merge_result
         self.merge_error = merge_error
         self.merge_calls = []
@@ -149,6 +155,14 @@ class GitHub:
         if not self.merged_statuses:
             raise AssertionError("unexpected pull_request_merged readback")
         return self.merged_statuses.pop(0)
+
+    def pull_request_merge_event(self, repository, number, token):
+        assert repository == REPOSITORY
+        assert number == PR_NUMBER
+        assert token == "installation-token"
+        if not self.merge_events:
+            raise AssertionError("unexpected pull_request_merge_event readback")
+        return self.merge_events.pop(0)
 
     def merge_pull_request(
         self,
@@ -282,8 +296,9 @@ def test_plane_merge_recovers_remote_success_after_uncertain_write(session):
 def test_reconcile_already_merged_ready_publication(session):
     ready = ready_publication(session, issue_number=223)
     github = GitHub(
-        [pull(merged=True, merge_sha=MERGE_SHA)],
+        [pull(merged=True, merge_sha=None)],
         merged_statuses=[True],
+        merge_events=[SimpleNamespace(commit_id=MERGE_SHA)],
     )
     coordinator = MergeCoordinator(
         token_provider=TokenProvider(),
