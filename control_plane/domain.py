@@ -501,12 +501,20 @@ def validate_transition(
     if event_type is EventType.MERGEABILITY_RECORDED:
         if state is not PublicationState.APPROVED:
             raise DomainError("mergeability is evaluated only after approval")
+        if view.merge_policy_violation:
+            raise DomainError(
+                "merge policy violation permanently blocks governed readiness"
+            )
         if view.remote_head_sha is None or payload.get("head_sha") != view.remote_head_sha:
             raise DomainError("mergeability result is bound to a stale head")
         return
     if event_type is EventType.MERGED:
         if state is not PublicationState.READY_TO_MERGE:
             raise DomainError("merge requires READY_TO_MERGE state")
+        if view.merge_policy_violation:
+            raise DomainError(
+                "merge policy violation permanently blocks governed merge"
+            )
         if (
             view.remote_head_sha is None
             or payload.get("head_sha") != view.remote_head_sha
