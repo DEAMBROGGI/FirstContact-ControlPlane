@@ -683,3 +683,79 @@ def test_issue_creation_and_managed_label_projection_use_bounded_routes():
     assert issue.issue_node_id == "I_issue14"
     assert set(projected.labels) == {"status:in-progress", "type:fix", "priority:P1"}
     assert [method for method, _path in calls] == ["POST", "GET", "DELETE", "POST", "GET"]
+
+
+def test_merge_pull_request_binds_expected_head_and_returns_merge_commit():
+    merge_sha = "4" * 40
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "PUT"
+        assert request.url.path == (
+            "/repos/DEAMBROGGI/FirstContact/pulls/13/merge"
+        )
+        assert request.headers["Authorization"] == "Bearer installation-token"
+        assert json.loads(request.content.decode("utf-8")) == {
+            "sha": HEAD,
+            "merge_method": "merge",
+        }
+        return httpx.Response(
+            200,
+            json={
+                "sha": merge_sha,
+                "merged": True,
+                "message": "Pull Request successfully merged",
+            },
+        )
+
+    github = GitHubRepositoryGateway(
+        api_url="https://api.github.test",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    result = github.merge_pull_request(
+        "DEAMBROGGI/FirstContact",
+        13,
+        expected_head_sha=HEAD,
+        token="installation-token",
+    )
+
+    assert result == merge_sha
+
+
+def test_pull_request_snapshot_exposes_merged_receipt():
+    merge_sha = "5" * 40
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == (
+            "/repos/DEAMBROGGI/FirstContact/pulls/13"
+        )
+        return httpx.Response(
+            200,
+            json={
+                "number": 13,
+                "state": "closed",
+                "merged": True,
+                "merge_commit_sha": merge_sha,
+                "base": {"ref": "master"},
+                "head": {
+                    "ref": "control-plane/issue-22-canonical",
+                    "sha": HEAD,
+                },
+            },
+        )
+
+    github = GitHubRepositoryGateway(
+        api_url="https://api.github.test",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    pull = github.pull_request(
+        "DEAMBROGGI/FirstContact",
+        13,
+        "installation-token",
+    )
+
+    assert pull.merged is True
+    assert pull.merge_commit_sha == merge_sha
+    assert pull.head_sha == HEAD
