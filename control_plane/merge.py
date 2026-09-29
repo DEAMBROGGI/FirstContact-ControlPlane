@@ -109,6 +109,11 @@ class MergeCoordinator:
                 raise MergeError("stored merge receipt does not match GitHub")
             return view
 
+        if view.merge_policy_violation:
+            raise MergeError(
+                "merge policy violation permanently blocks governed merge"
+            )
+
         if view.state is PublicationState.READY_TO_MERGE:
             return record_merged(
                 session,
@@ -225,6 +230,19 @@ class MergeCoordinator:
                 )
             if pull.state != "open":
                 raise MergeError("canonical pull request is not open")
+
+            candidate = view.current_candidate
+            if candidate is None:
+                raise MergeError("publication is missing current candidate identity")
+            base_sha = self.github.ref_sha(
+                view.repository,
+                pull.base_ref,
+                access.token,
+            )
+            if base_sha != candidate.base_sha:
+                raise MergeError(
+                    "canonical pull request base moved after candidate admission"
+                )
 
             merge_sha: str | None = None
             merge_error: Exception | None = None
