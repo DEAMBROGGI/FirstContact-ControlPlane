@@ -53,7 +53,11 @@ class MergeCoordinator:
         merged: bool,
     ) -> str:
         if not merged or pull.merge_commit_sha is None:
-            raise MergeError("GitHub merge receipt is incomplete")
+            raise MergeError(
+                "GitHub merge receipt is incomplete "
+                f"(merged={merged}, "
+                f"merge_commit_sha_present={pull.merge_commit_sha is not None})"
+            )
         return pull.merge_commit_sha
 
     def _record_reconciled_pull(
