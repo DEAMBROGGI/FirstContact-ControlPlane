@@ -170,6 +170,7 @@ class MergeCoordinator:
             view=view,
             pull=pull,
             merged=merged,
+            token=access.token,
         )
 
     def merge(
@@ -215,6 +216,7 @@ class MergeCoordinator:
                     view=view,
                     pull=pull,
                     merged=True,
+                    token=access.token,
                 )
             if pull.state != "open":
                 raise MergeError("canonical pull request is not open")
