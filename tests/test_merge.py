@@ -120,8 +120,16 @@ class TokenProvider:
 
 
 class GitHub:
-    def __init__(self, pulls, *, merge_result=MERGE_SHA, merge_error=None):
+    def __init__(
+        self,
+        pulls,
+        *,
+        merged_statuses,
+        merge_result=MERGE_SHA,
+        merge_error=None,
+    ):
         self.pulls = list(pulls)
+        self.merged_statuses = list(merged_statuses)
         self.merge_result = merge_result
         self.merge_error = merge_error
         self.merge_calls = []
@@ -133,6 +141,14 @@ class GitHub:
         if not self.pulls:
             raise AssertionError("unexpected pull_request readback")
         return self.pulls.pop(0)
+
+    def pull_request_merged(self, repository, number, token):
+        assert repository == REPOSITORY
+        assert number == PR_NUMBER
+        assert token == "installation-token"
+        if not self.merged_statuses:
+            raise AssertionError("unexpected pull_request_merged readback")
+        return self.merged_statuses.pop(0)
 
     def merge_pull_request(
         self,
@@ -214,7 +230,8 @@ def test_plane_merge_executes_exact_head_and_records_native_receipt(session):
         [
             pull(merged=False),
             pull(merged=True, merge_sha=MERGE_SHA),
-        ]
+        ],
+        merged_statuses=[False, True],
     )
     coordinator = MergeCoordinator(
         token_provider=token_provider,
@@ -247,6 +264,7 @@ def test_plane_merge_recovers_remote_success_after_uncertain_write(session):
             pull(merged=False),
             pull(merged=True, merge_sha=MERGE_SHA),
         ],
+        merged_statuses=[False, True],
         merge_error=GitHubApiError("transport failed after write"),
     )
     coordinator = MergeCoordinator(
@@ -263,7 +281,10 @@ def test_plane_merge_recovers_remote_success_after_uncertain_write(session):
 
 def test_reconcile_already_merged_ready_publication(session):
     ready = ready_publication(session, issue_number=223)
-    github = GitHub([pull(merged=True, merge_sha=MERGE_SHA)])
+    github = GitHub(
+        [pull(merged=True, merge_sha=MERGE_SHA)],
+        merged_statuses=[True],
+    )
     coordinator = MergeCoordinator(
         token_provider=TokenProvider(),
         github=github,
@@ -279,7 +300,10 @@ def test_reconcile_already_merged_ready_publication(session):
 
 def test_reconcile_non_ready_out_of_band_merge_records_violation(session):
     approved = approved_publication(session, issue_number=224)
-    github = GitHub([pull(merged=True, merge_sha=MERGE_SHA)])
+    github = GitHub(
+        [pull(merged=True, merge_sha=MERGE_SHA)],
+        merged_statuses=[True],
+    )
     coordinator = MergeCoordinator(
         token_provider=TokenProvider(),
         github=github,
@@ -299,7 +323,10 @@ def test_merge_command_rejects_non_ready_unmerged_publication(session):
     approved = approved_publication(session, issue_number=225)
     coordinator = MergeCoordinator(
         token_provider=TokenProvider(),
-        github=GitHub([pull(merged=False)]),
+        github=GitHub(
+            [pull(merged=False)],
+            merged_statuses=[False],
+        ),
     )
 
     with pytest.raises(DomainError, match="READY_TO_MERGE"):
@@ -312,7 +339,10 @@ def test_reconcile_rejects_stale_github_head(session):
     ready = ready_publication(session, issue_number=226)
     coordinator = MergeCoordinator(
         token_provider=TokenProvider(),
-        github=GitHub([pull(merged=True, head="9" * 40, merge_sha=MERGE_SHA)]),
+        github=GitHub(
+            [pull(merged=True, head="9" * 40, merge_sha=MERGE_SHA)],
+            merged_statuses=[True],
+        ),
     )
 
     with pytest.raises(MergeError, match="head changed"):
