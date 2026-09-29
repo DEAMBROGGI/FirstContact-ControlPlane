@@ -126,6 +126,7 @@ class GitHub:
         *,
         merged_statuses,
         merge_events=None,
+        base_shas=None,
         merge_result=MERGE_SHA,
         merge_error=None,
     ):
@@ -135,6 +136,11 @@ class GitHub:
             merge_events
             if merge_events is not None
             else [SimpleNamespace(commit_id=MERGE_SHA)] * 4
+        )
+        self.base_shas = list(
+            base_shas
+            if base_shas is not None
+            else [BASE] * 4
         )
         self.merge_result = merge_result
         self.merge_error = merge_error
@@ -163,6 +169,14 @@ class GitHub:
         if not self.merge_events:
             raise AssertionError("unexpected pull_request_merge_event readback")
         return self.merge_events.pop(0)
+
+    def ref_sha(self, repository, branch, token):
+        assert repository == REPOSITORY
+        assert branch == "master"
+        assert token == "installation-token"
+        if not self.base_shas:
+            raise AssertionError("unexpected ref_sha readback")
+        return self.base_shas.pop(0)
 
     def merge_pull_request(
         self,
@@ -368,3 +382,73 @@ def test_reconcile_rejects_stale_github_head(session):
         coordinator.reconcile(session, ready.publication_id)
 
     assert get_view(session, ready.publication_id).state is PublicationState.READY_TO_MERGE
+
+
+def test_policy_violation_blocks_later_readiness_and_reconcile(session):
+    approved = approved_publication(session, issue_number=227)
+    first = MergeCoordinator(
+        token_provider=TokenProvider(),
+        github=GitHub(
+            [pull(merged=True, merge_sha=MERGE_SHA)],
+            merged_statuses=[True],
+        ),
+    )
+
+    with pytest.raises(MergeError, match="before Control Plane READY_TO_MERGE"):
+        first.reconcile(session, approved.publication_id)
+
+    violated = get_view(session, approved.publication_id)
+    assert violated.state is PublicationState.APPROVED
+    assert violated.merge_policy_violation is True
+
+    with pytest.raises(
+        DomainError,
+        match="permanently blocks governed readiness",
+    ):
+        record_mergeability(
+            session,
+            approved.publication_id,
+            head_sha=HEAD,
+            mergeable=True,
+        )
+
+    second = MergeCoordinator(
+        token_provider=TokenProvider(),
+        github=GitHub(
+            [pull(merged=True, merge_sha=MERGE_SHA)],
+            merged_statuses=[True],
+        ),
+    )
+
+    with pytest.raises(
+        MergeError,
+        match="permanently blocks governed merge",
+    ):
+        second.reconcile(session, approved.publication_id)
+
+    current = get_view(session, approved.publication_id)
+    assert current.state is PublicationState.APPROVED
+    assert current.merge_policy_violation is True
+
+
+def test_plane_merge_rejects_base_drift_after_ready(session):
+    ready = ready_publication(session, issue_number=228)
+    github = GitHub(
+        [pull(merged=False)],
+        merged_statuses=[False],
+        base_shas=["9" * 40],
+    )
+    coordinator = MergeCoordinator(
+        token_provider=TokenProvider(),
+        github=github,
+    )
+
+    with pytest.raises(
+        MergeError,
+        match="base moved after candidate admission",
+    ):
+        coordinator.merge(session, ready.publication_id)
+
+    current = get_view(session, ready.publication_id)
+    assert current.state is PublicationState.READY_TO_MERGE
+    assert github.merge_calls == []
