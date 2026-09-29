@@ -759,3 +759,38 @@ def test_pull_request_snapshot_exposes_merged_receipt():
     assert pull.merged is True
     assert pull.merge_commit_sha == merge_sha
     assert pull.head_sha == HEAD
+
+
+def test_pull_request_merged_uses_dedicated_status_endpoint():
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        assert request.headers["Authorization"] == "Bearer installation-token"
+        if request.url.path.endswith("/pulls/13/merge"):
+            return httpx.Response(204)
+        if request.url.path.endswith("/pulls/14/merge"):
+            return httpx.Response(404, json={"message": "Not Found"})
+        raise AssertionError(f"unexpected request {request.method} {request.url}")
+
+    github = GitHubRepositoryGateway(
+        api_url="https://api.github.test",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    assert github.pull_request_merged(
+        "DEAMBROGGI/FirstContact",
+        13,
+        "installation-token",
+    ) is True
+
+    assert github.pull_request_merged(
+        "DEAMBROGGI/FirstContact",
+        14,
+        "installation-token",
+    ) is False
+
+    assert calls == [
+        "/repos/DEAMBROGGI/FirstContact/pulls/13/merge",
+        "/repos/DEAMBROGGI/FirstContact/pulls/14/merge",
+    ]
