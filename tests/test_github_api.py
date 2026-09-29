@@ -589,10 +589,9 @@ def test_sub_issue_link_is_idempotent_and_uses_issue_database_id():
         assert request.method == "POST"
         assert request.url.path.endswith("/issues/10/sub_issues")
         assert json.loads(request.content.decode("utf-8")) == {"sub_issue_id": 10100}
-        return httpx.Response(
-            201,
-            json={"id": 10100, "number": 101, "state": "open", "body": ""},
-        )
+        # GitHub's write response is not authoritative for the child identity.
+        # The gateway must prove the relationship by listing sub-issues again.
+        return httpx.Response(201, json={"id": 99999, "number": 10})
 
     github = GitHubRepositoryGateway(
         api_url="https://api.github.test",
@@ -601,7 +600,52 @@ def test_sub_issue_link_is_idempotent_and_uses_issue_database_id():
     github.ensure_sub_issue("DEAMBROGGI/FirstContact-ControlPlane", 10, 10100, "token")
     github.ensure_sub_issue("DEAMBROGGI/FirstContact-ControlPlane", 10, 10100, "token")
 
-    assert [method for method, _path in calls] == ["GET", "POST", "GET"]
+    assert [method for method, _path in calls] == [
+        "GET",
+        "POST",
+        "GET",
+        "GET",
+    ]
+
+
+def test_sub_issue_link_recovers_uncertain_write_from_readback():
+    calls = []
+    linked = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal linked
+        calls.append((request.method, request.url.path))
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json=(
+                    [{"id": 10100, "number": 101}]
+                    if linked
+                    else []
+                ),
+            )
+        assert request.method == "POST"
+        assert json.loads(request.content.decode("utf-8")) == {"sub_issue_id": 10100}
+        linked = True
+        return httpx.Response(502, json={"message": "response lost after mutation"})
+
+    github = GitHubRepositoryGateway(
+        api_url="https://api.github.test",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    github.ensure_sub_issue(
+        "DEAMBROGGI/FirstContact-ControlPlane",
+        10,
+        10100,
+        "token",
+    )
+
+    assert [method for method, _path in calls] == [
+        "GET",
+        "POST",
+        "GET",
+    ]
 
 
 def test_sub_issue_link_fails_closed_on_malformed_listing():
