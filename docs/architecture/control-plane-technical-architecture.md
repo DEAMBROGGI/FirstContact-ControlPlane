@@ -604,7 +604,9 @@ La arquitectura queda apta para integrar otra API solo cuando:
 
 Once a Publication is `READY_TO_MERGE`, Plane owns the final write boundary.
 The merge command must re-read the canonical PR, verify repository/PR/base/head
-identity, and send GitHub the exact governed HEAD as the expected merge SHA.
+identity, re-read the base ref, require it to equal the admitted candidate
+`base_sha`, and only then send GitHub the exact governed HEAD as the expected
+merge SHA.
 GitHub's response is evidence only after a second readback proves the PR is
 merged. Plane uses the dedicated merged-status endpoint as the authoritative
 boolean. The merge commit SHA is taken from the PR payload when available and
@@ -630,8 +632,11 @@ response, and the PR #13 dogfood case without a manual `append_event(MERGED)`.
 
 If GitHub reports an exact-head merge while Plane was not `READY_TO_MERGE`,
 the reconciler persists `MERGE_POLICY_VIOLATION` and leaves the Publication
-in its prior lifecycle state. An external merge never manufactures governed
-readiness.
+in its prior lifecycle state. That violation permanently taints the current
+Publication for governed merge: later mergeability recording cannot manufacture
+`READY_TO_MERGE`, and reconciliation cannot convert the same external merge
+into a governed `MERGED` receipt. Recovery requires an explicit new governed
+Publication rather than laundering the out-of-band merge.
 
 ~~~mermaid
 sequenceDiagram
