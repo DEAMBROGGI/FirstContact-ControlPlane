@@ -4,8 +4,9 @@ from fastapi.testclient import TestClient
 
 from control_plane.config import settings
 from control_plane.db import get_session
-from control_plane.main import app, get_quarantine
+from control_plane.main import app, get_merge_coordinator, get_quarantine
 from control_plane.quarantine import BASE_REF, HEAD_REF, GitCandidateQuarantine
+from control_plane.service import create_publication, get_view
 
 
 def git(repo, *args):
@@ -93,5 +94,60 @@ def test_api_creates_verified_candidate_and_keeps_publisher_disabled(
         )
         assert published.status_code == 503
         assert published.json()["detail"] == "publisher is disabled"
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_merge_endpoints_are_plane_coordinator_commands(session):
+    publication = create_publication(
+        session,
+        "DEAMBROGGI/FirstContact",
+        522,
+    )
+
+    class FakeMergeCoordinator:
+        def __init__(self):
+            self.calls = []
+
+        def merge(self, supplied_session, publication_id):
+            assert supplied_session is session
+            self.calls.append(("merge", publication_id))
+            return get_view(session, publication_id)
+
+        def reconcile(self, supplied_session, publication_id):
+            assert supplied_session is session
+            self.calls.append(("reconcile", publication_id))
+            return get_view(session, publication_id)
+
+    coordinator = FakeMergeCoordinator()
+
+    def override_session():
+        yield session
+
+    app.dependency_overrides[get_session] = override_session
+    app.dependency_overrides[get_merge_coordinator] = lambda: coordinator
+    client = TestClient(app)
+    headers = {"X-Control-Plane-Token": settings.internal_token}
+
+    try:
+        merged = client.post(
+            f"/api/v1/internal/publications/{publication.publication_id}/merge",
+            headers=headers,
+        )
+        assert merged.status_code == 200
+
+        reconciled = client.post(
+            (
+                f"/api/v1/internal/publications/{publication.publication_id}"
+                "/merge/reconcile"
+            ),
+            headers=headers,
+        )
+        assert reconciled.status_code == 200
+
+        assert coordinator.calls == [
+            ("merge", publication.publication_id),
+            ("reconcile", publication.publication_id),
+        ]
     finally:
         app.dependency_overrides.clear()
