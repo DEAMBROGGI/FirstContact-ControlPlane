@@ -39,6 +39,7 @@ class EventType(StrEnum):
     REVIEW_RECORDED = "REVIEW_RECORDED"
     MERGEABILITY_RECORDED = "MERGEABILITY_RECORDED"
     MERGED = "MERGED"
+    MERGE_POLICY_VIOLATION = "MERGE_POLICY_VIOLATION"
     PUBLICATION_SUPERSEDED = "PUBLICATION_SUPERSEDED"
 class ValidationStatus(StrEnum):
     PASS = "PASS"
@@ -100,6 +101,9 @@ class PublicationView:
     remediation_cleared_head_sha: str | None
     review_decision: ReviewDecision | None
     mergeable: bool | None
+    merge_commit_sha: str | None
+    merge_source: str | None
+    merge_policy_violation: bool
     projection: LifecycleProjection
 
 
@@ -156,6 +160,9 @@ def fold_events(
     remediation_cleared_head_sha: str | None = None
     review_decision: ReviewDecision | None = None
     mergeable: bool | None = None
+    merge_commit_sha: str | None = None
+    merge_source: str | None = None
+    merge_policy_violation = False
 
     for event in events:
         event_type = EventType(event["event_type"])
@@ -266,7 +273,21 @@ def fold_events(
             mergeable = bool(payload["mergeable"])
             state = PublicationState.READY_TO_MERGE if mergeable else PublicationState.APPROVED
         elif event_type is EventType.MERGED:
+            merge_commit_sha = (
+                str(payload["merge_commit_sha"])
+                if payload.get("merge_commit_sha") is not None
+                else merge_commit_sha
+            )
+            merge_source = (
+                str(payload["source"])
+                if payload.get("source") is not None
+                else merge_source
+            )
             state = PublicationState.MERGED
+        elif event_type is EventType.MERGE_POLICY_VIOLATION:
+            merge_policy_violation = True
+            merge_commit_sha = str(payload["merge_commit_sha"])
+            merge_source = str(payload["source"])
         elif event_type is EventType.PUBLICATION_SUPERSEDED:
             state = PublicationState.SUPERSEDED
 
@@ -295,6 +316,9 @@ def fold_events(
         remediation_cleared_head_sha=remediation_cleared_head_sha,
         review_decision=review_decision,
         mergeable=mergeable,
+        merge_commit_sha=merge_commit_sha,
+        merge_source=merge_source,
+        merge_policy_violation=merge_policy_violation,
         projection=desired_projection(state),
     )
 def _required_review_adjudication_matches(
@@ -339,6 +363,14 @@ def _required_review_adjudication_matches(
         )
 
     return False
+
+
+def _is_exact_sha(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 40
+        and all(char in "0123456789abcdef" for char in value)
+    )
 
 
 def validate_transition(
@@ -469,12 +501,50 @@ def validate_transition(
     if event_type is EventType.MERGEABILITY_RECORDED:
         if state is not PublicationState.APPROVED:
             raise DomainError("mergeability is evaluated only after approval")
+        if view.merge_policy_violation:
+            raise DomainError(
+                "merge policy violation permanently blocks governed readiness"
+            )
         if view.remote_head_sha is None or payload.get("head_sha") != view.remote_head_sha:
             raise DomainError("mergeability result is bound to a stale head")
         return
     if event_type is EventType.MERGED:
         if state is not PublicationState.READY_TO_MERGE:
             raise DomainError("merge requires READY_TO_MERGE state")
+        if view.merge_policy_violation:
+            raise DomainError(
+                "merge policy violation permanently blocks governed merge"
+            )
+        if (
+            view.remote_head_sha is None
+            or payload.get("head_sha") != view.remote_head_sha
+        ):
+            raise DomainError("merge receipt head is stale")
+        if (
+            view.pull_request_number is None
+            or payload.get("pull_request_number") != view.pull_request_number
+        ):
+            raise DomainError("merge receipt pull request is stale")
+        if not _is_exact_sha(payload.get("merge_commit_sha")):
+            raise DomainError("merge commit SHA is invalid")
+        if payload.get("source") not in {"PLANE_MERGE", "GITHUB_RECONCILE"}:
+            raise DomainError("merge receipt source is invalid")
+        return
+    if event_type is EventType.MERGE_POLICY_VIOLATION:
+        if (
+            view.remote_head_sha is None
+            or payload.get("head_sha") != view.remote_head_sha
+        ):
+            raise DomainError("merge policy violation head is stale")
+        if (
+            view.pull_request_number is None
+            or payload.get("pull_request_number") != view.pull_request_number
+        ):
+            raise DomainError("merge policy violation pull request is stale")
+        if not _is_exact_sha(payload.get("merge_commit_sha")):
+            raise DomainError("merge policy violation commit SHA is invalid")
+        if payload.get("source") != "GITHUB_RECONCILE":
+            raise DomainError("merge policy violation source is invalid")
         return
     if event_type is EventType.PUBLICATION_SUPERSEDED:
         if state in {PublicationState.MERGED, PublicationState.SUPERSEDED}:

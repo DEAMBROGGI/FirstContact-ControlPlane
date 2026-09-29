@@ -589,10 +589,9 @@ def test_sub_issue_link_is_idempotent_and_uses_issue_database_id():
         assert request.method == "POST"
         assert request.url.path.endswith("/issues/10/sub_issues")
         assert json.loads(request.content.decode("utf-8")) == {"sub_issue_id": 10100}
-        return httpx.Response(
-            201,
-            json={"id": 10100, "number": 101, "state": "open", "body": ""},
-        )
+        # GitHub's write response is not authoritative for the child identity.
+        # The gateway must prove the relationship by listing sub-issues again.
+        return httpx.Response(201, json={"id": 99999, "number": 10})
 
     github = GitHubRepositoryGateway(
         api_url="https://api.github.test",
@@ -601,7 +600,52 @@ def test_sub_issue_link_is_idempotent_and_uses_issue_database_id():
     github.ensure_sub_issue("DEAMBROGGI/FirstContact-ControlPlane", 10, 10100, "token")
     github.ensure_sub_issue("DEAMBROGGI/FirstContact-ControlPlane", 10, 10100, "token")
 
-    assert [method for method, _path in calls] == ["GET", "POST", "GET"]
+    assert [method for method, _path in calls] == [
+        "GET",
+        "POST",
+        "GET",
+        "GET",
+    ]
+
+
+def test_sub_issue_link_recovers_uncertain_write_from_readback():
+    calls = []
+    linked = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal linked
+        calls.append((request.method, request.url.path))
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json=(
+                    [{"id": 10100, "number": 101}]
+                    if linked
+                    else []
+                ),
+            )
+        assert request.method == "POST"
+        assert json.loads(request.content.decode("utf-8")) == {"sub_issue_id": 10100}
+        linked = True
+        return httpx.Response(502, json={"message": "response lost after mutation"})
+
+    github = GitHubRepositoryGateway(
+        api_url="https://api.github.test",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    github.ensure_sub_issue(
+        "DEAMBROGGI/FirstContact-ControlPlane",
+        10,
+        10100,
+        "token",
+    )
+
+    assert [method for method, _path in calls] == [
+        "GET",
+        "POST",
+        "GET",
+    ]
 
 
 def test_sub_issue_link_fails_closed_on_malformed_listing():
@@ -683,3 +727,152 @@ def test_issue_creation_and_managed_label_projection_use_bounded_routes():
     assert issue.issue_node_id == "I_issue14"
     assert set(projected.labels) == {"status:in-progress", "type:fix", "priority:P1"}
     assert [method for method, _path in calls] == ["POST", "GET", "DELETE", "POST", "GET"]
+
+
+def test_merge_pull_request_binds_expected_head_and_returns_merge_commit():
+    merge_sha = "4" * 40
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "PUT"
+        assert request.url.path == (
+            "/repos/DEAMBROGGI/FirstContact/pulls/13/merge"
+        )
+        assert request.headers["Authorization"] == "Bearer installation-token"
+        assert json.loads(request.content.decode("utf-8")) == {
+            "sha": HEAD,
+            "merge_method": "merge",
+        }
+        return httpx.Response(
+            200,
+            json={
+                "sha": merge_sha,
+                "merged": True,
+                "message": "Pull Request successfully merged",
+            },
+        )
+
+    github = GitHubRepositoryGateway(
+        api_url="https://api.github.test",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    result = github.merge_pull_request(
+        "DEAMBROGGI/FirstContact",
+        13,
+        expected_head_sha=HEAD,
+        token="installation-token",
+    )
+
+    assert result == merge_sha
+
+
+def test_pull_request_snapshot_exposes_merged_receipt():
+    merge_sha = "5" * 40
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == (
+            "/repos/DEAMBROGGI/FirstContact/pulls/13"
+        )
+        return httpx.Response(
+            200,
+            json={
+                "number": 13,
+                "state": "closed",
+                "merged": True,
+                "merge_commit_sha": merge_sha,
+                "base": {"ref": "master"},
+                "head": {
+                    "ref": "control-plane/issue-22-canonical",
+                    "sha": HEAD,
+                },
+            },
+        )
+
+    github = GitHubRepositoryGateway(
+        api_url="https://api.github.test",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    pull = github.pull_request(
+        "DEAMBROGGI/FirstContact",
+        13,
+        "installation-token",
+    )
+
+    assert pull.merged is True
+    assert pull.merge_commit_sha == merge_sha
+    assert pull.head_sha == HEAD
+
+
+def test_pull_request_merged_uses_dedicated_status_endpoint():
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        assert request.headers["Authorization"] == "Bearer installation-token"
+        if request.url.path.endswith("/pulls/13/merge"):
+            return httpx.Response(204)
+        if request.url.path.endswith("/pulls/14/merge"):
+            return httpx.Response(404, json={"message": "Not Found"})
+        raise AssertionError(f"unexpected request {request.method} {request.url}")
+
+    github = GitHubRepositoryGateway(
+        api_url="https://api.github.test",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    assert github.pull_request_merged(
+        "DEAMBROGGI/FirstContact",
+        13,
+        "installation-token",
+    ) is True
+
+    assert github.pull_request_merged(
+        "DEAMBROGGI/FirstContact",
+        14,
+        "installation-token",
+    ) is False
+
+    assert calls == [
+        "/repos/DEAMBROGGI/FirstContact/pulls/13/merge",
+        "/repos/DEAMBROGGI/FirstContact/pulls/14/merge",
+    ]
+
+
+def test_pull_request_merge_event_recovers_commit_sha():
+    merge_sha = "6" * 40
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == (
+            "/repos/DEAMBROGGI/FirstContact/issues/13/events"
+        )
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "id": 99,
+                    "event": "merged",
+                    "commit_id": merge_sha,
+                    "created_at": "2026-09-29T20:48:12Z",
+                    "actor": {"login": "DEAMBROGGI"},
+                }
+            ],
+        )
+
+    github = GitHubRepositoryGateway(
+        api_url="https://api.github.test",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    event = github.pull_request_merge_event(
+        "DEAMBROGGI/FirstContact",
+        13,
+        "installation-token",
+    )
+
+    assert event is not None
+    assert event.commit_id == merge_sha
+    assert event.actor == "DEAMBROGGI"
+    assert event.created_at == "2026-09-29T20:48:12Z"

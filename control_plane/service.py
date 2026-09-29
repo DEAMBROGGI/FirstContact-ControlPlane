@@ -653,6 +653,89 @@ def record_mergeability(
     return get_view(session, publication_id)
 
 
+def _merge_receipt_payload(
+    *,
+    head_sha: str,
+    pull_request_number: int,
+    merge_commit_sha: str,
+    source: str,
+) -> dict[str, Any]:
+    if pull_request_number <= 0:
+        raise DomainError("pull_request_number must be positive")
+    return {
+        "head_sha": _sha(head_sha, "head_sha"),
+        "pull_request_number": int(pull_request_number),
+        "merge_commit_sha": _sha(merge_commit_sha, "merge_commit_sha"),
+        "source": source,
+    }
+
+
+def record_merged(
+    session: Session,
+    publication_id: str,
+    *,
+    head_sha: str,
+    pull_request_number: int,
+    merge_commit_sha: str,
+    source: str,
+) -> PublicationView:
+    payload = _merge_receipt_payload(
+        head_sha=head_sha,
+        pull_request_number=pull_request_number,
+        merge_commit_sha=merge_commit_sha,
+        source=source,
+    )
+    view = _locked_publication_view(session, publication_id)
+    if view.state is PublicationState.MERGED:
+        merged_events = [
+            event
+            for event in load_events(session, publication_id)
+            if event["event_type"] == EventType.MERGED.value
+        ]
+        if len(merged_events) != 1 or merged_events[0]["payload"] != payload:
+            raise DomainError("merged publication receipt does not match")
+        session.commit()
+        return view
+    validate_transition(view, EventType.MERGED, payload)
+    append_event(session, publication_id, EventType.MERGED, payload)
+    session.commit()
+    return get_view(session, publication_id)
+
+
+def record_merge_policy_violation(
+    session: Session,
+    publication_id: str,
+    *,
+    head_sha: str,
+    pull_request_number: int,
+    merge_commit_sha: str,
+) -> PublicationView:
+    payload = _merge_receipt_payload(
+        head_sha=head_sha,
+        pull_request_number=pull_request_number,
+        merge_commit_sha=merge_commit_sha,
+        source="GITHUB_RECONCILE",
+    )
+    view = _locked_publication_view(session, publication_id)
+    existing = [
+        event
+        for event in load_events(session, publication_id)
+        if (
+            event["event_type"] == EventType.MERGE_POLICY_VIOLATION.value
+            and event["payload"] == payload
+        )
+    ]
+    if len(existing) > 1:
+        raise DomainError("merge policy violation receipt is duplicated")
+    if existing:
+        session.commit()
+        return view
+    validate_transition(view, EventType.MERGE_POLICY_VIOLATION, payload)
+    append_event(session, publication_id, EventType.MERGE_POLICY_VIOLATION, payload)
+    session.commit()
+    return get_view(session, publication_id)
+
+
 def list_publication_ids(session: Session) -> list[str]:
     return list(session.scalars(select(PublicationRow.id).order_by(PublicationRow.created_at.desc())))
 

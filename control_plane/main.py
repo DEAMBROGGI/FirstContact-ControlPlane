@@ -14,6 +14,7 @@ from .domain import DomainError
 from .github_api import GitHubRepositoryGateway
 from .github_app import GitHubAppTokenProvider
 from .github_review_auth import GitHubReviewTokenProvider
+from .merge import MergeCoordinator, MergeError
 from .profile_registry import all_profiles
 from .publisher import GitHubPublisher, PublicationError
 from .plane_review import (
@@ -102,6 +103,25 @@ def get_publisher(
             token_provider=token_provider,
             github=github,
             quarantine=quarantine,
+        )
+    finally:
+        token_provider.close()
+        github.close()
+
+
+def get_merge_coordinator():
+    if settings.publisher_mode != "github-app":
+        raise HTTPException(status_code=503, detail="merge coordinator is disabled")
+    token_provider = GitHubAppTokenProvider(
+        app_id=settings.github_app_id,
+        private_key_path=settings.github_app_private_key_path,
+        api_url=settings.github_api_url,
+    )
+    github = GitHubRepositoryGateway(api_url=settings.github_api_url)
+    try:
+        yield MergeCoordinator(
+            token_provider=token_provider,
+            github=github,
         )
     finally:
         token_provider.close()
@@ -419,6 +439,50 @@ def mergeability_record(publication_id: str, request: MergeabilityRequest, sessi
         raise HTTPException(status_code=404, detail="publication not found") from exc
     except DomainError as exc:
         raise _conflict(exc) from exc
+
+
+@app.post(
+    "/api/v1/internal/publications/{publication_id}/merge",
+    dependencies=[Depends(require_token)],
+)
+def merge_execute(
+    publication_id: str,
+    session: Session = Depends(get_session),
+    coordinator: MergeCoordinator = Depends(get_merge_coordinator),
+):
+    try:
+        return _payload(coordinator.merge(session, publication_id))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="publication not found") from exc
+    except DomainError as exc:
+        raise _conflict(exc) from exc
+    except MergeError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="governed merge failed closed",
+        ) from exc
+
+
+@app.post(
+    "/api/v1/internal/publications/{publication_id}/merge/reconcile",
+    dependencies=[Depends(require_token)],
+)
+def merge_reconcile(
+    publication_id: str,
+    session: Session = Depends(get_session),
+    coordinator: MergeCoordinator = Depends(get_merge_coordinator),
+):
+    try:
+        return _payload(coordinator.reconcile(session, publication_id))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="publication not found") from exc
+    except DomainError as exc:
+        raise _conflict(exc) from exc
+    except MergeError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="merge reconciliation failed closed",
+        ) from exc
 
 
 @app.post(

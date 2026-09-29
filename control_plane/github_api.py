@@ -22,6 +22,8 @@ class PullRequestSnapshot:
     base_ref: str
     head_ref: str
     head_sha: str
+    merged: bool = False
+    merge_commit_sha: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,6 +43,13 @@ class IssueCommentSnapshot:
     comment_id: int
     actor: str
     body: str
+    created_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class PullMergeEventSnapshot:
+    commit_id: str
+    actor: str | None
     created_at: str
 
 
@@ -263,12 +272,19 @@ class GitHubRepositoryGateway:
         return value
     def _pull_snapshot(self, payload: dict) -> PullRequestSnapshot:
         try:
+            merge_commit_sha = (
+                str(payload["merge_commit_sha"]).lower()
+                if payload.get("merge_commit_sha") is not None
+                else None
+            )
             snapshot = PullRequestSnapshot(
                 number=int(payload["number"]),
                 state=str(payload["state"]),
                 base_ref=str(payload["base"]["ref"]),
                 head_ref=str(payload["head"]["ref"]),
                 head_sha=str(payload["head"]["sha"]).lower(),
+                merged=bool(payload.get("merged", False)),
+                merge_commit_sha=merge_commit_sha,
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise GitHubApiError("GitHub pull request response is invalid") from exc
@@ -276,6 +292,14 @@ class GitHubRepositoryGateway:
             c not in "0123456789abcdef" for c in snapshot.head_sha
         ):
             raise GitHubApiError("GitHub pull request head SHA is invalid")
+        if snapshot.merge_commit_sha is not None and (
+            len(snapshot.merge_commit_sha) != 40
+            or any(
+                c not in "0123456789abcdef"
+                for c in snapshot.merge_commit_sha
+            )
+        ):
+            raise GitHubApiError("GitHub pull request merge commit SHA is invalid")
         return snapshot
 
     def pull_request(
@@ -292,6 +316,115 @@ class GitHubRepositoryGateway:
         )
         assert response is not None
         return self._pull_snapshot(response.json())
+
+    def pull_request_merge_event(
+        self,
+        repository: str,
+        number: int,
+        token: str,
+    ) -> PullMergeEventSnapshot | None:
+        if number <= 0:
+            raise GitHubApiError("pull request number is invalid")
+        owner, name = self._parts(repository)
+        payload = self._paginate(
+            f"{self.api_url}/repos/{owner}/{name}/issues/{number}/events",
+            token=token,
+            params={"per_page": "100"},
+        )
+        merged_events = [
+            item
+            for item in payload
+            if isinstance(item, dict) and item.get("event") == "merged"
+        ]
+        if not merged_events:
+            return None
+        if len(merged_events) != 1:
+            raise GitHubApiError("GitHub merged event is ambiguous")
+        item = merged_events[0]
+        try:
+            commit_id = str(item["commit_id"]).lower()
+            created_at = str(item["created_at"])
+            actor = (
+                str(item["actor"]["login"])
+                if item.get("actor") is not None
+                else None
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise GitHubApiError("GitHub merged event is invalid") from exc
+        if len(commit_id) != 40 or any(
+            char not in "0123456789abcdef" for char in commit_id
+        ):
+            raise GitHubApiError("GitHub merged event commit SHA is invalid")
+        if not created_at.strip():
+            raise GitHubApiError("GitHub merged event timestamp is invalid")
+        return PullMergeEventSnapshot(
+            commit_id=commit_id,
+            actor=actor,
+            created_at=created_at,
+        )
+
+    def pull_request_merged(
+        self,
+        repository: str,
+        number: int,
+        token: str,
+    ) -> bool:
+        if number <= 0:
+            raise GitHubApiError("pull request number is invalid")
+        owner, name = self._parts(repository)
+        response = self._request(
+            "GET",
+            f"{self.api_url}/repos/{owner}/{name}/pulls/{number}/merge",
+            token=token,
+            allow_404=True,
+        )
+        if response is None:
+            return False
+        if response.status_code != 204:
+            raise GitHubApiError(
+                "GitHub merged-status response is invalid"
+            )
+        return True
+
+    def merge_pull_request(
+        self,
+        repository: str,
+        number: int,
+        *,
+        expected_head_sha: str,
+        token: str,
+        merge_method: str = "merge",
+    ) -> str:
+        if number <= 0:
+            raise GitHubApiError("pull request number is invalid")
+        head = expected_head_sha.lower()
+        if len(head) != 40 or any(
+            char not in "0123456789abcdef" for char in head
+        ):
+            raise GitHubApiError("expected pull request head SHA is invalid")
+        if merge_method not in {"merge", "squash", "rebase"}:
+            raise GitHubApiError("merge method is invalid")
+        owner, name = self._parts(repository)
+        response = self._request(
+            "PUT",
+            f"{self.api_url}/repos/{owner}/{name}/pulls/{number}/merge",
+            token=token,
+            json={"sha": head, "merge_method": merge_method},
+        )
+        assert response is not None
+        try:
+            payload = response.json()
+            merged = bool(payload["merged"])
+            merge_sha = str(payload["sha"]).lower()
+        except (KeyError, TypeError, ValueError) as exc:
+            raise GitHubApiError("GitHub merge response is invalid") from exc
+        if not merged:
+            raise GitHubApiError("GitHub did not merge the pull request")
+        if len(merge_sha) != 40 or any(
+            char not in "0123456789abcdef" for char in merge_sha
+        ):
+            raise GitHubApiError("GitHub merge response SHA is invalid")
+        return merge_sha
 
     def issue(
         self,
@@ -479,19 +612,44 @@ class GitHubRepositoryGateway:
             raise GitHubApiError("GitHub sub-issue link is ambiguous")
         if sub_issue_database_id in child_ids:
             return
-        response = self._request(
-            "POST",
+        write_error: GitHubApiError | None = None
+        try:
+            self._request(
+                "POST",
+                endpoint,
+                token=token,
+                json={"sub_issue_id": sub_issue_database_id},
+            )
+        except GitHubApiError as exc:
+            # The link may have committed even if the write response was
+            # malformed or lost. The authoritative proof is the bounded
+            # sub-issue listing readback, not the POST response body.
+            write_error = exc
+
+        readback = self._paginate(
             endpoint,
             token=token,
-            json={"sub_issue_id": sub_issue_database_id},
+            params={"per_page": "100"},
         )
-        assert response is not None
-        try:
-            linked = self._issue_snapshot(response.json())
-        except (KeyError, TypeError, ValueError) as exc:
-            raise GitHubApiError("GitHub sub-issue response is invalid") from exc
-        if linked.database_id != sub_issue_database_id:
-            raise GitHubApiError("GitHub sub-issue link did not verify")
+        readback_ids: list[int] = []
+        for item in readback:
+            if not isinstance(item, dict):
+                raise GitHubApiError("GitHub sub-issue listing is invalid")
+            try:
+                child_id = int(item["id"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise GitHubApiError("GitHub sub-issue listing is invalid") from exc
+            if child_id <= 0:
+                raise GitHubApiError("GitHub sub-issue listing is invalid")
+            readback_ids.append(child_id)
+
+        if readback_ids.count(sub_issue_database_id) > 1:
+            raise GitHubApiError("GitHub sub-issue link is ambiguous")
+        if sub_issue_database_id in readback_ids:
+            return
+        if write_error is not None:
+            raise GitHubApiError("GitHub sub-issue link failed closed") from write_error
+        raise GitHubApiError("GitHub sub-issue link did not verify")
 
     def ensure_project_v2_status(
         self,

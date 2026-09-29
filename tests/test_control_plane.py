@@ -27,6 +27,7 @@ from control_plane.service import (
     mark_codex_review_unavailable,
     mark_remote_published,
     record_mergeability,
+    record_merged,
     record_review,
     record_validation,
     request_codex_review,
@@ -518,8 +519,14 @@ def test_merged_publication_rejects_successor_candidate(session):
         head_sha=view.remote_head_sha,
         mergeable=True,
     )
-    append_event(session, view.publication_id, EventType.MERGED, {})
-    session.commit()
+    record_merged(
+        session,
+        view.publication_id,
+        head_sha=view.remote_head_sha,
+        pull_request_number=view.pull_request_number,
+        merge_commit_sha="6" * 40,
+        source="PLANE_MERGE",
+    )
     assert get_view(session, view.publication_id).state is PublicationState.MERGED
     with pytest.raises(DomainError, match="MERGED publication is terminal"):
         submit_verified_candidate(session, view.publication_id, successor_source())
@@ -1196,8 +1203,14 @@ def test_merged_publication_cannot_be_superseded(session):
         head_sha=old.remote_head_sha,
         mergeable=True,
     )
-    append_event(session, old.publication_id, EventType.MERGED, {})
-    session.commit()
+    record_merged(
+        session,
+        old.publication_id,
+        head_sha=old.remote_head_sha,
+        pull_request_number=old.pull_request_number,
+        merge_commit_sha="7" * 40,
+        source="PLANE_MERGE",
+    )
     successor = raw_publication(session, old.repository, old.issue_number)
 
     with pytest.raises(DomainError, match="cannot be superseded from MERGED"):
@@ -1234,8 +1247,14 @@ def test_merged_is_inactive_for_canonical_publication_resolution(session):
         mergeable=True,
     )
     assert approved.state is PublicationState.APPROVED
-    append_event(session, original.publication_id, EventType.MERGED, {})
-    session.commit()
+    record_merged(
+        session,
+        original.publication_id,
+        head_sha=published.remote_head_sha,
+        pull_request_number=published.pull_request_number,
+        merge_commit_sha="8" * 40,
+        source="PLANE_MERGE",
+    )
     assert get_view(session, original.publication_id).state is PublicationState.MERGED
     assert ready.state is PublicationState.READY_TO_MERGE
 
