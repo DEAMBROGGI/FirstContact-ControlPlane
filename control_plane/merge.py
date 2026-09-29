@@ -47,8 +47,12 @@ class MergeCoordinator:
             raise MergeError("canonical pull request base changed")
 
     @staticmethod
-    def _verified_merge_commit(pull: PullRequestSnapshot) -> str:
-        if not pull.merged or pull.merge_commit_sha is None:
+    def _verified_merge_commit(
+        pull: PullRequestSnapshot,
+        *,
+        merged: bool,
+    ) -> str:
+        if not merged or pull.merge_commit_sha is None:
             raise MergeError("GitHub merge receipt is incomplete")
         return pull.merge_commit_sha
 
@@ -59,9 +63,18 @@ class MergeCoordinator:
         *,
         view: PublicationView,
         pull: PullRequestSnapshot,
+        token: str,
     ) -> PublicationView:
         self._verify_identity(view, pull)
-        merge_commit_sha = self._verified_merge_commit(pull)
+        merged = self.github.pull_request_merged(
+            view.repository,
+            pull.number,
+            token,
+        )
+        merge_commit_sha = self._verified_merge_commit(
+            pull,
+            merged=merged,
+        )
         assert view.pull_request_number is not None
         assert view.remote_head_sha is not None
 
@@ -119,7 +132,12 @@ class MergeCoordinator:
             raise MergeError("GitHub merge reconciliation failed closed") from exc
 
         self._verify_identity(view, pull)
-        if not pull.merged:
+        merged = self.github.pull_request_merged(
+            view.repository,
+            view.pull_request_number,
+            access.token,
+        )
+        if not merged:
             if view.state is PublicationState.MERGED:
                 raise MergeError("Plane says MERGED but GitHub does not")
             return view
@@ -128,6 +146,7 @@ class MergeCoordinator:
             publication_id,
             view=view,
             pull=pull,
+            token=access.token,
         )
 
     def merge(
@@ -161,12 +180,18 @@ class MergeCoordinator:
             )
             self._verify_identity(view, pull)
 
-            if pull.merged:
+            already_merged = self.github.pull_request_merged(
+                view.repository,
+                view.pull_request_number,
+                access.token,
+            )
+            if already_merged:
                 return self._record_reconciled_pull(
                     session,
                     publication_id,
                     view=view,
                     pull=pull,
+                    token=access.token,
                 )
             if pull.state != "open":
                 raise MergeError("canonical pull request is not open")
@@ -193,7 +218,12 @@ class MergeCoordinator:
             )
             self._verify_identity(view, readback)
 
-            if not readback.merged or readback.merge_commit_sha is None:
+            merged = self.github.pull_request_merged(
+                view.repository,
+                view.pull_request_number,
+                access.token,
+            )
+            if not merged or readback.merge_commit_sha is None:
                 if merge_error is not None:
                     raise MergeError("GitHub merge failed closed") from merge_error
                 raise MergeError("GitHub merge did not converge on readback")
