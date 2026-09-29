@@ -81,11 +81,14 @@ class MergeCoordinator:
         token: str,
     ) -> PublicationView:
         self._verify_identity(view, pull)
-        merge_event = self.github.pull_request_merge_event(
-            view.repository,
-            pull.number,
-            token,
-        )
+        try:
+            merge_event = self.github.pull_request_merge_event(
+                view.repository,
+                pull.number,
+                token,
+            )
+        except GitHubApiError as exc:
+            raise MergeError("GitHub merge receipt readback failed closed") from exc
         merge_commit_sha = self._verified_merge_commit(
             pull,
             merged=merged,
@@ -140,6 +143,7 @@ class MergeCoordinator:
                 view.repository,
                 permissions={
                     "contents": "read",
+                    "issues": "read",
                     "pull_requests": "read",
                 },
             )
@@ -194,6 +198,7 @@ class MergeCoordinator:
                 view.repository,
                 permissions={
                     "contents": "write",
+                    "issues": "read",
                     "pull_requests": "write",
                 },
             )
