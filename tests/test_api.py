@@ -44,7 +44,9 @@ def candidate_bundle(tmp_path):
 def test_api_creates_verified_candidate_and_keeps_publisher_disabled(
     session,
     tmp_path,
+    monkeypatch,
 ):
+    monkeypatch.setattr(settings, "publisher_mode", "disabled")
     def override_session():
         yield session
 
