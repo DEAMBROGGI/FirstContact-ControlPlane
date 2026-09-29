@@ -135,8 +135,12 @@ multiple packages.
    branches, and exact current head before each external action. It records
    receipts only after readback or provider confirmation.
 7. Once all finding closure evidence and thread receipts are present, the
-   Control Plane posts one work-package summary, closes the implementation
-   issue, records that closure, and appends `WORK_PACKAGE_COMPLETED`.
+   Control Plane posts one work-package summary and re-locks the Publication.
+   It appends authoritative `WORK_PACKAGE_COMPLETED` only while the exact review
+   run and remote/review head remain current. Only after that commit may the
+   orchestrator close the implementation Issue and project `Done`. A crash after
+   authoritative completion is recovered by retrying only those terminal GitHub
+   projections.
 
 Claim, implementation submission, successor verification, and completion
 reconcile the managed status label and Project #4's `Lifecycle` field. The projection vocabulary is `Ready`,
@@ -258,17 +262,23 @@ rules do not define the generic remediation package contract.
 
 ### Review/remediation safety invariants proven by dogfood
 
-- A candidate cannot be submitted while an automated review is `RUNNING`; this
-  serializes successor publication against trigger dispatch and prevents the
-  governed marker from invoking Codex on a moved PR head.
+- A candidate cannot be submitted while an automated review is `RUNNING` or while
+  any remediation package for that Publication is `VERIFYING`. Publication and
+  remediation verification acquire locks in Publication -> work-package order,
+  preventing a successor from stranding exact-head verification on an older HEAD.
+- Immediately before emitting a governed provider trigger, the broker re-reads
+  the canonical PR and verifies number, base/head refs, and exact head SHA again.
+  A direct remote PR move therefore fails before the trigger side effect.
 - Human `APPROVED` fails closed while any remediation package for the Publication
   is unfinished, even when the exact-head automated review itself reports PASS.
 - Final remediation completion re-locks the Publication and revalidates the
-  current review run and exact remote/review head before appending `DONE`.
+  current review run and exact remote/review head before appending authoritative
+  `DONE`. Terminal GitHub `Done` labels/Project state and Issue closure are
+  retryable projections performed only after that authoritative commit.
 - A rejected-only package preserves the provider `CHANGES_REQUIRED` evidence but
-  appends an explicit `REMEDIATION_CLEARED` Publication event after all GitHub
-  artifacts and issue closure are complete. That restores same-head `IN_REVIEW`
-  eligibility without fabricating a provider PASS.
+  appends an explicit same-head `REMEDIATION_CLEARED` Publication event in the
+  authoritative completion transaction. Terminal GitHub closure/projection then
+  converges from `DONE` without fabricating a provider PASS.
 - Client-controlled text that can be persisted/materialized is rejected when it
   contains the reserved `@codex` automation mention.
 - Required automated review remains fail-closed when the provider is unavailable.
@@ -276,11 +286,18 @@ rules do not define the generic remediation package contract.
   synthesized and no governed merge gate is satisfied until independent review
   evidence is available or a separately audited future override policy applies.
 
-Publication preflight recovery is compensating and append-only: if an ADMITTED
-candidate is rejected before any remote push because the configured base no
-longer matches the remote base, Plane appends `CANDIDATE_REJECTED` with
+Publication preflight recovery is compensating and append-only. The publisher
+checks the canonical base SHA at admission preflight, again at the remote write
+boundary, and again before recording `REMOTE_PUBLISHED`. If an ADMITTED
+candidate is rejected because the configured base no longer matches the remote
+base, Plane appends `CANDIDATE_REJECTED` with
 `REMOTE_BASE_MOVED_AFTER_ADMISSION` and returns the Publication to
 `VALIDATION_FAILED`. A remediation package already bound to that candidate uses
 `WORK_PACKAGE_REWORK_REQUIRED -> IN_PROGRESS` before a corrected candidate is
 submitted. Prior candidate, validation and implementation events are retained;
 no candidate identity or prior event is overwritten.
+
+Project V2 item discovery is bounded but fail-closed: reaching the configured
+100-page safety cap while GitHub still reports `hasNextPage=true` is not treated
+as authoritative absence. No add mutation is permitted until the scan proves
+that pagination is exhausted.

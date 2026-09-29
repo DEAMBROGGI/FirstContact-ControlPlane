@@ -211,6 +211,54 @@ def _source_payload(source: VerifiedCandidateSource) -> dict[str, Any]:
     }
 
 
+_REMEDIATION_STATE_EVENTS = (
+    "WORK_PACKAGE_CREATED",
+    "WORK_PACKAGE_CLAIMED",
+    "IMPLEMENTATION_SUBMITTED",
+    "SUCCESSOR_REVIEW_STARTED",
+    "REJECTED_FINDINGS_FINALIZATION_STARTED",
+    "WORK_PACKAGE_REWORK_REQUIRED",
+    "WORK_PACKAGE_COMPLETED",
+)
+_REMEDIATION_VERIFYING_EVENTS = {
+    "SUCCESSOR_REVIEW_STARTED",
+    "REJECTED_FINDINGS_FINALIZATION_STARTED",
+}
+
+
+def _assert_no_verifying_remediation(
+    session: Session,
+    publication_id: str,
+) -> None:
+    # Publication is already locked by submit_verified_candidate(). Work-package
+    # rows are then locked in deterministic id order. Verification-start paths
+    # use the same publication -> package lock order, so a candidate cannot race
+    # a package into VERIFYING after this check.
+    packages = list(
+        session.scalars(
+            select(RemediationWorkPackageRow)
+            .where(RemediationWorkPackageRow.publication_id == publication_id)
+            .order_by(RemediationWorkPackageRow.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    )
+    for package in packages:
+        latest_state_event = session.scalar(
+            select(RemediationEventRow.event_type)
+            .where(
+                RemediationEventRow.work_package_id == package.id,
+                RemediationEventRow.event_type.in_(_REMEDIATION_STATE_EVENTS),
+            )
+            .order_by(RemediationEventRow.sequence.desc())
+            .limit(1)
+        )
+        if latest_state_event in _REMEDIATION_VERIFYING_EVENTS:
+            raise DomainError(
+                "candidate cannot be submitted while remediation verification is active"
+            )
+
+
 def submit_verified_candidate(
     session: Session,
     publication_id: str,
@@ -261,6 +309,7 @@ def submit_verified_candidate(
             return view
         raise DomainError("candidate identity already belongs to another publication state")
 
+    _assert_no_verifying_remediation(session, publication_id)
     validate_transition(view, EventType.CANDIDATE_SUBMITTED, payload)
     session.add(
         CandidateRow(

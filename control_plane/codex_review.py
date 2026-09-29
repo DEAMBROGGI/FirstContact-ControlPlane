@@ -283,6 +283,12 @@ class CodexReviewBroker:
             if existing:
                 comment = existing[0]
             else:
+                trigger_pull = self.github.pull_request(
+                    locked.repository,
+                    locked.pull_request_number or 0,
+                    access.token,
+                )
+                self._verify_exact_pr(locked, trigger_pull)
                 comment = self.github.add_issue_comment(
                     locked.repository,
                     locked.pull_request_number or 0,

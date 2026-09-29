@@ -280,7 +280,7 @@ flowchart TD
 
     Q --> S{"Todos cerrados?"}
     R --> S
-    S -->|Si| T["API summary<br/>Batch DONE<br/>close fix Issue"]
+    S -->|Si| T["API summary<br/>authoritative Batch DONE<br/>then close/project fix Issue"]
     S -->|No u O| U["Batch permanece VERIFYING / REWORK_REQUIRED<br/>sin summary ni cierre"]
 ~~~
 
@@ -885,3 +885,17 @@ longer matches the remote base, Plane appends `CANDIDATE_REJECTED` with
 `WORK_PACKAGE_REWORK_REQUIRED -> IN_PROGRESS` before a corrected candidate is
 submitted. Prior candidate, validation and implementation events are retained;
 no candidate identity or prior event is overwritten.
+
+## Deep-review concurrency invariants
+
+- Candidate submission and remediation verification serialize with a deterministic
+  Publication -> work-package lock order. A Publication cannot advance while any
+  package is `VERIFYING`.
+- Publisher base identity is re-read at the remote write boundary and again before
+  `REMOTE_PUBLISHED`; a moved base cannot become authoritative publication evidence.
+- `WORK_PACKAGE_COMPLETED` is authoritative. GitHub Issue closure, managed `Done`
+  labels, and Project `Done` are retryable projections that occur only afterward.
+- Project V2 bounded scans fail closed if the page cap is reached with unread pages;
+  incomplete observation never authorizes `addProjectV2ItemById`.
+- Codex/provider trigger dispatch performs a final canonical PR exact-head readback
+  immediately before posting the reserved trigger comment.

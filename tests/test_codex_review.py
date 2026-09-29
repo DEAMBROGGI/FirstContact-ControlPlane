@@ -114,6 +114,7 @@ class FakeGitHub:
         self.authenticated_login = "DEAMBROGGI"
         self.authenticated_user_requests = 0
         self.pull_request_requests = 0
+        self.pull_head_sequence = []
         self.issue_comment_list_requests = 0
 
     def authenticated_user_login(self, token):
@@ -126,12 +127,17 @@ class FakeGitHub:
         assert repository == "DEAMBROGGI/FirstContact"
         assert number == 44
         assert token == "review-token"
+        head_sha = (
+            self.pull_head_sequence.pop(0)
+            if self.pull_head_sequence
+            else self.head_sha
+        )
         return PullRequestSnapshot(
             number=44,
             state="open",
             base_ref="master",
             head_ref="control-plane/issue-88-abcd1234",
-            head_sha=self.head_sha,
+            head_sha=head_sha,
         )
 
     def list_issue_comments(self, repository, number, token):
@@ -746,6 +752,22 @@ def test_stale_pr_head_fails_before_review_lock(session):
         value.request(session, view.publication_id)
 
     assert get_view(session, view.publication_id).automated_review_status is None
+
+
+def test_remote_pr_move_after_review_run_creation_blocks_trigger_comment(session):
+    view = published_publication(session)
+    github = FakeGitHub()
+    github.pull_head_sequence = [HEAD, "4" * 40]
+    value, _tokens, _github = broker(github=github)
+
+    with pytest.raises(CodexReviewError, match="failed closed"):
+        value.request(session, view.publication_id)
+
+    assert github.pull_request_requests == 2
+    assert github.posted_bodies == []
+    latest = get_view(session, view.publication_id)
+    assert latest.automated_review_status is AutomatedReviewStatus.UNAVAILABLE
+    assert latest.automated_review_trigger_comment_id is None
 
 
 def test_disabled_mode_never_invokes_github(session):

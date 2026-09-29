@@ -405,6 +405,78 @@ def test_project_v2_projection_adds_issue_and_sets_lifecycle_field():
     assert len(calls) == 4
 
 
+def test_project_v2_pagination_cap_fails_closed_without_add_mutation():
+    item_pages = 0
+    add_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal item_pages, add_calls
+        body = json.loads(request.content.decode("utf-8"))
+        query = body["query"]
+        if "projectV2(number: $number)" in query:
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "repositoryOwner": {
+                            "__typename": "User",
+                            "projectV2": {
+                                "id": "PVT_project4",
+                                "fields": {
+                                    "nodes": [{
+                                        "__typename": "ProjectV2SingleSelectField",
+                                        "id": "PVTSSF_lifecycle",
+                                        "name": "Lifecycle",
+                                        "options": [{"id": "opt_review", "name": "Review"}],
+                                    }]
+                                },
+                            },
+                        }
+                    }
+                },
+            )
+        if "items(first: 100" in query:
+            item_pages += 1
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "node": {
+                            "items": {
+                                "nodes": [],
+                                "pageInfo": {
+                                    "endCursor": f"cursor-{item_pages}",
+                                    "hasNextPage": True,
+                                },
+                            }
+                        }
+                    }
+                },
+            )
+        if "addProjectV2ItemById" in query:
+            add_calls += 1
+            return httpx.Response(500, json={"message": "must not mutate"})
+        raise AssertionError(query)
+
+    github = GitHubRepositoryGateway(
+        api_url="https://api.github.test",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    with pytest.raises(GitHubApiError, match="pagination safety cap"):
+        github.ensure_project_v2_status(
+            "DEAMBROGGI/FirstContact-ControlPlane",
+            "I_issue14",
+            project_number=4,
+            field_name="Lifecycle",
+            status="Review",
+            project_token="dedicated-project-token",
+        )
+
+    assert item_pages == 100
+    assert add_calls == 0
+
+
 def test_project_v2_retry_recovers_lost_add_response_without_duplicate_item():
     calls = []
     items = []

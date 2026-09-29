@@ -375,6 +375,21 @@ class GitHubPublisher:
                             "canonical pull request head does not match governed publication"
                         )
 
+            if view.state is PublicationState.ADMITTED:
+                remote_base_before_write = self.github.ref_sha(
+                    view.repository, base_branch, token
+                )
+                if remote_base_before_write != candidate.base_sha:
+                    reject_admitted_candidate(
+                        session,
+                        publication_id,
+                        candidate_id=candidate.candidate_id,
+                        reason="REMOTE_BASE_MOVED_AFTER_ADMISSION",
+                    )
+                    raise PublicationError(
+                        "remote base moved at publication write boundary"
+                    )
+
             if target_before is None:
                 self.git_push.push_governed_head(
                     repo_path=self.quarantine.repo_path(source.quarantine_id),
@@ -439,6 +454,24 @@ class GitHubPublisher:
                 )
         except (GitHubAuthError, GitHubApiError, CandidateQuarantineError) as exc:
             raise PublicationError("GitHub publication failed closed") from exc
+
+        if view.state is PublicationState.ADMITTED:
+            try:
+                remote_base_after_write = self.github.ref_sha(
+                    view.repository, base_branch, token
+                )
+            except GitHubApiError as exc:
+                raise PublicationError("GitHub publication failed closed") from exc
+            if remote_base_after_write != candidate.base_sha:
+                reject_admitted_candidate(
+                    session,
+                    publication_id,
+                    candidate_id=candidate.candidate_id,
+                    reason="REMOTE_BASE_MOVED_AFTER_ADMISSION",
+                )
+                raise PublicationError(
+                    "remote base moved before publication authority was recorded"
+                )
 
         if view.state is PublicationState.IN_REVIEW:
             if view.remote_head_sha != candidate.head_sha:

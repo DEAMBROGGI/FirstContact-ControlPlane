@@ -94,6 +94,7 @@ class FakeTokenProvider:
 class FakeGateway:
     def __init__(self, *, base_sha, head_sha):
         self.base_sha = base_sha
+        self.base_sha_reads = []
         self.head_sha = head_sha
         self.target_sha = None
         self.pull_number = 31
@@ -115,6 +116,8 @@ class FakeGateway:
     def ref_sha(self, repository, branch, token):
         assert token == "installation-secret"
         if branch == "master":
+            if self.base_sha_reads:
+                return self.base_sha_reads.pop(0)
             return self.base_sha
         if self.target_sha_reads:
             return self.target_sha_reads.pop(0)
@@ -331,6 +334,31 @@ def test_stale_remote_base_fails_before_push(session, tmp_path):
         "candidate_id": view.current_candidate.candidate_id,
         "reason": "REMOTE_BASE_MOVED_AFTER_ADMISSION",
     }
+
+def test_remote_base_change_after_preflight_fails_before_governed_push(session, tmp_path):
+    view, quarantine, source = admitted_publication(session, tmp_path)
+    gateway = FakeGateway(
+        base_sha=view.current_candidate.base_sha,
+        head_sha=view.current_candidate.head_sha,
+    )
+    gateway.base_sha_reads = [
+        view.current_candidate.base_sha,
+        "f" * 40,
+    ]
+    publisher, _gateway, push = publisher_for(
+        view,
+        quarantine,
+        source,
+        gateway=gateway,
+    )
+
+    with pytest.raises(PublicationError, match="write boundary"):
+        publisher.publish(session, view.publication_id)
+
+    assert push.calls == 0
+    assert get_view(session, view.publication_id).state is PublicationState.VALIDATION_FAILED
+    assert remote_published_events(session, view.publication_id) == []
+
 
 def test_branch_collision_fails_closed(session, tmp_path):
     view, quarantine, source = admitted_publication(session, tmp_path)

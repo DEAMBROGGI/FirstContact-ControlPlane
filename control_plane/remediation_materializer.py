@@ -575,21 +575,88 @@ class GitHubRemediationMaterializer:
             ),
         )
 
+    def _ensure_terminal_done_projection(
+        self,
+        session: Session,
+        view: RemediationWorkPackageView,
+        *,
+        access,
+    ) -> RemediationWorkPackageView:
+        if view.state is not WorkPackageState.DONE:
+            raise DomainError("terminal projection requires authoritative DONE state")
+        if view.implementation_issue_number is None:
+            raise RemediationMaterializationError(
+                "work package has no linked implementation issue"
+            )
+
+        if not view.issue_closed:
+            lease_id = str(uuid.uuid4())
+            artifact_key = "implementation-issue:close"
+            if not claim_github_artifact_dispatch(
+                session,
+                view.work_package_id,
+                artifact_key=artifact_key,
+                lease_id=lease_id,
+            ):
+                return get_work_package(session, view.work_package_id)
+            try:
+                closed = self.github.close_issue(
+                    view.repository,
+                    view.implementation_issue_number,
+                    access.token,
+                )
+                if closed.number != view.implementation_issue_number:
+                    raise RemediationMaterializationError(
+                        "closed implementation issue identity changed"
+                    )
+                record_issue_closed(
+                    session,
+                    view.work_package_id,
+                    idempotency_key="github:implementation-issue:close",
+                )
+            finally:
+                release_github_artifact_dispatch(
+                    session,
+                    view.work_package_id,
+                    artifact_key=artifact_key,
+                    lease_id=lease_id,
+                )
+            view = get_work_package(session, view.work_package_id)
+
+        issue = self.github.issue(
+            view.repository,
+            view.implementation_issue_number,
+            access.token,
+        )
+        if issue.issue_node_id is None:
+            raise RemediationMaterializationError(
+                "implementation issue has no GitHub node id"
+            )
+        self.github.ensure_issue_labels(
+            view.repository,
+            view.implementation_issue_number,
+            self._desired_labels(view),
+            access.token,
+        )
+        self._project(view, issue.issue_node_id)
+        return get_work_package(session, view.work_package_id)
+
+
     def materialize(
         self,
         session: Session,
         work_package_id: str,
     ) -> RemediationWorkPackageView:
         view = get_work_package(session, work_package_id)
-        if view.state is WorkPackageState.DONE:
-            return view
         if view.implementation_issue_number is None:
             raise DomainError("implementation issue must be linked before materialization")
         if self.project_number is None:
             raise RemediationMaterializationError(
                 "remediation Project V2 number is not configured"
             )
-        if view.state is not WorkPackageState.VERIFYING or not self._closure_ready(view):
+        if view.state is not WorkPackageState.DONE and (
+            view.state is not WorkPackageState.VERIFYING or not self._closure_ready(view)
+        ):
             raise DomainError(
                 "all accepted findings require successor verification before materialization"
             )
@@ -598,6 +665,12 @@ class GitHubRemediationMaterializer:
                 view.repository,
                 permissions={"issues": "write", "pull_requests": "write"},
             )
+            if view.state is WorkPackageState.DONE:
+                return self._ensure_terminal_done_projection(
+                    session,
+                    view,
+                    access=access,
+                )
             bot_login = self.token_provider.bot_login()
             for initial_finding in view.findings:
                 finding = next(
@@ -688,7 +761,7 @@ class GitHubRemediationMaterializer:
                                 f"{view.reviewed_head_sha}; no code remediation was required."
                             )
                         body = (
-                            f"Implementation and verification completed for work package "
+                            f"Implementation and verification are ready for authoritative completion for work package "
                             f"{work_package_id}. {evidence} Closed findings: {findings}.\n\n"
                             f"{marker}"
                         )
@@ -716,69 +789,15 @@ class GitHubRemediationMaterializer:
                         lease_id=lease_id,
                     )
 
-            view = get_work_package(session, work_package_id)
-            if not view.issue_closed:
-                lease_id = str(uuid.uuid4())
-                artifact_key = "implementation-issue:close"
-                if not claim_github_artifact_dispatch(
-                    session,
-                    work_package_id,
-                    artifact_key=artifact_key,
-                    lease_id=lease_id,
-                ):
-                    return get_work_package(session, work_package_id)
-                try:
-                    self._verify_current_head(session, view, access.token)
-                    closed = self.github.close_issue(
-                        view.repository,
-                        view.implementation_issue_number,
-                        access.token,
-                    )
-                    if closed.number != view.implementation_issue_number:
-                        raise RemediationMaterializationError(
-                            "closed implementation issue identity changed"
-                        )
-                    record_issue_closed(
-                        session,
-                        work_package_id,
-                        idempotency_key="github:implementation-issue:close",
-                    )
-                finally:
-                    release_github_artifact_dispatch(
-                        session,
-                        work_package_id,
-                        artifact_key=artifact_key,
-                        lease_id=lease_id,
-                    )
-
-            if view.implementation_issue_number is None:
-                raise RemediationMaterializationError(
-                    "work package has no linked implementation issue"
-                )
-            issue = self.github.issue(
-                view.repository,
-                view.implementation_issue_number,
-                access.token,
-            )
-            if issue.issue_node_id is None:
-                raise RemediationMaterializationError(
-                    "implementation issue has no GitHub node id"
-                )
-            self.github.ensure_issue_labels(
-                view.repository,
-                view.implementation_issue_number,
-                self._desired_labels(view, finalizing_done=True),
-                access.token,
-            )
-            self._project(
-                view,
-                issue.issue_node_id,
-                finalizing_done=True,
-            )
-            return complete_work_package(
+            completed = complete_work_package(
                 session,
                 work_package_id,
                 idempotency_key="github:work-package:done",
+            )
+            return self._ensure_terminal_done_projection(
+                session,
+                completed,
+                access=access,
             )
         except (GitHubApiError, GitHubAuthError, DomainError) as exc:
             raise RemediationMaterializationError(

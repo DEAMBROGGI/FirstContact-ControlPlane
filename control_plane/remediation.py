@@ -173,6 +173,24 @@ def _lock_work_package(session: Session, work_package_id: str) -> RemediationWor
     return row
 
 
+def _lock_publication_then_work_package(
+    session: Session,
+    work_package_id: str,
+) -> RemediationWorkPackageRow:
+    seed = session.get(RemediationWorkPackageRow, work_package_id)
+    if seed is None:
+        raise KeyError(work_package_id)
+    publication = session.scalar(
+        select(PublicationRow)
+        .where(PublicationRow.id == seed.publication_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if publication is None:
+        raise KeyError(seed.publication_id)
+    return _lock_work_package(session, work_package_id)
+
+
 def _append(
     session: Session,
     row: RemediationWorkPackageRow,
@@ -888,7 +906,7 @@ def begin_successor_verification(
     head_sha: str,
     idempotency_key: str,
 ) -> RemediationWorkPackageView:
-    row = _lock_work_package(session, work_package_id)
+    row = _lock_publication_then_work_package(session, work_package_id)
     payload = {"review_run_id": review_run_id, "head_sha": head_sha.lower()}
     duplicate = _command_duplicate(
         session,
@@ -940,7 +958,7 @@ def begin_rejected_findings_finalization(
     *,
     idempotency_key: str,
 ) -> RemediationWorkPackageView:
-    row = _lock_work_package(session, work_package_id)
+    row = _lock_publication_then_work_package(session, work_package_id)
     payload = {
         "review_run_id": row.review_run_id,
         "head_sha": row.reviewed_head_sha,
@@ -1216,11 +1234,11 @@ def record_issue_closed(
     row = _lock_work_package(session, work_package_id)
     view = get_work_package(session, work_package_id)
     if (
-        view.state is not WorkPackageState.VERIFYING
+        view.state not in {WorkPackageState.VERIFYING, WorkPackageState.DONE}
         or view.summary_comment_id is None
         or view.implementation_issue_number is None
     ):
-        raise DomainError("implementation issue cannot close before the summary comment")
+        raise DomainError("implementation issue cannot close before authoritative completion readiness")
     payload: dict[str, Any] = {"issue_number": view.implementation_issue_number}
     duplicate = _command_duplicate(
         session,
@@ -1249,7 +1267,7 @@ def complete_work_package(
     *,
     idempotency_key: str,
 ) -> RemediationWorkPackageView:
-    row = _lock_work_package(session, work_package_id)
+    row = _lock_publication_then_work_package(session, work_package_id)
     view = get_work_package(session, work_package_id)
     payload: dict[str, Any] = {"implementation_issue_number": view.implementation_issue_number}
     duplicate = _command_duplicate(
@@ -1264,8 +1282,8 @@ def complete_work_package(
     if view.state is WorkPackageState.DONE:
         session.commit()
         return view
-    if view.state is not WorkPackageState.VERIFYING or not view.issue_closed:
-        raise DomainError("work package can only complete after verification and issue closure")
+    if view.state is not WorkPackageState.VERIFYING:
+        raise DomainError("work package can only complete after verification")
     if view.summary_comment_id is None or any(
         finding["closure_state"] not in {"VERIFIED_ABSENT", "REJECTED_BY_PRINCIPAL"}
         or any(value not in {"MATERIALIZED", "NOT_APPLICABLE"} for value in finding["materialization"].values())
@@ -1273,13 +1291,6 @@ def complete_work_package(
     ):
         raise DomainError("work package findings are not fully closed")
 
-    publication_row = session.scalar(
-        select(PublicationRow)
-        .where(PublicationRow.id == row.publication_id)
-        .with_for_update()
-    )
-    if publication_row is None:
-        raise KeyError(row.publication_id)
     publication = get_view(session, row.publication_id)
     expected_run_id = view.successor_review_run_id or row.review_run_id
     expected_head_sha = view.successor_head_sha or row.reviewed_head_sha

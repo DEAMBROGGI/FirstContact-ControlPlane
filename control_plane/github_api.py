@@ -632,6 +632,7 @@ class GitHubRepositoryGateway:
         """
         item_id = None
         cursor = None
+        pagination_exhausted = False
         for _page in range(100):
             item_data = graphql(item_query, {"projectId": project_id, "after": cursor})
             connection = item_data.get("node", {}).get("items") or {}
@@ -652,6 +653,12 @@ class GitHubRepositoryGateway:
             cursor = page_info.get("endCursor")
             if not cursor:
                 raise GitHubApiError("Project V2 item cursor is missing")
+            if _page == 99:
+                pagination_exhausted = True
+        if pagination_exhausted and not item_id:
+            raise GitHubApiError(
+                "Project V2 item pagination safety cap was exhausted"
+            )
         if not item_id:
             add_query = """
             mutation($projectId: ID!, $contentId: ID!) {

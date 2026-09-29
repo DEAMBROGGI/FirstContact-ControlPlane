@@ -350,6 +350,26 @@ class FakeRemediationTokenProvider:
         return "firstcontact-control-plane[bot]"
 
 
+def test_candidate_submission_is_blocked_while_remediation_is_verifying(session):
+    view, package, _source_run, _successor_run = prepare_verifying_package(session)
+    before = get_view(session, view.publication_id)
+    assert get_work_package(session, package.work_package_id).state is WorkPackageState.VERIFYING
+
+    with pytest.raises(
+        DomainError,
+        match="remediation verification is active",
+    ):
+        submit_verified_candidate(
+            session,
+            view.publication_id,
+            source("6" * 40, "7" * 40, "c"),
+        )
+
+    after = get_view(session, view.publication_id)
+    assert after.current_candidate == before.current_candidate
+    assert get_work_package(session, package.work_package_id).state is WorkPackageState.VERIFYING
+
+
 def test_project_v2_uses_separate_secret_and_fails_closed_when_missing(session):
     view, _source_run, package = create_package(session)
     github = FakeRemediationGitHub(view)
@@ -472,6 +492,7 @@ class FakeRemediationGitHub:
         self.resolve_calls = 0
         self.issue_state = "open"
         self.close_calls = 0
+        self.fail_close_once = False
         self.drop_issue_response = False
         self.created_issues = []
         self.issue_labels = set()
@@ -567,6 +588,9 @@ class FakeRemediationGitHub:
 
     def close_issue(self, repository, issue_number, token):
         self.close_calls += 1
+        if self.fail_close_once:
+            self.fail_close_once = False
+            raise GitHubApiError("close response unavailable")
         self.issue_state = "closed"
         return IssueSnapshot(number=issue_number, state="closed", body="")
 
@@ -637,6 +661,72 @@ class FakeRemediationGitHub:
         self.project_tokens.append(project_token)
         self.project_statuses.append((issue_node_id, status))
         return "PVTI_item"
+
+
+def test_terminal_projection_happens_only_after_authoritative_done(
+    session,
+    monkeypatch,
+):
+    view, package, _source_run, _successor_run = prepare_verifying_package(session)
+    github = FakeRemediationGitHub(view)
+    github.head_sha = get_work_package(session, package.work_package_id).successor_head_sha
+    github.drop_reaction_response = False
+    github.drop_reply_response = False
+    github.drop_summary_response = False
+    materializer = GitHubRemediationMaterializer(
+        token_provider=FakeRemediationTokenProvider(),
+        github=github,
+        project_token=SecretStr("project-user-token"),
+        review_thread_token=SecretStr("review-user-token"),
+    )
+
+    import control_plane.remediation_materializer as materializer_module
+
+    def reject_completion(*_args, **_kwargs):
+        raise DomainError("authoritative completion rejected")
+
+    monkeypatch.setattr(materializer_module, "complete_work_package", reject_completion)
+
+    with pytest.raises(RemediationMaterializationError):
+        materializer.materialize(session, package.work_package_id)
+
+    assert get_work_package(session, package.work_package_id).state is WorkPackageState.VERIFYING
+    assert github.issue_state == "open"
+    assert github.close_calls == 0
+    assert not any(status == "Done" for _item, status in github.project_statuses)
+    assert "status:done" not in github.issue_labels
+
+
+def test_done_projection_recovers_after_crash_following_authoritative_completion(session):
+    view, package, _source_run, _successor_run = prepare_verifying_package(session)
+    github = FakeRemediationGitHub(view)
+    github.head_sha = get_work_package(session, package.work_package_id).successor_head_sha
+    github.drop_reaction_response = False
+    github.drop_reply_response = False
+    github.drop_summary_response = False
+    github.fail_close_once = True
+    materializer = GitHubRemediationMaterializer(
+        token_provider=FakeRemediationTokenProvider(),
+        github=github,
+        project_token=SecretStr("project-user-token"),
+        review_thread_token=SecretStr("review-user-token"),
+    )
+
+    with pytest.raises(RemediationMaterializationError):
+        materializer.materialize(session, package.work_package_id)
+
+    authoritative = get_work_package(session, package.work_package_id)
+    assert authoritative.state is WorkPackageState.DONE
+    assert authoritative.issue_closed is False
+    assert github.issue_state == "open"
+    assert not any(status == "Done" for _item, status in github.project_statuses)
+
+    converged = materializer.materialize(session, package.work_package_id)
+    assert converged.state is WorkPackageState.DONE
+    assert converged.issue_closed is True
+    assert github.issue_state == "closed"
+    assert github.project_statuses[-1] == ("I_kwDO_issue14", "Done")
+    assert "status:done" in github.issue_labels
 
 
 def test_materializer_recovers_lost_responses_without_duplicate_artifacts(session):
@@ -1018,7 +1108,7 @@ def test_human_approval_is_blocked_while_required_remediation_is_unfinished(sess
         )
 
 
-def test_work_package_completion_rechecks_current_review_and_head_under_lock(session):
+def test_verifying_package_prevents_successor_from_making_completion_stale(session):
     view, package, _source_run, _successor_run = prepare_verifying_package(session)
     for artifact, remote_id in (("reaction", 701), ("reply", 702), ("resolution", "PRRT_stale")):
         record_github_artifact(
@@ -1035,25 +1125,21 @@ def test_work_package_completion_rechecks_current_review_and_head_under_lock(ses
         comment_id=703,
         idempotency_key="stale-summary",
     )
-    record_issue_closed(
+
+    with pytest.raises(DomainError, match="remediation verification is active"):
+        submit_verified_candidate(
+            session,
+            view.publication_id,
+            source("6" * 40, "7" * 40, "c"),
+        )
+
+    completed = complete_work_package(
         session,
         package.work_package_id,
-        idempotency_key="stale-issue-close",
+        idempotency_key="protected-done",
     )
-
-    submit_verified_candidate(
-        session,
-        view.publication_id,
-        source("6" * 40, "7" * 40, "c"),
-    )
-
-    with pytest.raises(DomainError, match="completion is stale"):
-        complete_work_package(
-            session,
-            package.work_package_id,
-            idempotency_key="stale-done",
-        )
-    assert get_work_package(session, package.work_package_id).state is WorkPackageState.VERIFYING
+    assert completed.state is WorkPackageState.DONE
+    assert get_view(session, view.publication_id).remote_head_sha == completed.successor_head_sha
 
 
 def test_ready_work_package_persists_exact_review_decisions_and_is_idempotent(session):
