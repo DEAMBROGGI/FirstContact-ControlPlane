@@ -316,6 +316,12 @@ This applies to Codex trigger dispatch and remediation artifact dispatch. Recove
 workers may reclaim expired leases, but stale workers fail before mutation and may
 not mark an active replacement dispatch unavailable.
 
+A trigger POST with an uncertain transport result is recovered under the same
+fence before any unavailable outcome is appended. Plane re-reads issue comments
+for the exact run/head marker and authorized trigger actor. Exactly one match is
+recorded as the durable receipt; zero/unreadable/ambiguous evidence leaves the run
+RUNNING and retryable instead of treating a lost response as provider failure.
+
 ### Post-write publication compensation
 
 If the canonical base moves after the final pre-write read but before the governed

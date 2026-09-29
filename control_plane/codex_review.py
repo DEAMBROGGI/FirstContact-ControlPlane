@@ -174,6 +174,7 @@ class CodexReviewBroker:
 
         lease_id: str | None = None
         run_id: str | None = None
+        uncertain_trigger_write = False
         try:
             access = self._review_access(view.repository)
             pull = self.github.pull_request(
@@ -298,12 +299,38 @@ class CodexReviewBroker:
                     access.token,
                 )
                 self._verify_exact_pr(locked, trigger_pull)
-                comment = self.github.add_issue_comment(
-                    locked.repository,
-                    locked.pull_request_number or 0,
-                    self._trigger_body(run_id, locked.remote_head_sha or ""),
-                    trigger_access.token,
-                )
+                try:
+                    comment = self.github.add_issue_comment(
+                        locked.repository,
+                        locked.pull_request_number or 0,
+                        self._trigger_body(run_id, locked.remote_head_sha or ""),
+                        trigger_access.token,
+                    )
+                except GitHubApiError:
+                    uncertain_trigger_write = True
+                    recovered_comments = self.github.list_issue_comments(
+                        locked.repository,
+                        locked.pull_request_number or 0,
+                        access.token,
+                    )
+                    recovered = [
+                        item for item in recovered_comments if marker in item.body
+                    ]
+                    if any(
+                        _actor_key(item.actor) != _actor_key(trigger_access.login)
+                        for item in recovered
+                    ):
+                        raise CodexReviewError(
+                            "uncertain Codex trigger was emitted by an unexpected actor"
+                        )
+                    if len(recovered) > 1:
+                        raise CodexReviewError(
+                            "multiple Codex trigger comments exist after uncertain write"
+                        )
+                    if not recovered:
+                        raise
+                    comment = recovered[0]
+                    uncertain_trigger_write = False
                 if _actor_key(comment.actor) != _actor_key(trigger_access.login):
                     raise CodexReviewError(
                         "Codex trigger comment actor does not match authorized user"
@@ -341,6 +368,7 @@ class CodexReviewBroker:
                     latest,
                     latest.remote_head_sha or "",
                 )
+                and not uncertain_trigger_write
             ):
                 mark_codex_review_unavailable(
                     session,

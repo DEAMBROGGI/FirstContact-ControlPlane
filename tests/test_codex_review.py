@@ -22,6 +22,7 @@ from control_plane.domain import (
     ValidationStatus,
 )
 from control_plane.github_api import (
+    GitHubApiError,
     IssueCommentSnapshot,
     IssueReactionSnapshot,
     PullRequestSnapshot,
@@ -117,6 +118,7 @@ class FakeGitHub:
         self.pull_request_requests = 0
         self.pull_head_sequence = []
         self.issue_comment_list_requests = 0
+        self.raise_after_issue_comment_append = False
 
     def authenticated_user_login(self, token):
         self.authenticated_user_requests += 1
@@ -156,6 +158,8 @@ class FakeGitHub:
             created_at=TRIGGER_AT,
         )
         self.issue_comments.append(item)
+        if self.raise_after_issue_comment_append:
+            raise GitHubApiError("simulated lost response after accepted trigger")
         return item
 
     def list_pull_reviews(self, repository, number, token):
@@ -461,6 +465,36 @@ def test_returned_trigger_actor_mismatch_fails_closed(session):
     assert get_view(
         session, view.publication_id
     ).automated_review_status is AutomatedReviewStatus.UNAVAILABLE
+
+
+def test_lost_trigger_response_recovers_accepted_comment_without_unavailable(session):
+    view = published_publication(session)
+    github = FakeGitHub()
+    github.raise_after_issue_comment_append = True
+    value, _tokens, _github = broker(github=github)
+
+    recovered = value.request(session, view.publication_id)
+
+    assert len(github.posted_bodies) == 1
+    assert github.issue_comment_list_requests == 2
+    assert len(github.issue_comments) == 1
+    assert recovered.automated_review_status is AutomatedReviewStatus.RUNNING
+    assert recovered.automated_review_trigger_comment_id == github.issue_comments[0].comment_id
+    assert recovered.automated_review_trigger_actor == "DEAMBROGGI"
+    assert not any(
+        event["event_type"] == "CODEX_REVIEW_UNAVAILABLE"
+        for event in load_events(session, view.publication_id)
+    )
+
+    assert recovered.automated_review_run_id is not None
+    dispatch = session.get(CodexReviewDispatchRow, recovered.automated_review_run_id)
+    assert dispatch is not None
+    assert dispatch.state == "COMPLETED"
+    assert dispatch.completed_comment_id == github.issue_comments[0].comment_id
+
+    retried = value.request(session, view.publication_id)
+    assert retried.automated_review_run_id == recovered.automated_review_run_id
+    assert len(github.posted_bodies) == 1
 
 
 def test_dispatch_lease_serializes_trigger_ownership(session):

@@ -908,6 +908,11 @@ no candidate identity or prior event is overwritten.
 - Provider trigger dispatch and remediation artifact dispatch share that rule;
   takeover is allowed only before the stale owner enters the fenced mutation
   section.
+- An uncertain provider-trigger POST is not terminal evidence of unavailability.
+  Before releasing the fenced dispatch, Plane re-reads issue comments and recovers
+  exactly one authorized marker for the same run/head when GitHub accepted the
+  write but the response was lost. If readback cannot prove either outcome, the
+  run remains recoverable/RUNNING rather than being rewritten as unavailable.
 - Publication base drift detected after a successful branch push triggers exact-ref
   compensation before candidate rejection. The previous governed ref is restored
   (or the initial ref removed) only while the remote ref still equals the rejected
