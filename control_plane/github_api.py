@@ -22,6 +22,8 @@ class PullRequestSnapshot:
     base_ref: str
     head_ref: str
     head_sha: str
+    merged: bool = False
+    merge_commit_sha: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -263,12 +265,19 @@ class GitHubRepositoryGateway:
         return value
     def _pull_snapshot(self, payload: dict) -> PullRequestSnapshot:
         try:
+            merge_commit_sha = (
+                str(payload["merge_commit_sha"]).lower()
+                if payload.get("merge_commit_sha") is not None
+                else None
+            )
             snapshot = PullRequestSnapshot(
                 number=int(payload["number"]),
                 state=str(payload["state"]),
                 base_ref=str(payload["base"]["ref"]),
                 head_ref=str(payload["head"]["ref"]),
                 head_sha=str(payload["head"]["sha"]).lower(),
+                merged=bool(payload.get("merged", False)),
+                merge_commit_sha=merge_commit_sha,
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise GitHubApiError("GitHub pull request response is invalid") from exc
@@ -276,6 +285,14 @@ class GitHubRepositoryGateway:
             c not in "0123456789abcdef" for c in snapshot.head_sha
         ):
             raise GitHubApiError("GitHub pull request head SHA is invalid")
+        if snapshot.merge_commit_sha is not None and (
+            len(snapshot.merge_commit_sha) != 40
+            or any(
+                c not in "0123456789abcdef"
+                for c in snapshot.merge_commit_sha
+            )
+        ):
+            raise GitHubApiError("GitHub pull request merge commit SHA is invalid")
         return snapshot
 
     def pull_request(
@@ -292,6 +309,46 @@ class GitHubRepositoryGateway:
         )
         assert response is not None
         return self._pull_snapshot(response.json())
+
+    def merge_pull_request(
+        self,
+        repository: str,
+        number: int,
+        *,
+        expected_head_sha: str,
+        token: str,
+        merge_method: str = "merge",
+    ) -> str:
+        if number <= 0:
+            raise GitHubApiError("pull request number is invalid")
+        head = expected_head_sha.lower()
+        if len(head) != 40 or any(
+            char not in "0123456789abcdef" for char in head
+        ):
+            raise GitHubApiError("expected pull request head SHA is invalid")
+        if merge_method not in {"merge", "squash", "rebase"}:
+            raise GitHubApiError("merge method is invalid")
+        owner, name = self._parts(repository)
+        response = self._request(
+            "PUT",
+            f"{self.api_url}/repos/{owner}/{name}/pulls/{number}/merge",
+            token=token,
+            json={"sha": head, "merge_method": merge_method},
+        )
+        assert response is not None
+        try:
+            payload = response.json()
+            merged = bool(payload["merged"])
+            merge_sha = str(payload["sha"]).lower()
+        except (KeyError, TypeError, ValueError) as exc:
+            raise GitHubApiError("GitHub merge response is invalid") from exc
+        if not merged:
+            raise GitHubApiError("GitHub did not merge the pull request")
+        if len(merge_sha) != 40 or any(
+            char not in "0123456789abcdef" for char in merge_sha
+        ):
+            raise GitHubApiError("GitHub merge response SHA is invalid")
+        return merge_sha
 
     def issue(
         self,
