@@ -341,3 +341,26 @@ branch for an initial publication. Compensation is accepted only if the remote r
 still equals the rejected candidate SHA, and its readback must converge before
 `CANDIDATE_REJECTED` is appended. This prevents a rejected candidate from becoming
 an orphan remote head that blocks the next publication.
+
+
+## Plane-first Principal Review source
+
+Plane-first reviewers use an authoritative two-event review contract rather than
+creating GitHub findings first and reconstructing them later:
+
+1. `PLANE_REVIEW_RECORDED` persists the exact review run, reviewer identity,
+   reviewed HEAD, compact review body, and stable finding metadata before any
+   external write.
+2. `PlaneReviewPublisher` materializes one native GitHub pull-request review on
+   that exact HEAD. Every inline finding carries a stable recovery marker.
+3. GitHub review/comment receipts are read back and only then persisted as
+   `PLANE_REVIEW_MATERIALIZED`.
+4. `create_work_package()` accepts that materialized source under provider
+   `PLANE_REVIEW`, preserving the Plane finding id and normalized identity while
+   treating GitHub review/comment ids strictly as correlation evidence.
+
+The publisher is replay-safe: a lost response after GitHub accepted the review
+is recovered through the stable review/finding markers rather than issuing a
+second review. Current PR/head identity and reviewer-controlled reserved
+automation mentions fail closed. Native Codex continues through its own adapter;
+neither source may masquerade as the other.

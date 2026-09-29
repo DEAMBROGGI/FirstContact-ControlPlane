@@ -26,6 +26,16 @@ class MergeabilityRequest(BaseModel):
     mergeable: bool
 
 
+class PlaneReviewRequest(BaseModel):
+    review_run_id: str = Field(min_length=1, max_length=160)
+    reviewer_kind: str = Field(min_length=1, max_length=80)
+    reviewer: str = Field(min_length=1, max_length=200)
+    reviewed_head_sha: str
+    body: str = Field(min_length=1, max_length=4000)
+    comments: list[dict[str, Any]] = Field(default_factory=list, max_length=200)
+    idempotency_key: str = Field(min_length=1, max_length=200)
+
+
 class CreateRemediationWorkPackageRequest(BaseModel):
     publication_id: str
     implementation_issue_number: int | None = Field(default=None, gt=0)

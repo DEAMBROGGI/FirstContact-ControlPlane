@@ -16,6 +16,11 @@ from .github_app import GitHubAppTokenProvider
 from .github_review_auth import GitHubReviewTokenProvider
 from .profile_registry import all_profiles
 from .publisher import GitHubPublisher, PublicationError
+from .plane_review import (
+    PlaneReviewError,
+    PlaneReviewPublisher,
+    record_plane_review,
+)
 from .quarantine import CandidateQuarantineError, GitCandidateQuarantine
 from .remediation_materializer import (
     GitHubRemediationMaterializer,
@@ -28,6 +33,7 @@ from .schemas import (
     ClaimRemediationWorkPackageRequest,
     IdempotencyRequest,
     MergeabilityRequest,
+    PlaneReviewRequest,
     ReviewRequest,
     StartSuccessorVerificationRequest,
     SubmitRemediationImplementationRequest,
@@ -126,6 +132,25 @@ def get_codex_review_broker():
             mode=settings.codex_review_mode,
             allowed_actors=actors,
             trigger_user=trigger_user,
+        )
+    finally:
+        token_provider.close()
+        github.close()
+
+
+def get_plane_review_publisher():
+    if settings.publisher_mode != "github-app":
+        raise HTTPException(status_code=503, detail="Plane review publisher is disabled")
+    token_provider = GitHubAppTokenProvider(
+        app_id=settings.github_app_id,
+        private_key_path=settings.github_app_private_key_path,
+        api_url=settings.github_api_url,
+    )
+    github = GitHubRepositoryGateway(api_url=settings.github_api_url)
+    try:
+        yield PlaneReviewPublisher(
+            token_provider=token_provider,
+            github=github,
         )
     finally:
         token_provider.close()
@@ -323,6 +348,44 @@ def codex_review_reconcile(
         raise _conflict(exc) from exc
     except CodexReviewError as exc:
         raise HTTPException(status_code=502, detail="Codex review reconciliation failed closed") from exc
+
+
+@app.post(
+    "/api/v1/internal/publications/{publication_id}/plane-reviews",
+    dependencies=[Depends(require_token)],
+)
+def plane_review_submit(
+    publication_id: str,
+    request: PlaneReviewRequest,
+    session: Session = Depends(get_session),
+    publisher: PlaneReviewPublisher = Depends(get_plane_review_publisher),
+):
+    try:
+        record_plane_review(
+            session,
+            publication_id,
+            run_id=request.review_run_id,
+            reviewer_kind=request.reviewer_kind,
+            reviewer=request.reviewer,
+            reviewed_head_sha=request.reviewed_head_sha,
+            body=request.body,
+            comments=request.comments,
+            idempotency_key=request.idempotency_key,
+        )
+        return publisher.materialize(
+            session,
+            publication_id,
+            request.review_run_id,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="publication not found") from exc
+    except DomainError as exc:
+        raise _conflict(exc) from exc
+    except PlaneReviewError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="Plane review publication failed closed",
+        ) from exc
 
 
 @app.post("/api/v1/publications/{publication_id}/reviews", dependencies=[Depends(require_token)])

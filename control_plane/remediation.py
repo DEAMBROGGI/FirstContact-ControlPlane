@@ -402,18 +402,26 @@ def _find_source_review(
 ) -> dict[str, Any] | None:
     from .repository import load_events
 
+    providers = {
+        "CODEX_REVIEW_COMPLETED": "CODEX_CODE_REVIEW",
+        "PLANE_REVIEW_MATERIALIZED": "PLANE_REVIEW",
+    }
     for event in load_events(session, publication_id):
+        event_type = event["event_type"]
+        provider = providers.get(event_type)
+        if provider is None:
+            continue
         payload = event["payload"]
         if (
             payload.get("run_id") != review_run_id
             or payload.get("head_sha") != reviewed_head_sha
-            or not event["event_type"].endswith("COMPLETED")
         ):
             continue
         if payload.get("result") not in {"PASS", "CHANGES_REQUIRED"}:
             continue
-        if event["event_type"] != "CODEX_REVIEW_COMPLETED":
-            raise DomainError("source review provider is unsupported")
+        if payload.get("provider") not in {None, provider}:
+            raise DomainError("source review provider evidence is inconsistent")
+
         provider_review_ids = payload.get("provider_review_ids")
         provider_comment_ids = payload.get("provider_comment_ids")
         findings = payload.get("findings")
@@ -428,6 +436,7 @@ def _find_source_review(
             set(provider_comment_ids)
         ) != len(provider_comment_ids):
             raise DomainError("source review finding ledger contains duplicate ids")
+
         source_comments: dict[int, dict[str, Any]] = {}
         for finding in findings:
             if not isinstance(finding, dict):
@@ -450,7 +459,11 @@ def _find_source_review(
             raise DomainError("source review provider comments do not match its findings")
         if provider_review_id is not None and provider_review_id not in provider_review_ids:
             continue
-        return {"event_type": event["event_type"], **payload}
+        return {
+            "event_type": event_type,
+            "provider": provider,
+            **payload,
+        }
     return None
 
 
@@ -460,8 +473,12 @@ def _validate_review_findings(
     source_review: dict[str, Any],
     review_provider: str,
 ) -> None:
-    if review_provider != "CODEX_CODE_REVIEW":
+    source_provider = str(source_review.get("provider") or "")
+    if review_provider != source_provider:
         raise DomainError("source review provider does not match the completed review")
+    if source_provider not in {"CODEX_CODE_REVIEW", "PLANE_REVIEW"}:
+        raise DomainError("source review provider is unsupported")
+
     trusted_comments = {
         int(item["provider_comment_id"]): item
         for item in source_review["findings"]
@@ -480,36 +497,54 @@ def _validate_review_findings(
             continue
         if kind != "PROVIDER_THREAD":
             raise DomainError("finding source kind is unsupported")
+
         review_id = source["provider_review_id"]
         comment_id = source["provider_thread_id"]
-        if source["provider"] != review_provider or review_id is None or comment_id is None:
+        if (
+            source["provider"] != source_provider
+            or review_id is None
+            or comment_id is None
+        ):
             raise DomainError("provider finding does not match the source review provider")
+
         trusted = trusted_comments.get(comment_id)
         if trusted is None or int(trusted["provider_review_id"]) != review_id:
             raise DomainError("provider finding is not owned by the source review run")
-        expected_id = f"codex:{review_id}:{comment_id}"
-        expected_identity = f"codex:review-{review_id}:comment-{comment_id}"
+
+        if source_provider == "CODEX_CODE_REVIEW":
+            expected_id = f"codex:{review_id}:{comment_id}"
+            expected_identity = f"codex:review-{review_id}:comment-{comment_id}"
+        else:
+            expected_id = str(trusted.get("finding_id") or "")
+            expected_identity = str(trusted.get("normalized_identity") or "")
+
         if (
             finding["finding_id"] != expected_id
             or finding["normalized_identity"] != expected_identity
         ):
             raise DomainError("provider finding identity differs from the source review")
+
         finding["source"].update(
             {
                 "path": trusted.get("path"),
                 "line": trusted.get("line"),
+                "side": trusted.get("side"),
                 "body": str(trusted.get("body", ""))[:4000],
             }
         )
         submitted_comments.append((review_id, comment_id))
+
     if len(submitted_comments) != len(set(submitted_comments)):
         raise DomainError("duplicate provider finding in Principal Reviewer decision set")
+
     expected_comments = {
         (int(item["provider_review_id"]), int(item["provider_comment_id"]))
         for item in source_review["findings"]
     }
     if set(submitted_comments) != expected_comments:
-        raise DomainError("Principal Reviewer decision set must include every source provider finding exactly once")
+        raise DomainError(
+            "Principal Reviewer decision set must include every source provider finding exactly once"
+        )
 
 
 def _normalize_findings(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -647,8 +682,6 @@ def create_work_package(
     )
     if source_review is None:
         raise DomainError("source review run is missing or does not match the exact head")
-    if source_review["event_type"] != "CODEX_REVIEW_COMPLETED":
-        raise DomainError("source review provider is unsupported")
     _validate_review_findings(
         normalized_findings,
         source_review=source_review,

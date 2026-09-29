@@ -914,6 +914,67 @@ class GitHubRepositoryGateway:
         except (KeyError, TypeError, ValueError) as exc:
             raise GitHubApiError("GitHub pull review response is invalid") from exc
 
+    def create_pull_review(
+        self,
+        repository: str,
+        pull_number: int,
+        *,
+        commit_id: str,
+        body: str,
+        comments: list[dict],
+        token: str,
+    ) -> PullReviewSnapshot:
+        normalized_head = commit_id.lower()
+        if (
+            pull_number <= 0
+            or len(normalized_head) != 40
+            or any(c not in "0123456789abcdef" for c in normalized_head)
+            or not body.strip()
+            or len(comments) > 200
+        ):
+            raise GitHubApiError("pull review payload is invalid")
+
+        wire_comments = []
+        for item in comments:
+            path = str(item.get("path") or "").strip()
+            line = item.get("line")
+            side = str(item.get("side") or "").upper()
+            comment_body = str(item.get("body") or "").strip()
+            if (
+                not path
+                or not isinstance(line, int)
+                or line <= 0
+                or side not in {"LEFT", "RIGHT"}
+                or not comment_body
+            ):
+                raise GitHubApiError("pull review comment payload is invalid")
+            wire_comments.append(
+                {
+                    "path": path,
+                    "line": line,
+                    "side": side,
+                    "body": comment_body,
+                }
+            )
+
+        owner, name = self._parts(repository)
+        response = self._request(
+            "POST",
+            f"{self.api_url}/repos/{owner}/{name}/pulls/{pull_number}/reviews",
+            token=token,
+            json={
+                "commit_id": normalized_head,
+                "body": body,
+                "event": "COMMENT",
+                "comments": wire_comments,
+            },
+        )
+        assert response is not None
+        review = self._pull_review_snapshot(response.json())
+        if review.review_id <= 0 or review.commit_id != normalized_head:
+            raise GitHubApiError("GitHub pull review identity does not match request")
+        return review
+
     def list_pull_reviews(
         self,
         repository: str,
