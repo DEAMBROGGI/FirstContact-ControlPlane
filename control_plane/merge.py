@@ -51,14 +51,24 @@ class MergeCoordinator:
         pull: PullRequestSnapshot,
         *,
         merged: bool,
+        event_commit_sha: str | None,
     ) -> str:
-        if not merged or pull.merge_commit_sha is None:
+        if not merged:
+            raise MergeError("GitHub merge receipt says pull request is not merged")
+        values = []
+        if pull.merge_commit_sha is not None:
+            values.append(pull.merge_commit_sha)
+        if event_commit_sha is not None:
+            values.append(event_commit_sha)
+        unique = tuple(dict.fromkeys(values))
+        if not unique:
             raise MergeError(
                 "GitHub merge receipt is incomplete "
-                f"(merged={merged}, "
-                f"merge_commit_sha_present={pull.merge_commit_sha is not None})"
+                "(merged=True, no merge commit SHA evidence)"
             )
-        return pull.merge_commit_sha
+        if len(unique) != 1:
+            raise MergeError("GitHub merge commit evidence is inconsistent")
+        return unique[0]
 
     def _record_reconciled_pull(
         self,
