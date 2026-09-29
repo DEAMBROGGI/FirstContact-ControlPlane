@@ -102,6 +102,8 @@ Semantica:
 | POST /api/v1/publications/{id}/codex-review/reconcile | orchestrator | reconciliar provider evidence |
 | POST /api/v1/publications/{id}/reviews | Human Review UI | APPROVE / REQUEST_CHANGES exact-head |
 | POST /api/v1/internal/publications/{id}/mergeability | checker | mergeability exact-head |
+| POST /api/v1/internal/publications/{id}/merge | Plane | execute governed exact-head merge |
+| POST /api/v1/internal/publications/{id}/merge/reconcile | reconciler | recover/audit GitHub merged state |
 | GET /api/v1/publications/{id} | UI/orchestrator | view autoritativa |
 | GET /api/v1/publications/{id}/events | audit/UI | event history |
 | POST /api/v1/internal/remediation/work-packages | Control Plane orchestrator | persistir decisiones ya tomadas y crear/reusar batch; si falta Issue, crear/reutilizar y proyectar Fix Issue |
@@ -597,6 +599,53 @@ La arquitectura queda apta para integrar otra API solo cuando:
 - este documento se actualice contra endpoints/eventos reales;
 - un segundo repositorio valide el onboarding checklist.
 
+
+### Governed merge execution and reconciliation
+
+Once a Publication is `READY_TO_MERGE`, Plane owns the final write boundary.
+The merge command must re-read the canonical PR, verify repository/PR/base/head
+identity, and send GitHub the exact governed HEAD as the expected merge SHA.
+GitHub's response is evidence only after a second PR readback proves the PR is
+merged and exposes the merge commit SHA.
+
+The authoritative ledger receipt is:
+
+~~~text
+MERGED
+  head_sha
+  pull_request_number
+  merge_commit_sha
+  source = PLANE_MERGE | GITHUB_RECONCILE
+~~~
+
+`MERGED` is idempotent for one exact receipt and remains terminal.
+
+If GitHub already reports the exact canonical PR merged while Plane is still
+`READY_TO_MERGE`, the reconciler records the same receipt with
+`source=GITHUB_RECONCILE`. This covers a process restart, an uncertain merge
+response, and the PR #13 dogfood case without a manual `append_event(MERGED)`.
+
+If GitHub reports an exact-head merge while Plane was not `READY_TO_MERGE`,
+the reconciler persists `MERGE_POLICY_VIOLATION` and leaves the Publication
+in its prior lifecycle state. An external merge never manufactures governed
+readiness.
+
+~~~mermaid
+sequenceDiagram
+    autonumber
+    participant P as Plane
+    participant DB as Ledger
+    participant GH as GitHub
+
+    P->>DB: read READY_TO_MERGE + exact PR/HEAD
+    P->>GH: GET canonical PR
+    GH-->>P: open + exact HEAD
+    P->>GH: merge(expected_head_sha)
+    GH-->>P: merge response
+    P->>GH: GET canonical PR
+    GH-->>P: merged + merge_commit_sha
+    P->>DB: MERGED(exact receipt)
+~~~
 
 ## 24. Human Merge Override / Break-glass
 
