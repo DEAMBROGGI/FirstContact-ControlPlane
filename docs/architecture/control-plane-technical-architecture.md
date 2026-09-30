@@ -1028,7 +1028,11 @@ upstream item reaches `DONE` and the dependent becomes `READY`.
 Unsatisfied dependencies are derived as `BLOCKED` and therefore never enter the
 claimable set. PostgreSQL claim-next obtains a repository-scoped advisory
 transaction lock and then row-locks the selected item before re-reading state and
-appending `WORK_CLAIMED`. Specific-item claims also row-lock and re-read before
+appending `WORK_CLAIMED`. Hard-dependency mutations acquire that same
+repository-scoped transaction lock before the target row lock and before the
+cycle check/write. This prevents opposite concurrent edges from both validating
+against the same pre-write graph, and preserves one lock order between scheduling
+and graph mutation. Specific-item claims also row-lock and re-read before
 mutation.
 
 Every claim carries a server-policy lease id and UTC expiry. An active implementer
