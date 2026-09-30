@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from .codex_review import CodexReviewBroker, CodexReviewError
 from .config import settings
-from .db import get_session, init_db
+from .db import SessionLocal, get_session, init_db
 from .domain import DomainError
 from .github_api import GitHubRepositoryGateway
 from .github_app import GitHubAppTokenProvider
@@ -98,6 +98,7 @@ from .work import (
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     init_db()
+    _startup_reconcile_pending_webhooks()
     yield
 
 
@@ -168,6 +169,45 @@ def _configured_actors(raw: str) -> tuple[str, ...]:
         for value in raw.split(",")
         if value.strip()
     )
+
+
+def _startup_reconcile_pending_webhooks() -> int:
+    if settings.publisher_mode != "github-app":
+        return 0
+    webhook_secret = settings.github_webhook_secret.get_secret_value().strip()
+    if not webhook_secret:
+        return 0
+    limit = settings.github_webhook_startup_reconcile_limit
+    if limit <= 0:
+        return 0
+
+    token_provider = GitHubAppTokenProvider(
+        app_id=settings.github_app_id,
+        private_key_path=settings.github_app_private_key_path,
+        api_url=settings.github_api_url,
+    )
+    github = GitHubRepositoryGateway(api_url=settings.github_api_url)
+    session = SessionLocal()
+    try:
+        gateway = GitHubWebhookGateway(
+            token_provider=token_provider,
+            github=github,
+            codex_review_mode=settings.codex_review_mode,
+            codex_actors=_configured_actors(settings.codex_review_actors),
+            human_review_actors=_configured_actors(settings.human_review_actors),
+            webhook_secret=webhook_secret,
+            maximum_payload_bytes=settings.github_webhook_max_payload_bytes,
+        )
+        return len(
+            gateway.reconcile_pending_best_effort(
+                session,
+                limit=limit,
+            )
+        )
+    finally:
+        session.close()
+        token_provider.close()
+        github.close()
 
 
 def get_codex_review_broker():
