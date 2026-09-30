@@ -8,7 +8,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Any, Mapping
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from .codex_review import CodexReviewBroker, CodexReviewError
@@ -88,6 +88,21 @@ def _utcnow() -> datetime:
 
 def _normalize_actor(value: str) -> str:
     return value.strip().lower()
+
+
+def _lock_delivery_scope(session: Session, delivery_id: str) -> None:
+    """Serialize first-write/replay decisions for one GitHub delivery id."""
+
+    if session.get_bind().dialect.name != "postgresql":
+        return
+    key = hashlib.sha256(
+        ("firstcontact-github-webhook-delivery\0" + delivery_id).encode("utf-8")
+    ).digest()[:8]
+    lock_key = int.from_bytes(key, byteorder="big", signed=True)
+    session.execute(
+        text("SELECT pg_advisory_xact_lock(:webhook_delivery_key)"),
+        {"webhook_delivery_key": lock_key},
+    )
 
 
 def _delivery_view(row: GitHubWebhookDeliveryRow) -> WebhookDeliveryView:
@@ -220,6 +235,8 @@ def persist_webhook_delivery(
         raise GitHubWebhookError("GitHub delivery id is missing or invalid")
     if _EVENT_RE.fullmatch(normalized_event) is None:
         raise GitHubWebhookError("GitHub event name is missing or invalid")
+
+    _lock_delivery_scope(session, normalized_delivery)
 
     repository = _repository_from_payload(payload)
     action_value = payload.get("action")
