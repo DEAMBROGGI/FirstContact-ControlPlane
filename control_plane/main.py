@@ -296,6 +296,17 @@ def _work_item_payload(view: WorkItemView):
     return data
 
 
+def _sync_publication_watch(session: Session, publication_id: str):
+    return sync_review_watch(
+        session,
+        publication_id,
+        expected_actors=(
+            *_configured_actors(settings.codex_review_actors),
+            *_configured_actors(settings.human_review_actors),
+        ),
+    )
+
+
 def _conflict(exc: Exception) -> HTTPException:
     return HTTPException(status_code=409, detail=str(exc))
 
@@ -713,14 +724,7 @@ def codex_review_request(
         raise HTTPException(status_code=503, detail="Codex review broker is disabled")
     try:
         view = broker.request(session, publication_id)
-        sync_review_watch(
-            session,
-            publication_id,
-            expected_actors=(
-                *_configured_actors(settings.codex_review_actors),
-                *_configured_actors(settings.human_review_actors),
-            ),
-        )
+        _sync_publication_watch(session, publication_id)
         return _payload(view)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="publication not found") from exc
@@ -872,11 +876,13 @@ def plane_review_submit(
             comments=request.comments,
             idempotency_key=request.idempotency_key,
         )
-        return publisher.materialize(
+        result = publisher.materialize(
             session,
             publication_id,
             request.review_run_id,
         )
+        _sync_publication_watch(session, publication_id)
+        return result
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="publication not found") from exc
     except DomainError as exc:
@@ -891,7 +897,7 @@ def plane_review_submit(
 @app.post("/api/v1/publications/{publication_id}/reviews", dependencies=[Depends(require_token)])
 def review_record(publication_id: str, request: ReviewRequest, session: Session = Depends(get_session)):
     try:
-        return _payload(record_review(
+        view = record_review(
             session,
             publication_id,
             reviewed_head_sha=request.reviewed_head_sha,
@@ -899,7 +905,9 @@ def review_record(publication_id: str, request: ReviewRequest, session: Session 
             require_codex_review=(
                 settings.codex_review_mode.strip().lower() == "required"
             ),
-        ))
+        )
+        _sync_publication_watch(session, publication_id)
+        return _payload(view)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="publication not found") from exc
     except DomainError as exc:
@@ -907,14 +915,14 @@ def review_record(publication_id: str, request: ReviewRequest, session: Session 
 @app.post("/api/v1/internal/publications/{publication_id}/mergeability", dependencies=[Depends(require_token)])
 def mergeability_record(publication_id: str, request: MergeabilityRequest, session: Session = Depends(get_session)):
     try:
-        return _payload(
-            record_mergeability(
-                session,
-                publication_id,
-                head_sha=request.head_sha,
-                mergeable=request.mergeable,
-            )
+        view = record_mergeability(
+            session,
+            publication_id,
+            head_sha=request.head_sha,
+            mergeable=request.mergeable,
         )
+        _sync_publication_watch(session, publication_id)
+        return _payload(view)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="publication not found") from exc
     except DomainError as exc:
@@ -931,7 +939,9 @@ def merge_execute(
     coordinator: MergeCoordinator = Depends(get_merge_coordinator),
 ):
     try:
-        return _payload(coordinator.merge(session, publication_id))
+        view = coordinator.merge(session, publication_id)
+        _sync_publication_watch(session, publication_id)
+        return _payload(view)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="publication not found") from exc
     except DomainError as exc:
@@ -953,7 +963,9 @@ def merge_reconcile(
     coordinator: MergeCoordinator = Depends(get_merge_coordinator),
 ):
     try:
-        return _payload(coordinator.reconcile(session, publication_id))
+        view = coordinator.reconcile(session, publication_id)
+        _sync_publication_watch(session, publication_id)
+        return _payload(view)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="publication not found") from exc
     except DomainError as exc:
@@ -1198,9 +1210,9 @@ def remediation_work_package_materialize(
     materializer: GitHubRemediationMaterializer = Depends(get_remediation_materializer),
 ):
     try:
-        return _work_package_payload(
-            materializer.materialize(session, work_package_id)
-        )
+        view = materializer.materialize(session, work_package_id)
+        _sync_publication_watch(session, view.publication_id)
+        return _work_package_payload(view)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="work package not found") from exc
     except DomainError as exc:
