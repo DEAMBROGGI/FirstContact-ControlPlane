@@ -12,6 +12,7 @@ from control_plane.domain import (
     DomainError,
     EventType,
     PublicationState,
+    ReviewDecision,
     ValidationStatus,
 )
 from control_plane.github_api import (
@@ -517,6 +518,53 @@ def test_review_watch_reconstructs_provider_next_action_from_publication(session
         CODEX_ACTOR.lower(),
         HUMAN_ACTOR.lower(),
     }
+
+
+def test_stale_review_watch_is_fail_closed_even_when_publication_is_in_review(session):
+    view = start_codex(session, published(session))
+    stale = sync_review_watch(
+        session,
+        view.publication_id,
+        expected_actors=(CODEX_ACTOR, HUMAN_ACTOR),
+        state="STALE",
+    )
+
+    assert stale.state == "STALE"
+    assert stale.next_role == "CONTROL_PLANE"
+    assert stale.next_action == "BLOCKED"
+
+    replayed = sync_review_watch(
+        session,
+        view.publication_id,
+        expected_actors=(CODEX_ACTOR, HUMAN_ACTOR),
+    )
+    assert replayed.state == "STALE"
+    assert replayed.next_role == "CONTROL_PLANE"
+    assert replayed.next_action == "BLOCKED"
+
+
+def test_direct_human_review_is_blocked_when_base_ref_drifted(session):
+    view = complete_codex_pass(session, start_codex(session, published(session)))
+    github = FakeGitHub()
+    github.ref_shas["master"] = "4" * 40
+    value = gateway(github)
+
+    with pytest.raises(DomainError, match="publication base is stale"):
+        value.assert_review_write_current(session, view.publication_id)
+
+    current = get_view(session, view.publication_id)
+    watch = get_review_watch(session, view.publication_id)
+    review_events = [
+        event
+        for event in load_events(session, view.publication_id)
+        if event["event_type"] == EventType.REVIEW_RECORDED.value
+    ]
+
+    assert current.state is PublicationState.IN_REVIEW
+    assert review_events == []
+    assert watch.state == "STALE"
+    assert watch.next_role == "CONTROL_PLANE"
+    assert watch.next_action == "BLOCKED"
 
 
 
