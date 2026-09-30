@@ -58,6 +58,7 @@ class WorkItemView:
     required_for_parent: bool
     executable: bool
     priority: int
+    topology_order: int
     rank: int
     context_version: int
     context_digest: str
@@ -451,6 +452,7 @@ def _view(
     *,
     memo: dict[str, WorkItemView],
     stack: set[str],
+    topology_orders: dict[str, int],
 ) -> WorkItemView:
     if row.id in memo:
         return memo[row.id]
@@ -472,6 +474,7 @@ def _view(
                 dependency,
                 memo=memo,
                 stack=stack,
+                topology_orders=topology_orders,
             )
             if dependency_view.state is not WorkState.DONE:
                 blockers.append(f"dependency:{dependency_id}")
@@ -485,6 +488,7 @@ def _view(
                 child,
                 memo=memo,
                 stack=stack,
+                topology_orders=topology_orders,
             )
             if child_view.state is not WorkState.DONE:
                 blockers.append(f"child:{child_id}")
@@ -516,6 +520,7 @@ def _view(
             required_for_parent=row.required_for_parent,
             executable=row.executable,
             priority=row.priority,
+            topology_order=topology_orders[row.id],
             rank=row.rank,
             context_version=row.context_version,
             context_digest=row.context_digest,
@@ -548,7 +553,13 @@ def get_work_item(session: Session, work_item_id: str) -> WorkItemView:
     row = session.get(WorkItemRow, work_item_id)
     if row is None:
         raise KeyError(work_item_id)
-    return _view(session, row, memo={}, stack=set())
+    return _view(
+        session,
+        row,
+        memo={},
+        stack=set(),
+        topology_orders=_topology_orders(session, row.repository),
+    )
 
 
 def get_work_item_by_issue(
@@ -575,19 +586,29 @@ def list_work_items(
         session.scalars(
             select(WorkItemRow)
             .where(WorkItemRow.repository == repository)
-            .order_by(
-                WorkItemRow.priority.asc(),
-                WorkItemRow.rank.asc(),
-                WorkItemRow.created_at.asc(),
-                WorkItemRow.id.asc(),
-            )
         )
     )
+    topology_orders = _topology_orders(session, repository)
     memo: dict[str, WorkItemView] = {}
-    return [
-        _view(session, row, memo=memo, stack=set())
+    views = [
+        _view(
+            session,
+            row,
+            memo=memo,
+            stack=set(),
+            topology_orders=topology_orders,
+        )
         for row in rows
     ]
+    return sorted(
+        views,
+        key=lambda view: (
+            view.priority,
+            view.topology_order,
+            view.rank,
+            view.work_item_id,
+        ),
+    )
 
 
 def create_work_item(
@@ -779,6 +800,30 @@ def _path_exists(graph: dict[str, set[str]], start: str, target: str) -> bool:
         seen.add(current)
         pending.extend(graph.get(current, ()))
     return False
+
+
+def _topology_orders(session: Session, repository: str) -> dict[str, int]:
+    graph = _blocking_graph(session, repository)
+    memo: dict[str, int] = {}
+    visiting: set[str] = set()
+
+    def depth(work_item_id: str) -> int:
+        if work_item_id in memo:
+            return memo[work_item_id]
+        if work_item_id in visiting:
+            raise RuntimeError("work graph contains a blocking cycle")
+        visiting.add(work_item_id)
+        try:
+            blockers = graph.get(work_item_id, set())
+            value = 0 if not blockers else 1 + max(depth(item) for item in blockers)
+            memo[work_item_id] = value
+            return value
+        finally:
+            visiting.remove(work_item_id)
+
+    for work_item_id in sorted(graph):
+        depth(work_item_id)
+    return memo
 
 
 def add_dependency(
@@ -996,26 +1041,10 @@ def claim_next_work(
         return view
 
     _lock_scheduler_scope(session, normalized_repository)
-    rows = list(
-        session.scalars(
-            select(WorkItemRow)
-            .where(
-                WorkItemRow.repository == normalized_repository,
-                WorkItemRow.executable.is_(True),
-            )
-            .order_by(
-                WorkItemRow.priority.asc(),
-                WorkItemRow.rank.asc(),
-                WorkItemRow.created_at.asc(),
-                WorkItemRow.id.asc(),
-            )
-        )
-    )
-    for seed in rows:
-        candidate = get_work_item(session, seed.id)
-        if candidate.state is not WorkState.READY:
+    for candidate in list_work_items(session, normalized_repository):
+        if not candidate.executable or candidate.state is not WorkState.READY:
             continue
-        row = _lock_work_item(session, seed.id)
+        row = _lock_work_item(session, candidate.work_item_id)
         candidate = get_work_item(session, row.id)
         if candidate.state is not WorkState.READY:
             continue
