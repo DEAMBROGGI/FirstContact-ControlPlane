@@ -120,6 +120,11 @@ class CompleteWorkItemRequest(BaseModel):
     idempotency_key: str = Field(min_length=1, max_length=200)
 
 
+class RenewWorkClaimRequest(BaseModel):
+    actor: str = Field(min_length=1, max_length=200)
+    idempotency_key: str = Field(min_length=1, max_length=200)
+
+
 class ReleaseWorkClaimRequest(BaseModel):
     actor: str = Field(min_length=1, max_length=200)
     reason: str = Field(min_length=1, max_length=1000)
