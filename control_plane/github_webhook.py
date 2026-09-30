@@ -207,6 +207,10 @@ def persist_webhook_delivery(
 ) -> WebhookDeliveryView:
     """Persist one verified delivery before any publication/domain processing."""
 
+    if maximum_bytes <= 0:
+        raise GitHubWebhookError("webhook payload limit must be positive")
+    if not body or len(body) > maximum_bytes:
+        raise GitHubWebhookError("GitHub webhook payload is empty or exceeds the limit")
     verify_webhook_signature(body, signature, secret=secret)
     payload = webhook_payload(body, maximum_bytes=maximum_bytes)
 
