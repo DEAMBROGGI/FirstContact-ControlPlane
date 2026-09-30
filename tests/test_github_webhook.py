@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from fastapi import HTTPException
 import hashlib
 import hmac
 import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from fastapi import HTTPException
 
 from control_plane.domain import (
     AutomatedReviewStatus,
