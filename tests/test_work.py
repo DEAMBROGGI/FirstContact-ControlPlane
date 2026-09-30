@@ -130,7 +130,7 @@ def test_dependency_blocks_until_authoritative_dependency_done(session):
     assert ready.blockers == ()
 
 
-def test_claim_next_order_is_priority_rank_then_stable_identity(session):
+def test_claim_next_orders_by_priority_then_explicit_rank(session):
     low = create(session, 2510, priority=2, rank=0)
     p0_later = create(session, 2511, priority=0, rank=9)
     p0_first = create(session, 2512, priority=0, rank=1)
@@ -143,13 +143,62 @@ def test_claim_next_order_is_priority_rank_then_stable_identity(session):
         session,
         REPOSITORY,
         actor=ACTOR,
-        idempotency_key="claim-next:one",
+        idempotency_key="claim-next:priority-rank",
     )
 
     assert claimed is not None
     assert claimed.work_item_id == p0_first.work_item_id
     assert claimed.state is WorkState.IN_PROGRESS
     assert claimed.implementer == ACTOR
+
+
+def test_claim_next_orders_topology_before_explicit_rank(session):
+    dependency = create(session, 2513, priority=0, rank=0)
+    downstream = create(session, 2514, priority=0, rank=0)
+    independent = create(session, 2515, priority=0, rank=99)
+
+    add_dependency(
+        session,
+        downstream.work_item_id,
+        dependency.work_item_id,
+        idempotency_key="2514:depends:2513",
+    )
+    implement_and_complete(session, dependency, suffix="topology-dependency")
+
+    downstream_ready = get_work_item(session, downstream.work_item_id)
+    independent_ready = get_work_item(session, independent.work_item_id)
+
+    assert downstream_ready.state is WorkState.READY
+    assert independent_ready.state is WorkState.READY
+    assert downstream_ready.topology_order == 1
+    assert independent_ready.topology_order == 0
+
+    claimed = claim_next_work(
+        session,
+        REPOSITORY,
+        actor=ACTOR,
+        idempotency_key="claim-next:topology",
+    )
+
+    assert claimed is not None
+    assert claimed.work_item_id == independent.work_item_id
+
+
+def test_claim_next_uses_stable_id_as_final_tie_break(session):
+    first = create(session, 2516, priority=0, rank=5)
+    second = create(session, 2517, priority=0, rank=5)
+
+    expected = min(first.work_item_id, second.work_item_id)
+
+    claimed = claim_next_work(
+        session,
+        REPOSITORY,
+        actor=ACTOR,
+        idempotency_key="claim-next:stable-id",
+    )
+
+    assert claimed is not None
+    assert claimed.work_item_id == expected
 
 
 def test_claim_next_retry_is_idempotent_and_specific_second_claim_fails(session):
