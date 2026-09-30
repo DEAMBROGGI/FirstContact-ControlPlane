@@ -778,11 +778,21 @@ def release_work_item(
     *,
     idempotency_key: str,
 ) -> WorkItemView:
+    payload = {"reason": "EXPLICIT_RELEASE"}
+    existing = _event_by_idempotency(session, idempotency_key)
+    if existing is not None:
+        if (
+            existing.work_item_id != work_item_id
+            or existing.event_type != "WORK_RELEASED"
+            or _canonical(existing.payload) != _canonical(payload)
+        ):
+            raise DomainError("idempotency key was already used for another work command")
+        return get_work_item(session, work_item_id)
+
     row = _lock_work_item(session, work_item_id)
     view = get_work_item(session, row.id)
     if view.released:
-        session.commit()
-        return view
+        raise DomainError("work item is already released")
     if view.state in {WorkState.IN_PROGRESS, WorkState.REVIEW, WorkState.DONE}:
         raise DomainError("work item cannot be released from its current state")
     _append(
@@ -790,7 +800,7 @@ def release_work_item(
         row,
         event_type="WORK_RELEASED",
         idempotency_key=idempotency_key,
-        payload={"reason": "EXPLICIT_RELEASE"},
+        payload=payload,
     )
     session.commit()
     return get_work_item(session, row.id)
