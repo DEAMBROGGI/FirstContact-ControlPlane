@@ -593,6 +593,15 @@ def _required_review_adjudication(
     }
 
 
+def required_review_adjudication(
+    session: Session,
+    publication_id: str,
+) -> dict[str, Any] | None:
+    """Return the exact-head automated/fallback adjudication without mutating state."""
+    view = get_view(session, publication_id)
+    return _required_review_adjudication(session, publication_id, view)
+
+
 def record_review(
     session: Session,
     publication_id: str,
