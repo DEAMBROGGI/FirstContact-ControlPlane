@@ -350,7 +350,12 @@ def sync_review_watch(
             }
         )
     )
-    next_role, next_action = _derive_next(session, publication_id)
+    row = session.get(ReviewWatchRow, publication_id)
+    effective_state = state if state is not None else (row.state if row is not None else None)
+    if effective_state == "STALE":
+        next_role, next_action = "CONTROL_PLANE", "BLOCKED"
+    else:
+        next_role, next_action = _derive_next(session, publication_id)
     provider = "CODEX" if view.automated_review_run_id is not None else None
 
     row = session.get(ReviewWatchRow, publication_id)
@@ -364,7 +369,7 @@ def sync_review_watch(
             provider=provider,
             trigger_comment_id=view.automated_review_trigger_comment_id,
             expected_actors=list(actors),
-            state=state or ("DONE" if view.state is PublicationState.MERGED else "ACTIVE"),
+            state=effective_state or ("DONE" if view.state is PublicationState.MERGED else "ACTIVE"),
             next_role=next_role,
             next_action=next_action,
             last_delivery_id=last_delivery_id,
@@ -622,6 +627,38 @@ class GitHubWebhookGateway:
             state="STALE",
         )
         return False
+
+    def assert_review_write_current(
+        self,
+        session: Session,
+        publication_id: str,
+    ) -> None:
+        """Fail closed before accepting a direct Human Review write."""
+        view = get_view(session, publication_id)
+        if view.pull_request_number is None or view.remote_head_sha is None:
+            raise GitHubWebhookError("publication is not published")
+
+        try:
+            access = self._access(view.repository)
+            pull = self._read_pull(view, access.token)
+        except (GitHubAuthError, GitHubApiError) as exc:
+            raise GitHubWebhookError("GitHub review write readback failed closed") from exc
+
+        if pull.head_sha != view.remote_head_sha:
+            sync_review_watch(
+                session,
+                publication_id,
+                expected_actors=self.expected_actors,
+                state="STALE",
+            )
+            raise DomainError("human review is blocked because the published PR head is stale")
+
+        if not self._base_is_current(
+            session,
+            publication_id,
+            token=access.token,
+        ):
+            raise DomainError("human review is blocked because the publication base is stale")
 
     def _codex_broker(self) -> CodexReviewBroker:
         return CodexReviewBroker(
