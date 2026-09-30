@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     DateTime,
     ForeignKey,
     Integer,
@@ -196,3 +197,108 @@ class RemediationDispatchRow(Base):
         onupdate=utcnow,
         nullable=False,
     )
+
+
+class WorkItemRow(Base):
+    """Stable work-item identity; lifecycle is reconstructed from WorkItemEventRow."""
+
+    __tablename__ = "work_items"
+    __table_args__ = (
+        UniqueConstraint(
+            "repository",
+            "issue_number",
+            name="uq_work_item_repository_issue",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    repository: Mapped[str] = mapped_column(String(200), nullable=False, index=True)
+    issue_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    parent_work_item_id: Mapped[str | None] = mapped_column(
+        ForeignKey("work_items.id"),
+        nullable=True,
+        index=True,
+    )
+    required_for_parent: Mapped[bool] = mapped_column(
+        Boolean,
+        default=True,
+        nullable=False,
+    )
+    executable: Mapped[bool] = mapped_column(
+        Boolean,
+        default=True,
+        nullable=False,
+    )
+    priority: Mapped[int] = mapped_column(Integer, nullable=False)
+    rank: Mapped[int] = mapped_column(Integer, nullable=False)
+    context_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    context_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    context_data: Mapped[dict] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utcnow,
+        nullable=False,
+    )
+
+
+class WorkDependencyRow(Base):
+    """Materialized hard-dependency edge; creation is also recorded in the work ledger."""
+
+    __tablename__ = "work_dependencies"
+    __table_args__ = (
+        UniqueConstraint(
+            "work_item_id",
+            "depends_on_work_item_id",
+            name="uq_work_dependency_edge",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    work_item_id: Mapped[str] = mapped_column(
+        ForeignKey("work_items.id"),
+        nullable=False,
+        index=True,
+    )
+    depends_on_work_item_id: Mapped[str] = mapped_column(
+        ForeignKey("work_items.id"),
+        nullable=False,
+        index=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utcnow,
+        nullable=False,
+    )
+
+
+class WorkItemEventRow(Base):
+    __tablename__ = "work_item_events"
+    __table_args__ = (
+        UniqueConstraint(
+            "work_item_id",
+            "sequence",
+            name="uq_work_item_event_sequence",
+        ),
+        UniqueConstraint(
+            "idempotency_key",
+            name="uq_work_item_event_idempotency",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    work_item_id: Mapped[str] = mapped_column(
+        ForeignKey("work_items.id"),
+        nullable=False,
+        index=True,
+    )
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utcnow,
+        nullable=False,
+    )
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(200), nullable=False)
+    payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    previous_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    event_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
