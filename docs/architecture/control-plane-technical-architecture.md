@@ -1040,7 +1040,13 @@ audit rather than being deleted or rewritten.
 
 ### Fresh-session context
 
-Each work item stores an immutable versioned context snapshot and SHA-256 digest.
+Each work item records its immutable versioned context snapshot and SHA-256 digest
+inside the hash-chained `WORK_CREATED` ledger event. The relational context
+columns are only a read/index projection and are verified against that event on
+every reconstruction; projection drift fails closed. Required parent/child
+blocking is likewise derived from the child creation ledgers rather than trusted
+from a mutable projection alone.
+
 A new implementer session receives the same context together with:
 
 ```text
