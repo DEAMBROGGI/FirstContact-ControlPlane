@@ -926,8 +926,8 @@ def test_base_push_back_to_candidate_sha_is_the_only_stale_watch_recovery(sessio
     assert recovery_result.outcome == "BASE_PUSH_STALE:0:RECOVERED:1"
     assert recovery_result.next_action == "DONE"
     assert watch.state == "ACTIVE"
-    assert watch.next_role == "PROVIDER"
-    assert watch.next_action == "WAIT_PROVIDER"
+    assert watch.next_role == "HUMAN_REVIEWER"
+    assert watch.next_action == "WAIT_HUMAN_REVIEW"
 
 
     push_payload = {
