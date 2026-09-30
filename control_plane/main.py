@@ -938,8 +938,14 @@ def plane_review_submit(
 
 
 @app.post("/api/v1/publications/{publication_id}/reviews", dependencies=[Depends(require_token)])
-def review_record(publication_id: str, request: ReviewRequest, session: Session = Depends(get_session)):
+def review_record(
+    publication_id: str,
+    request: ReviewRequest,
+    session: Session = Depends(get_session),
+    gateway: GitHubWebhookGateway = Depends(get_github_webhook_gateway),
+):
     try:
+        gateway.assert_review_write_current(session, publication_id)
         view = record_review(
             session,
             publication_id,
@@ -955,6 +961,12 @@ def review_record(publication_id: str, request: ReviewRequest, session: Session 
         raise HTTPException(status_code=404, detail="publication not found") from exc
     except DomainError as exc:
         raise _conflict(exc) from exc
+    except GitHubWebhookError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="GitHub review write readback failed closed",
+        ) from exc
+
 @app.post("/api/v1/internal/publications/{publication_id}/mergeability", dependencies=[Depends(require_token)])
 def mergeability_record(publication_id: str, request: MergeabilityRequest, session: Session = Depends(get_session)):
     try:
