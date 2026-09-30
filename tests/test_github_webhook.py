@@ -34,6 +34,8 @@ from control_plane.github_webhook import (
     sync_review_watch,
 )
 from control_plane.models import GitHubWebhookDeliveryRow
+from control_plane.main import review_record
+from control_plane.schemas import ReviewRequest
 from control_plane.profile_registry import profile_for_repository
 from control_plane.quarantine import VerifiedCandidateSource
 from control_plane.repository import load_events
@@ -560,6 +562,38 @@ def test_direct_human_review_is_blocked_when_base_ref_drifted(session):
         if event["event_type"] == EventType.REVIEW_RECORDED.value
     ]
 
+    assert current.state is PublicationState.IN_REVIEW
+    assert review_events == []
+    assert watch.state == "STALE"
+    assert watch.next_role == "CONTROL_PLANE"
+    assert watch.next_action == "BLOCKED"
+
+
+def test_direct_human_review_endpoint_is_blocked_when_base_ref_drifted(session):
+    view = complete_codex_pass(session, start_codex(session, published(session)))
+    github = FakeGitHub()
+    github.ref_shas["master"] = "4" * 40
+    value = gateway(github)
+
+    with pytest.raises(Exception) as caught:
+        review_record(
+            view.publication_id,
+            ReviewRequest(
+                reviewed_head_sha=HEAD,
+                decision=ReviewDecision.APPROVED,
+            ),
+            session,
+            value,
+        )
+
+    assert getattr(caught.value, "status_code", None) == 409
+    current = get_view(session, view.publication_id)
+    watch = get_review_watch(session, view.publication_id)
+    review_events = [
+        event
+        for event in load_events(session, view.publication_id)
+        if event["event_type"] == EventType.REVIEW_RECORDED.value
+    ]
     assert current.state is PublicationState.IN_REVIEW
     assert review_events == []
     assert watch.state == "STALE"
