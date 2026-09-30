@@ -1027,6 +1027,13 @@ transaction lock and then row-locks the selected item before re-reading state an
 appending `WORK_CLAIMED`. Specific-item claims also row-lock and re-read before
 mutation.
 
+Every claim carries a server-policy lease id and UTC expiry. An active implementer
+may renew the same lease identity. When the lease expires before implementation
+completion, the effective state derives back to `READY`; the stale actor can no
+longer submit implementation evidence, and a new claim with a new idempotency key
+may recover the work. The expired claim remains in the hash-chained ledger for
+audit rather than being deleted or rewritten.
+
 ### Fresh-session context
 
 Each work item stores an immutable versioned context snapshot and SHA-256 digest.
@@ -1072,6 +1079,7 @@ POST /api/v1/work/claim-next
 GET  /api/v1/work-items/{id}
 GET  /api/v1/work-items/{id}/events
 POST /api/v1/work-items/{id}/claim
+POST /api/v1/work-items/{id}/claim/renew
 POST /api/v1/work-items/{id}/claim/release
 POST /api/v1/work-items/{id}/implementation
 
