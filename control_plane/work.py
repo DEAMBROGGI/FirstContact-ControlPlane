@@ -266,6 +266,31 @@ def _append(
 
 
 def _fold_local(session: Session, work_item_id: str) -> _LocalState:
+    row = session.get(WorkItemRow, work_item_id)
+    if row is None:
+        raise KeyError(work_item_id)
+    events = load_work_item_events(session, work_item_id)
+    if not events or events[0]["event_type"] != "WORK_CREATED":
+        raise RuntimeError("work-item ledger is missing its creation event")
+
+    normalized_context, observed_digest = _context_payload(row.context_data)
+    if observed_digest != row.context_digest or normalized_context != row.context_data:
+        raise RuntimeError("work-item context identity is corrupt")
+
+    expected_created = {
+        "repository": row.repository,
+        "issue_number": row.issue_number,
+        "parent_work_item_id": row.parent_work_item_id,
+        "required_for_parent": row.required_for_parent,
+        "executable": row.executable,
+        "priority": row.priority,
+        "rank": row.rank,
+        "context_version": row.context_version,
+        "context_digest": row.context_digest,
+    }
+    if _canonical(events[0]["payload"]) != _canonical(expected_created):
+        raise RuntimeError("work-item immutable identity differs from its ledger")
+
     released = False
     suspended = False
     implementer: str | None = None
@@ -274,7 +299,7 @@ def _fold_local(session: Session, work_item_id: str) -> _LocalState:
     implemented = False
     completed = False
 
-    for event in load_work_item_events(session, work_item_id):
+    for event in events:
         event_type = event["event_type"]
         payload = event["payload"]
         if event_type == "WORK_RELEASED":
@@ -310,13 +335,23 @@ def _fold_local(session: Session, work_item_id: str) -> _LocalState:
 
 
 def _dependency_ids(session: Session, work_item_id: str) -> tuple[str, ...]:
-    return tuple(
+    materialized = tuple(
         session.scalars(
             select(WorkDependencyRow.depends_on_work_item_id)
             .where(WorkDependencyRow.work_item_id == work_item_id)
             .order_by(WorkDependencyRow.depends_on_work_item_id.asc())
         )
     )
+    ledger = tuple(
+        sorted(
+            str(event["payload"]["depends_on_work_item_id"])
+            for event in load_work_item_events(session, work_item_id)
+            if event["event_type"] == "WORK_DEPENDENCY_ADDED"
+        )
+    )
+    if materialized != ledger:
+        raise RuntimeError("work dependency projection differs from its ledger")
+    return materialized
 
 
 def _required_child_ids(session: Session, work_item_id: str) -> tuple[str, ...]:
