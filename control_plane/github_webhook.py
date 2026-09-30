@@ -17,7 +17,7 @@ from .github_api import GitHubApiError, GitHubRepositoryGateway
 from .github_app import GitHubAppTokenProvider, GitHubAuthError
 from .merge import MergeCoordinator, MergeError
 from .models import GitHubWebhookDeliveryRow, PublicationRow, ReviewWatchRow
-from .profile_registry import profile_for_repository
+from .profile_registry import ProfileError, profile_for_repository
 from .service import (
     get_view,
     mark_codex_review_unavailable,
@@ -167,7 +167,10 @@ def _repository_from_payload(payload: Mapping[str, Any]) -> str:
     if "/" not in full_name or len(full_name) > 200:
         raise GitHubWebhookError("GitHub webhook repository identity is invalid")
     # Registration/profile lookup is the repository allowlist.
-    profile_for_repository(full_name)
+    try:
+        profile_for_repository(full_name)
+    except ProfileError as exc:
+        raise GitHubWebhookError("GitHub webhook repository is not registered") from exc
     return full_name
 
 
@@ -605,6 +608,13 @@ class GitHubWebhookGateway:
             raise GitHubWebhookError("governed Codex trigger actor changed")
         if _parse_time(trigger.created_at) != trigger_time:
             raise GitHubWebhookError("governed Codex trigger timestamp changed")
+        marker = (
+            "<!-- firstcontact-control-plane:codex-review "
+            f"run={view.automated_review_run_id} "
+            f"head={view.automated_review_head_sha} -->"
+        )
+        if marker not in (trigger.body or ""):
+            raise GitHubWebhookError("governed Codex trigger marker changed")
 
         matches = []
         for item in comments:
