@@ -558,9 +558,10 @@ def create_work_item(
         return view
 
     if parent_work_item_id is not None:
-        parent = session.get(WorkItemRow, parent_work_item_id)
-        if parent is None:
-            raise DomainError("parent work item does not exist")
+        try:
+            parent = _lock_work_item(session, parent_work_item_id)
+        except KeyError as exc:
+            raise DomainError("parent work item does not exist") from exc
         if parent.repository != normalized_repository:
             raise DomainError("parent work item must belong to the same repository")
         if required_for_parent:
