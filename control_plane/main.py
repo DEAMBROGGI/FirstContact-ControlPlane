@@ -81,6 +81,7 @@ from .work import (
     load_work_item_events,
     next_work,
     release_claim,
+    release_work_item,
     renew_claim,
     resume_work_item,
     submit_work_implementation,
@@ -495,6 +496,29 @@ def work_item_claim_release(
                 work_item_id,
                 actor=request.actor,
                 reason=request.reason,
+                idempotency_key=request.idempotency_key,
+            )
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="work item not found") from exc
+    except DomainError as exc:
+        raise _conflict(exc) from exc
+
+
+@app.post(
+    "/api/v1/internal/work-items/{work_item_id}/release",
+    dependencies=[Depends(require_token)],
+)
+def work_item_release(
+    work_item_id: str,
+    request: IdempotencyRequest,
+    session: Session = Depends(get_session),
+):
+    try:
+        return _work_item_payload(
+            release_work_item(
+                session,
+                work_item_id,
                 idempotency_key=request.idempotency_key,
             )
         )
