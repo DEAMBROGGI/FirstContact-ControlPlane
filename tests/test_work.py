@@ -539,3 +539,125 @@ def test_dependency_cannot_be_added_after_claim(session):
             dependency.work_item_id,
             idempotency_key="2641:depends:2640",
         )
+
+
+def test_implementation_and_release_commands_are_retry_idempotent(session):
+    view = create(session, 2650)
+    claimed = claim_work_item(
+        session,
+        view.work_item_id,
+        actor=ACTOR,
+        idempotency_key="2650:claim",
+    )
+
+    released = release_claim(
+        session,
+        claimed.work_item_id,
+        actor=ACTOR,
+        reason="handoff",
+        idempotency_key="2650:release",
+    )
+    replayed_release = release_claim(
+        session,
+        claimed.work_item_id,
+        actor=ACTOR,
+        reason="handoff",
+        idempotency_key="2650:release",
+    )
+    assert released.state is WorkState.READY
+    assert replayed_release.state is WorkState.READY
+
+    reclaimed = claim_work_item(
+        session,
+        view.work_item_id,
+        actor=ACTOR,
+        idempotency_key="2650:reclaim",
+    )
+    implemented = submit_work_implementation(
+        session,
+        reclaimed.work_item_id,
+        actor=ACTOR,
+        summary="retry-safe implementation",
+        evidence_sha256=EVIDENCE,
+        idempotency_key="2650:implementation",
+    )
+    replayed_implementation = submit_work_implementation(
+        session,
+        reclaimed.work_item_id,
+        actor=ACTOR,
+        summary="retry-safe implementation",
+        evidence_sha256=EVIDENCE,
+        idempotency_key="2650:implementation",
+    )
+
+    assert implemented.state is WorkState.REVIEW
+    assert replayed_implementation.state is WorkState.REVIEW
+
+    with pytest.raises(DomainError, match="idempotency key"):
+        submit_work_implementation(
+            session,
+            reclaimed.work_item_id,
+            actor=ACTOR,
+            summary="different payload",
+            evidence_sha256=EVIDENCE,
+            idempotency_key="2650:implementation",
+        )
+
+
+def test_resume_and_complete_commands_are_retry_idempotent(session):
+    view = create(session, 2660)
+    suspend_work_item(
+        session,
+        view.work_item_id,
+        actor="planner:test",
+        reason="pause",
+        idempotency_key="2660:suspend",
+    )
+
+    resumed = resume_work_item(
+        session,
+        view.work_item_id,
+        actor="planner:test",
+        idempotency_key="2660:resume",
+    )
+    replayed_resume = resume_work_item(
+        session,
+        view.work_item_id,
+        actor="planner:test",
+        idempotency_key="2660:resume",
+    )
+    assert resumed.state is WorkState.READY
+    assert replayed_resume.state is WorkState.READY
+
+    claim_work_item(
+        session,
+        view.work_item_id,
+        actor=ACTOR,
+        idempotency_key="2660:claim",
+    )
+    submit_work_implementation(
+        session,
+        view.work_item_id,
+        actor=ACTOR,
+        summary="done",
+        evidence_sha256=EVIDENCE,
+        idempotency_key="2660:implementation",
+    )
+
+    completed = complete_work_item(
+        session,
+        view.work_item_id,
+        actor=REVIEWER,
+        evidence="accepted",
+        idempotency_key="2660:complete",
+    )
+    replayed_complete = complete_work_item(
+        session,
+        view.work_item_id,
+        actor=REVIEWER,
+        evidence="accepted",
+        idempotency_key="2660:complete",
+    )
+
+    assert completed.state is WorkState.DONE
+    assert replayed_complete.state is WorkState.DONE
