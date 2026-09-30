@@ -788,13 +788,19 @@ async def github_webhook_receive(
             signature=x_hub_signature_256,
             body=body,
         )
+    except GitHubWebhookAuthError as exc:
+        raise HTTPException(status_code=401, detail="invalid GitHub webhook signature") from exc
+    except DomainError as exc:
+        raise _conflict(exc) from exc
+    except GitHubWebhookError as exc:
+        raise HTTPException(status_code=400, detail="invalid GitHub webhook delivery") from exc
+
+    try:
         processing = gateway.process_delivery(session, receipt.delivery_id)
         return {
             "delivery": asdict(receipt),
             "processing": asdict(processing),
         }
-    except GitHubWebhookAuthError as exc:
-        raise HTTPException(status_code=401, detail="invalid GitHub webhook signature") from exc
     except DomainError as exc:
         raise _conflict(exc) from exc
     except GitHubWebhookError as exc:
