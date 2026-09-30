@@ -10,6 +10,7 @@ import pytest
 from control_plane.domain import (
     AutomatedReviewStatus,
     DomainError,
+    EventType,
     PublicationState,
     ValidationStatus,
 )
@@ -31,6 +32,7 @@ from control_plane.github_webhook import (
 from control_plane.models import GitHubWebhookDeliveryRow
 from control_plane.profile_registry import profile_for_repository
 from control_plane.quarantine import VerifiedCandidateSource
+from control_plane.repository import load_events
 from control_plane.service import (
     claim_codex_review_trigger_dispatch,
     complete_codex_review,
@@ -512,3 +514,159 @@ def test_review_watch_reconstructs_provider_next_action_from_publication(session
         CODEX_ACTOR.lower(),
         HUMAN_ACTOR.lower(),
     }
+
+
+
+def test_duplicate_human_review_delivery_does_not_duplicate_review_event(session):
+    view = complete_codex_pass(session, start_codex(session, published(session)))
+    github = FakeGitHub()
+    github.reviews = [
+        PullReviewSnapshot(
+            review_id=804,
+            actor=HUMAN_ACTOR,
+            body="same approval replayed",
+            state="APPROVED",
+            commit_id=HEAD,
+            submitted_at="2026-09-30T12:08:00Z",
+        )
+    ]
+    value = gateway(github)
+
+    body, signature = raw_delivery(
+        event_name="pull_request_review",
+        review_id=804,
+        review_actor=HUMAN_ACTOR,
+    )
+    first = value.ingest(
+        session,
+        delivery_id="delivery-human-replay-1",
+        event_name="pull_request_review",
+        signature=signature,
+        body=body,
+    )
+    value.process_delivery(session, first.delivery_id)
+
+    second = value.ingest(
+        session,
+        delivery_id="delivery-human-replay-2",
+        event_name="pull_request_review",
+        signature=signature,
+        body=body,
+    )
+    replay = value.process_delivery(session, second.delivery_id)
+
+    review_events = [
+        event
+        for event in load_events(session, view.publication_id)
+        if event["event_type"] == EventType.REVIEW_RECORDED.value
+    ]
+    assert len(review_events) == 1
+    assert replay.outcome.startswith("HUMAN_APPROVED_ALREADY_RECORDED")
+    assert get_webhook_delivery(session, second.delivery_id).state == "PROCESSED"
+
+
+def test_pull_request_synchronize_with_unrecorded_head_marks_watch_stale(session):
+    view = start_codex(session, published(session))
+    github = FakeGitHub()
+    github.head_sha = "4" * 40
+    value = gateway(github)
+    sync_review_watch(
+        session,
+        view.publication_id,
+        expected_actors=(CODEX_ACTOR, HUMAN_ACTOR),
+    )
+
+    body, signature = raw_delivery(
+        event_name="pull_request",
+        action="synchronize",
+    )
+    receipt = value.ingest(
+        session,
+        delivery_id="delivery-sync-stale",
+        event_name="pull_request",
+        signature=signature,
+        body=body,
+    )
+    result = value.process_delivery(session, receipt.delivery_id)
+
+    current = get_view(session, view.publication_id)
+    watch = get_review_watch(session, view.publication_id)
+    assert current.remote_head_sha == HEAD
+    assert current.automated_review_status is AutomatedReviewStatus.RUNNING
+    assert watch.state == "STALE"
+    assert result.outcome == "STALE_HEAD"
+    assert result.next_action == "BLOCKED"
+
+
+def test_lost_usage_limit_webhook_converges_through_reconciliation(session):
+    view = start_codex(session, published(session))
+    github = FakeGitHub()
+    github.issue_comments = [
+        IssueCommentSnapshot(
+            comment_id=700,
+            actor=HUMAN_ACTOR,
+            body=(
+                "@codex review\n\n"
+                f"<!-- firstcontact-control-plane:codex-review "
+                f"run={view.automated_review_run_id} head={HEAD} -->"
+            ),
+            created_at=TRIGGER_AT,
+        ),
+        IssueCommentSnapshot(
+            comment_id=705,
+            actor=CODEX_ACTOR,
+            body=USAGE_LIMIT,
+            created_at="2026-09-30T12:09:00Z",
+        ),
+    ]
+    value = gateway(github)
+
+    result = value.reconcile_publication(
+        session,
+        view.publication_id,
+    )
+
+    current = get_view(session, view.publication_id)
+    assert current.automated_review_status is AutomatedReviewStatus.UNAVAILABLE
+    assert result.outcome == "RECONCILED"
+    assert result.next_action == "PRINCIPAL_FALLBACK"
+
+
+def test_usage_limit_with_mutated_trigger_marker_fails_closed(session):
+    view = start_codex(session, published(session))
+    github = FakeGitHub()
+    github.issue_comments = [
+        IssueCommentSnapshot(
+            comment_id=700,
+            actor=HUMAN_ACTOR,
+            body="@codex review without governed marker",
+            created_at=TRIGGER_AT,
+        ),
+        IssueCommentSnapshot(
+            comment_id=706,
+            actor=CODEX_ACTOR,
+            body=USAGE_LIMIT,
+            created_at="2026-09-30T12:10:00Z",
+        ),
+    ]
+    value = gateway(github)
+
+    body, signature = raw_delivery(
+        event_name="issue_comment",
+        comment_id=706,
+    )
+    receipt = value.ingest(
+        session,
+        delivery_id="delivery-mutated-trigger",
+        event_name="issue_comment",
+        signature=signature,
+        body=body,
+    )
+
+    from control_plane.github_webhook import GitHubWebhookError
+
+    with pytest.raises(GitHubWebhookError, match="trigger marker changed"):
+        value.process_delivery(session, receipt.delivery_id)
+
+    assert get_view(session, view.publication_id).automated_review_status is AutomatedReviewStatus.RUNNING
+    assert get_webhook_delivery(session, receipt.delivery_id).state == "PENDING"
