@@ -297,6 +297,9 @@ def _work_item_payload(view: WorkItemView):
 
 
 def _sync_publication_watch(session: Session, publication_id: str):
+    view = get_view(session, publication_id)
+    if view.pull_request_number is None or view.remote_head_sha is None:
+        return None
     return sync_review_watch(
         session,
         publication_id,
