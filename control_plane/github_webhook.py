@@ -11,10 +11,20 @@ from typing import Any, Mapping
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from .domain import AutomatedReviewStatus, DomainError, PublicationState
+from .codex_review import CodexReviewBroker, CodexReviewError
+from .domain import AutomatedReviewStatus, DomainError, PublicationState, ReviewDecision
+from .github_api import GitHubApiError, GitHubRepositoryGateway
+from .github_app import GitHubAppTokenProvider, GitHubAuthError
+from .merge import MergeCoordinator, MergeError
 from .models import GitHubWebhookDeliveryRow, PublicationRow, ReviewWatchRow
 from .profile_registry import profile_for_repository
-from .service import get_view, required_review_adjudication
+from .service import (
+    get_view,
+    mark_codex_review_unavailable,
+    record_mergeability,
+    record_review,
+    required_review_adjudication,
+)
 
 _SUPPORTED_EVENTS = frozenset(
     {
@@ -436,3 +446,696 @@ def mark_delivery_retry(
 
 def watch_payload(view: ReviewWatchView) -> dict[str, Any]:
     return asdict(view)
+
+
+_CODEX_USAGE_LIMIT_RE = re.compile(
+    r"(?is)reached\s+your\s+codex\s+usage\s+limits\s+for\s+code\s+reviews"
+)
+
+
+class GitHubWebhookDeferred(GitHubWebhookError):
+    """Evidence is valid but a prerequisite is not yet authoritative."""
+
+
+@dataclass(frozen=True, slots=True)
+class WebhookProcessResult:
+    delivery_id: str | None
+    publication_id: str | None
+    outcome: str
+    next_role: str
+    next_action: str
+    watch_state: str | None
+
+
+def _parse_time(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(
+            timezone.utc
+        )
+    except ValueError as exc:
+        raise GitHubWebhookError("GitHub evidence timestamp is invalid") from exc
+
+
+class GitHubWebhookGateway:
+    """Durable wake-up gateway that always re-reads GitHub before domain mutation."""
+
+    def __init__(
+        self,
+        *,
+        token_provider: GitHubAppTokenProvider,
+        github: GitHubRepositoryGateway,
+        codex_review_mode: str,
+        codex_actors: tuple[str, ...],
+        human_review_actors: tuple[str, ...],
+        webhook_secret: str,
+        maximum_payload_bytes: int,
+    ) -> None:
+        self.token_provider = token_provider
+        self.github = github
+        self.codex_review_mode = codex_review_mode.strip().lower()
+        self.codex_actors = tuple(
+            sorted({_normalize_actor(value) for value in codex_actors if value.strip()})
+        )
+        self.human_review_actors = tuple(
+            sorted({_normalize_actor(value) for value in human_review_actors if value.strip()})
+        )
+        self.webhook_secret = webhook_secret
+        self.maximum_payload_bytes = maximum_payload_bytes
+
+    @property
+    def expected_actors(self) -> tuple[str, ...]:
+        return tuple(sorted(set(self.codex_actors) | set(self.human_review_actors)))
+
+    def ingest(
+        self,
+        session: Session,
+        *,
+        delivery_id: str,
+        event_name: str,
+        signature: str | None,
+        body: bytes,
+    ) -> WebhookDeliveryView:
+        return persist_webhook_delivery(
+            session,
+            delivery_id=delivery_id,
+            event_name=event_name,
+            signature=signature,
+            body=body,
+            secret=self.webhook_secret,
+            maximum_bytes=self.maximum_payload_bytes,
+        )
+
+    def _access(self, repository: str):
+        return self.token_provider.installation_access(
+            repository,
+            permissions={
+                "contents": "read",
+                "issues": "read",
+                "pull_requests": "read",
+            },
+        )
+
+    @staticmethod
+    def _verify_pull_identity(view, pull) -> None:
+        if view.pull_request_number is None or view.remote_head_sha is None:
+            raise GitHubWebhookError("publication has no canonical PR identity")
+        if pull.number != view.pull_request_number:
+            raise GitHubWebhookError("canonical pull request number changed")
+        if view.remote_branch is not None and pull.head_ref != view.remote_branch:
+            raise GitHubWebhookError("canonical pull request branch changed")
+        if view.base_branch is not None and pull.base_ref != view.base_branch:
+            raise GitHubWebhookError("canonical pull request base changed")
+
+    def _read_pull(self, view, token: str):
+        assert view.pull_request_number is not None
+        pull = self.github.pull_request(
+            view.repository,
+            view.pull_request_number,
+            token,
+        )
+        self._verify_pull_identity(view, pull)
+        return pull
+
+    def _codex_broker(self) -> CodexReviewBroker:
+        return CodexReviewBroker(
+            token_provider=self.token_provider,
+            github=self.github,
+            mode=self.codex_review_mode,
+            allowed_actors=self.codex_actors,
+            trigger_user=None,
+        )
+
+    def _maybe_mark_codex_unavailable_from_comment(
+        self,
+        session: Session,
+        publication_id: str,
+        *,
+        comment_id: int | None,
+        token: str,
+    ) -> bool:
+        view = get_view(session, publication_id)
+        if (
+            view.automated_review_status is not AutomatedReviewStatus.RUNNING
+            or view.automated_review_run_id is None
+            or view.automated_review_head_sha is None
+            or view.automated_review_triggered_at is None
+            or view.pull_request_number is None
+        ):
+            return False
+
+        trigger_time = _parse_time(view.automated_review_triggered_at)
+        comments = self.github.list_issue_comments(
+            view.repository,
+            view.pull_request_number,
+            token,
+        )
+        matches = []
+        for item in comments:
+            if comment_id is not None and item.comment_id != comment_id:
+                continue
+            created = _parse_time(item.created_at)
+            if (
+                _normalize_actor(item.actor) in self.codex_actors
+                and created is not None
+                and trigger_time is not None
+                and created >= trigger_time
+                and _CODEX_USAGE_LIMIT_RE.search(item.body or "")
+            ):
+                matches.append(item)
+
+        if len(matches) > 1:
+            raise GitHubWebhookError("Codex usage-limit evidence is ambiguous")
+        if not matches:
+            return False
+
+        evidence = matches[0]
+        if evidence.comment_id == view.automated_review_trigger_comment_id:
+            raise GitHubWebhookError("Codex usage-limit evidence collides with trigger")
+
+        mark_codex_review_unavailable(
+            session,
+            publication_id,
+            run_id=view.automated_review_run_id,
+            reviewed_head_sha=view.automated_review_head_sha,
+            reason=f"CODEX_PROVIDER_USAGE_LIMIT:{evidence.comment_id}",
+        )
+        return True
+
+    def _reconcile_codex(
+        self,
+        session: Session,
+        publication_id: str,
+        *,
+        token: str,
+        comment_id: int | None = None,
+    ) -> str:
+        if self._maybe_mark_codex_unavailable_from_comment(
+            session,
+            publication_id,
+            comment_id=comment_id,
+            token=token,
+        ):
+            return "CODEX_UNAVAILABLE"
+
+        view = get_view(session, publication_id)
+        if view.automated_review_status is not AutomatedReviewStatus.RUNNING:
+            return "CODEX_NOT_RUNNING"
+
+        observation = self._codex_broker().reconcile(session, publication_id)
+        return "CODEX_" + observation.state
+
+    def _human_review_from_payload(
+        self,
+        session: Session,
+        publication_id: str,
+        *,
+        payload: Mapping[str, Any],
+        token: str,
+    ) -> str:
+        raw_review = payload.get("review")
+        if not isinstance(raw_review, Mapping):
+            return "NO_HUMAN_REVIEW"
+        try:
+            review_id = int(raw_review.get("id"))
+        except (TypeError, ValueError):
+            return "NO_HUMAN_REVIEW"
+        if review_id <= 0:
+            return "NO_HUMAN_REVIEW"
+
+        view = get_view(session, publication_id)
+        if view.pull_request_number is None or view.remote_head_sha is None:
+            raise GitHubWebhookError("human review publication metadata is incomplete")
+
+        reviews = self.github.list_pull_reviews(
+            view.repository,
+            view.pull_request_number,
+            token,
+        )
+        matches = [item for item in reviews if item.review_id == review_id]
+        if len(matches) != 1:
+            raise GitHubWebhookError("human review receipt is missing or ambiguous")
+
+        review = matches[0]
+        actor = _normalize_actor(review.actor)
+        if actor not in self.human_review_actors:
+            return "NON_HUMAN_REVIEW_ACTOR"
+        if review.commit_id != view.remote_head_sha:
+            return "STALE_HUMAN_REVIEW"
+
+        state = review.state.strip().upper()
+        if state == "APPROVED":
+            decision = ReviewDecision.APPROVED
+        elif state in {"CHANGES_REQUESTED", "REQUEST_CHANGES"}:
+            decision = ReviewDecision.CHANGES_REQUIRED
+        else:
+            return "NON_DECISION_HUMAN_REVIEW"
+
+        try:
+            record_review(
+                session,
+                publication_id,
+                reviewed_head_sha=review.commit_id,
+                decision=decision,
+                require_codex_review=(self.codex_review_mode == "required"),
+            )
+        except DomainError as exc:
+            raise GitHubWebhookDeferred(str(exc)) from exc
+        return "HUMAN_" + decision.value
+
+    def _mergeability_if_ready(
+        self,
+        session: Session,
+        publication_id: str,
+        *,
+        pull,
+    ) -> str:
+        view = get_view(session, publication_id)
+        if view.state is not PublicationState.APPROVED:
+            return "MERGEABILITY_NOT_ELIGIBLE"
+        if pull.head_sha != view.remote_head_sha:
+            return "STALE_MERGEABILITY"
+        if pull.mergeable is None:
+            return "MERGEABILITY_PENDING"
+        record_mergeability(
+            session,
+            publication_id,
+            head_sha=pull.head_sha,
+            mergeable=pull.mergeable,
+        )
+        return "MERGEABILITY_RECORDED"
+
+    def _reconcile_human_from_github(
+        self,
+        session: Session,
+        publication_id: str,
+        *,
+        token: str,
+    ) -> str:
+        view = get_view(session, publication_id)
+        if (
+            view.state is not PublicationState.IN_REVIEW
+            or required_review_adjudication(session, publication_id) is None
+            or view.pull_request_number is None
+            or view.remote_head_sha is None
+        ):
+            return "HUMAN_NOT_ELIGIBLE"
+        if not self.human_review_actors:
+            return "HUMAN_ACTOR_ALLOWLIST_EMPTY"
+
+        reviews = self.github.list_pull_reviews(
+            view.repository,
+            view.pull_request_number,
+            token,
+        )
+        candidates = [
+            item
+            for item in reviews
+            if _normalize_actor(item.actor) in self.human_review_actors
+            and item.commit_id == view.remote_head_sha
+            and item.state.strip().upper() in {
+                "APPROVED",
+                "CHANGES_REQUESTED",
+                "REQUEST_CHANGES",
+            }
+            and item.submitted_at is not None
+        ]
+        if not candidates:
+            return "HUMAN_REVIEW_NOT_FOUND"
+
+        candidates.sort(
+            key=lambda item: (_parse_time(item.submitted_at) or datetime.min.replace(tzinfo=timezone.utc), item.review_id)
+        )
+        selected = candidates[-1]
+        decision = (
+            ReviewDecision.APPROVED
+            if selected.state.strip().upper() == "APPROVED"
+            else ReviewDecision.CHANGES_REQUIRED
+        )
+        record_review(
+            session,
+            publication_id,
+            reviewed_head_sha=selected.commit_id,
+            decision=decision,
+            require_codex_review=(self.codex_review_mode == "required"),
+        )
+        return "HUMAN_" + decision.value
+
+    def reconcile_publication(
+        self,
+        session: Session,
+        publication_id: str,
+        *,
+        last_delivery_id: str | None = None,
+    ) -> WebhookProcessResult:
+        view = get_view(session, publication_id)
+        if view.pull_request_number is None or view.remote_head_sha is None:
+            raise GitHubWebhookError("publication is not published")
+
+        try:
+            access = self._access(view.repository)
+            pull = self._read_pull(view, access.token)
+        except (GitHubAuthError, GitHubApiError) as exc:
+            raise GitHubWebhookError("GitHub review readback failed closed") from exc
+
+        if pull.head_sha != view.remote_head_sha:
+            watch = sync_review_watch(
+                session,
+                publication_id,
+                expected_actors=self.expected_actors,
+                last_delivery_id=last_delivery_id,
+                state="STALE",
+            )
+            return WebhookProcessResult(
+                delivery_id=last_delivery_id,
+                publication_id=publication_id,
+                outcome="STALE_HEAD",
+                next_role="CONTROL_PLANE",
+                next_action="BLOCKED",
+                watch_state=watch.state,
+            )
+
+        if view.automated_review_status is AutomatedReviewStatus.RUNNING:
+            self._reconcile_codex(
+                session,
+                publication_id,
+                token=access.token,
+            )
+
+        self._reconcile_human_from_github(
+            session,
+            publication_id,
+            token=access.token,
+        )
+
+        view = get_view(session, publication_id)
+        pull = self._read_pull(view, access.token)
+
+        if view.state is PublicationState.APPROVED:
+            self._mergeability_if_ready(
+                session,
+                publication_id,
+                pull=pull,
+            )
+
+        view = get_view(session, publication_id)
+        if pull.merged or view.state is PublicationState.MERGED:
+            try:
+                MergeCoordinator(
+                    token_provider=self.token_provider,
+                    github=self.github,
+                ).reconcile(session, publication_id)
+            except (MergeError, DomainError) as exc:
+                raise GitHubWebhookError("merge reconciliation failed closed") from exc
+
+        watch = sync_review_watch(
+            session,
+            publication_id,
+            expected_actors=self.expected_actors,
+            last_delivery_id=last_delivery_id,
+        )
+        return WebhookProcessResult(
+            delivery_id=last_delivery_id,
+            publication_id=publication_id,
+            outcome="RECONCILED",
+            next_role=watch.next_role,
+            next_action=watch.next_action,
+            watch_state=watch.state,
+        )
+
+    def _process_pull_delivery(
+        self,
+        session: Session,
+        publication_id: str,
+        row: GitHubWebhookDeliveryRow,
+        *,
+        token: str,
+    ) -> str:
+        view = get_view(session, publication_id)
+        pull = self._read_pull(view, token)
+
+        if row.event_name == "pull_request" and row.action == "synchronize":
+            if pull.head_sha != view.remote_head_sha:
+                sync_review_watch(
+                    session,
+                    publication_id,
+                    expected_actors=self.expected_actors,
+                    last_delivery_id=row.delivery_id,
+                    state="STALE",
+                )
+                return "STALE_HEAD"
+            return "SYNCHRONIZE_MATCHED"
+
+        if pull.head_sha != view.remote_head_sha:
+            sync_review_watch(
+                session,
+                publication_id,
+                expected_actors=self.expected_actors,
+                last_delivery_id=row.delivery_id,
+                state="STALE",
+            )
+            return "STALE_HEAD"
+
+        if row.event_name == "issue_comment":
+            raw_comment = row.payload.get("comment")
+            comment_id = None
+            if isinstance(raw_comment, Mapping):
+                try:
+                    comment_id = int(raw_comment.get("id"))
+                except (TypeError, ValueError):
+                    comment_id = None
+            return self._reconcile_codex(
+                session,
+                publication_id,
+                token=token,
+                comment_id=comment_id,
+            )
+
+        if row.event_name == "pull_request_review":
+            raw_review = row.payload.get("review")
+            actor = ""
+            if isinstance(raw_review, Mapping):
+                user = raw_review.get("user")
+                if isinstance(user, Mapping):
+                    actor = _normalize_actor(str(user.get("login") or ""))
+
+            if actor in self.codex_actors:
+                return self._reconcile_codex(
+                    session,
+                    publication_id,
+                    token=token,
+                )
+            return self._human_review_from_payload(
+                session,
+                publication_id,
+                payload=row.payload,
+                token=token,
+            )
+
+        if row.event_name == "pull_request_review_comment":
+            view = get_view(session, publication_id)
+            if view.automated_review_status is AutomatedReviewStatus.RUNNING:
+                return self._reconcile_codex(
+                    session,
+                    publication_id,
+                    token=token,
+                )
+            return "REVIEW_COMMENT_OBSERVED"
+
+        if row.event_name == "pull_request" and row.action == "closed":
+            try:
+                MergeCoordinator(
+                    token_provider=self.token_provider,
+                    github=self.github,
+                ).reconcile(session, publication_id)
+            except (MergeError, DomainError) as exc:
+                raise GitHubWebhookError("closed PR reconciliation failed closed") from exc
+            return "PULL_CLOSED_RECONCILED"
+
+        if row.event_name == "pull_request":
+            return "PULL_OBSERVED"
+
+        return "EVENT_OBSERVED"
+
+    def _process_push(
+        self,
+        session: Session,
+        row: GitHubWebhookDeliveryRow,
+    ) -> str:
+        raw_ref = str(row.payload.get("ref") or "")
+        if not raw_ref.startswith("refs/heads/"):
+            return "PUSH_IGNORED_REF"
+        branch = raw_ref.removeprefix("refs/heads/")
+
+        try:
+            access = self._access(row.repository)
+            current_sha = self.github.ref_sha(
+                row.repository,
+                branch,
+                access.token,
+            )
+        except (GitHubAuthError, GitHubApiError) as exc:
+            raise GitHubWebhookError("push ref readback failed closed") from exc
+
+        stale = 0
+        watches = list(
+            session.scalars(
+                select(ReviewWatchRow).where(
+                    ReviewWatchRow.repository == row.repository,
+                    ReviewWatchRow.state == "ACTIVE",
+                )
+            )
+        )
+        for watch_row in watches:
+            view = get_view(session, watch_row.publication_id)
+            candidate = view.current_candidate
+            if (
+                view.base_branch == branch
+                and candidate is not None
+                and current_sha is not None
+                and candidate.base_sha != current_sha
+                and view.state is not PublicationState.MERGED
+            ):
+                watch_row.state = "STALE"
+                watch_row.next_role = "CONTROL_PLANE"
+                watch_row.next_action = "BLOCKED"
+                watch_row.last_delivery_id = row.delivery_id
+                watch_row.last_reconciled_at = _utcnow()
+                stale += 1
+        session.commit()
+        return f"BASE_PUSH_STALE:{stale}"
+
+    def process_delivery(
+        self,
+        session: Session,
+        delivery_id: str,
+    ) -> WebhookProcessResult:
+        row = session.scalar(
+            select(GitHubWebhookDeliveryRow)
+            .where(GitHubWebhookDeliveryRow.delivery_id == delivery_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if row is None:
+            raise KeyError(delivery_id)
+
+        if row.state in {"PROCESSED", "IGNORED"}:
+            publication_id = (
+                publication_for_pull(session, row.repository, row.pull_request_number)
+                if row.pull_request_number is not None
+                else None
+            )
+            watch = (
+                session.get(ReviewWatchRow, publication_id)
+                if publication_id is not None
+                else None
+            )
+            return WebhookProcessResult(
+                delivery_id=row.delivery_id,
+                publication_id=publication_id,
+                outcome=row.state,
+                next_role=watch.next_role if watch else "NONE",
+                next_action=watch.next_action if watch else "DONE",
+                watch_state=watch.state if watch else None,
+            )
+
+        if row.event_name not in _SUPPORTED_EVENTS:
+            mark_delivery_processed(session, delivery_id, state="IGNORED")
+            return WebhookProcessResult(
+                delivery_id=delivery_id,
+                publication_id=None,
+                outcome="UNSUPPORTED_EVENT",
+                next_role="NONE",
+                next_action="DONE",
+                watch_state=None,
+            )
+
+        if row.event_name == "push":
+            outcome = self._process_push(session, row)
+            mark_delivery_processed(session, delivery_id)
+            return WebhookProcessResult(
+                delivery_id=delivery_id,
+                publication_id=None,
+                outcome=outcome,
+                next_role="CONTROL_PLANE",
+                next_action="BLOCKED" if "STALE:" in outcome and not outcome.endswith(":0") else "DONE",
+                watch_state=None,
+            )
+
+        if row.pull_request_number is None:
+            mark_delivery_processed(session, delivery_id, state="IGNORED")
+            return WebhookProcessResult(
+                delivery_id=delivery_id,
+                publication_id=None,
+                outcome="NO_PULL_REQUEST",
+                next_role="NONE",
+                next_action="DONE",
+                watch_state=None,
+            )
+
+        publication_id = publication_for_pull(
+            session,
+            row.repository,
+            row.pull_request_number,
+        )
+        if publication_id is None:
+            mark_delivery_processed(session, delivery_id, state="IGNORED")
+            return WebhookProcessResult(
+                delivery_id=delivery_id,
+                publication_id=None,
+                outcome="UNMANAGED_PULL_REQUEST",
+                next_role="NONE",
+                next_action="DONE",
+                watch_state=None,
+            )
+
+        try:
+            access = self._access(row.repository)
+            outcome = self._process_pull_delivery(
+                session,
+                publication_id,
+                row,
+                token=access.token,
+            )
+            watch = sync_review_watch(
+                session,
+                publication_id,
+                expected_actors=self.expected_actors,
+                last_delivery_id=delivery_id,
+                state=("STALE" if outcome == "STALE_HEAD" else None),
+            )
+            mark_delivery_processed(session, delivery_id)
+            return WebhookProcessResult(
+                delivery_id=delivery_id,
+                publication_id=publication_id,
+                outcome=outcome,
+                next_role=watch.next_role if outcome != "STALE_HEAD" else "CONTROL_PLANE",
+                next_action=watch.next_action if outcome != "STALE_HEAD" else "BLOCKED",
+                watch_state=watch.state,
+            )
+        except GitHubWebhookDeferred as exc:
+            mark_delivery_retry(session, delivery_id, str(exc))
+            watch = sync_review_watch(
+                session,
+                publication_id,
+                expected_actors=self.expected_actors,
+                last_delivery_id=delivery_id,
+            )
+            return WebhookProcessResult(
+                delivery_id=delivery_id,
+                publication_id=publication_id,
+                outcome="DEFERRED",
+                next_role=watch.next_role,
+                next_action=watch.next_action,
+                watch_state=watch.state,
+            )
+        except (GitHubAuthError, GitHubApiError, CodexReviewError, GitHubWebhookError) as exc:
+            mark_delivery_retry(session, delivery_id, str(exc))
+            raise
+
+    def reconcile_pending(self, session: Session) -> tuple[WebhookProcessResult, ...]:
+        results = []
+        for delivery_id in list_pending_delivery_ids(session):
+            results.append(self.process_delivery(session, delivery_id))
+        return tuple(results)
