@@ -1093,6 +1093,7 @@ POST /api/v1/work-items/{id}/claim/renew
 POST /api/v1/work-items/{id}/claim/release
 POST /api/v1/work-items/{id}/implementation
 
+POST /api/v1/internal/work-items/{id}/release
 POST /api/v1/internal/work-items/{id}/complete
 POST /api/v1/internal/work-items/{id}/suspend
 POST /api/v1/internal/work-items/{id}/resume
