@@ -1,3 +1,4 @@
+from fastapi import HTTPException
 from __future__ import annotations
 
 import hashlib
@@ -575,7 +576,7 @@ def test_direct_human_review_endpoint_is_blocked_when_base_ref_drifted(session):
     github.ref_shas["master"] = "4" * 40
     value = gateway(github)
 
-    with pytest.raises(Exception) as caught:
+    with pytest.raises(HTTPException) as caught:
         review_record(
             view.publication_id,
             ReviewRequest(
@@ -586,7 +587,7 @@ def test_direct_human_review_endpoint_is_blocked_when_base_ref_drifted(session):
             value,
         )
 
-    assert getattr(caught.value, "status_code", None) == 409
+    assert caught.value.status_code == 409
     current = get_view(session, view.publication_id)
     watch = get_review_watch(session, view.publication_id)
     review_events = [
