@@ -717,6 +717,19 @@ class GitHubWebhookGateway:
         else:
             return "NON_DECISION_HUMAN_REVIEW"
 
+        current = get_view(session, publication_id)
+        if (
+            current.review_decision is decision
+            and current.remote_head_sha == review.commit_id
+            and current.state in {
+                PublicationState.APPROVED,
+                PublicationState.READY_TO_MERGE,
+                PublicationState.MERGED,
+                PublicationState.CHANGES_REQUIRED,
+            }
+        ):
+            return "HUMAN_" + decision.value + "_ALREADY_RECORDED"
+
         try:
             record_review(
                 session,
