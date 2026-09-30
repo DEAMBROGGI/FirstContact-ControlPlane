@@ -563,6 +563,16 @@ def create_work_item(
             raise DomainError("parent work item does not exist")
         if parent.repository != normalized_repository:
             raise DomainError("parent work item must belong to the same repository")
+        if required_for_parent:
+            parent_view = get_work_item(session, parent.id)
+            if parent_view.state in {
+                WorkState.IN_PROGRESS,
+                WorkState.REVIEW,
+                WorkState.DONE,
+            }:
+                raise DomainError(
+                    "required child cannot be added after parent implementation starts"
+                )
 
     work_item_id = str(
         uuid.uuid5(
