@@ -88,11 +88,25 @@ def test_work_api_claim_next_returns_complete_fresh_session_context(session):
         assert payload["state"] == "IN_PROGRESS"
         assert payload["next_role"] == "IMPLEMENTER"
         assert payload["next_action"] == "IMPLEMENT"
+        assert payload["claim_lease_id"]
+        assert payload["claim_expires_at"]
         assert payload["context"]["instructions"] == [
             "lock",
             "re-read",
             "append event",
         ]
+
+        renewed = client.post(
+            f"/api/v1/work-items/{payload['work_item_id']}/claim/renew",
+            headers=HEADERS,
+            json={
+                "actor": "implementer:fresh-session",
+                "idempotency_key": "api:claim-renew:2702",
+            },
+        )
+        assert renewed.status_code == 200
+        assert renewed.json()["claim_lease_id"] == payload["claim_lease_id"]
+        assert renewed.json()["state"] == "IN_PROGRESS"
     finally:
         app.dependency_overrides.clear()
 
