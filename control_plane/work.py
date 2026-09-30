@@ -80,6 +80,9 @@ class WorkItemView:
 
 @dataclass(frozen=True, slots=True)
 class _LocalState:
+    context_version: int
+    context_digest: str
+    context: dict[str, Any]
     released: bool
     suspended: bool
     implementer: str | None
@@ -305,9 +308,13 @@ def _fold_local(session: Session, work_item_id: str) -> _LocalState:
     if not events or events[0]["event_type"] != "WORK_CREATED":
         raise RuntimeError("work-item ledger is missing its creation event")
 
-    normalized_context, observed_digest = _context_payload(row.context_data)
-    if observed_digest != row.context_digest or normalized_context != row.context_data:
-        raise RuntimeError("work-item context identity is corrupt")
+    created = events[0]["payload"]
+    if not isinstance(created, dict):
+        raise RuntimeError("work-item creation payload is invalid")
+    ledger_context = created.get("context")
+    if not isinstance(ledger_context, dict):
+        raise RuntimeError("work-item ledger is missing versioned context")
+    normalized_context, observed_digest = _context_payload(ledger_context)
 
     expected_created = {
         "repository": row.repository,
@@ -319,9 +326,14 @@ def _fold_local(session: Session, work_item_id: str) -> _LocalState:
         "rank": row.rank,
         "context_version": row.context_version,
         "context_digest": row.context_digest,
+        "context": normalized_context,
     }
-    if _canonical(events[0]["payload"]) != _canonical(expected_created):
+    if _canonical(created) != _canonical(expected_created):
         raise RuntimeError("work-item immutable identity differs from its ledger")
+    if observed_digest != row.context_digest:
+        raise RuntimeError("work-item ledger context digest is invalid")
+    if normalized_context != row.context_data:
+        raise RuntimeError("work-item context projection differs from its ledger")
 
     released = False
     suspended = False
@@ -379,6 +391,9 @@ def _fold_local(session: Session, work_item_id: str) -> _LocalState:
         claim_expires_at = None
 
     return _LocalState(
+        context_version=row.context_version,
+        context_digest=row.context_digest,
+        context=normalized_context,
         released=released,
         suspended=suspended,
         implementer=implementer,
@@ -412,16 +427,28 @@ def _dependency_ids(session: Session, work_item_id: str) -> tuple[str, ...]:
 
 
 def _required_child_ids(session: Session, work_item_id: str) -> tuple[str, ...]:
-    return tuple(
+    parent = session.get(WorkItemRow, work_item_id)
+    if parent is None:
+        raise KeyError(work_item_id)
+    children: list[str] = []
+    candidates = list(
         session.scalars(
-            select(WorkItemRow.id)
-            .where(
-                WorkItemRow.parent_work_item_id == work_item_id,
-                WorkItemRow.required_for_parent.is_(True),
-            )
+            select(WorkItemRow)
+            .where(WorkItemRow.repository == parent.repository)
             .order_by(WorkItemRow.id.asc())
         )
     )
+    for candidate in candidates:
+        events = load_work_item_events(session, candidate.id)
+        if not events or events[0]["event_type"] != "WORK_CREATED":
+            raise RuntimeError("work-item ledger is missing its creation event")
+        created = events[0]["payload"]
+        if (
+            created.get("parent_work_item_id") == work_item_id
+            and created.get("required_for_parent") is True
+        ):
+            children.append(candidate.id)
+    return tuple(children)
 
 
 def _next_for(
@@ -522,9 +549,9 @@ def _view(
             priority=row.priority,
             topology_order=topology_orders[row.id],
             rank=row.rank,
-            context_version=row.context_version,
-            context_digest=row.context_digest,
-            context=dict(row.context_data),
+            context_version=local.context_version,
+            context_digest=local.context_digest,
+            context=dict(local.context),
             state=state,
             released=local.released,
             suspended=local.suspended,
@@ -730,6 +757,7 @@ def create_work_item(
             "rank": rank,
             "context_version": 1,
             "context_digest": context_digest,
+            "context": normalized_context,
         },
     )
     if released:
@@ -783,8 +811,13 @@ def _blocking_graph(session: Session, repository: str) -> dict[str, set[str]]:
     ):
         graph.setdefault(edge.work_item_id, set()).add(edge.depends_on_work_item_id)
     for row in rows:
-        if row.parent_work_item_id is not None and row.required_for_parent:
-            graph.setdefault(row.parent_work_item_id, set()).add(row.id)
+        events = load_work_item_events(session, row.id)
+        if not events or events[0]["event_type"] != "WORK_CREATED":
+            raise RuntimeError("work-item ledger is missing its creation event")
+        created = events[0]["payload"]
+        parent_id = created.get("parent_work_item_id")
+        if parent_id is not None and created.get("required_for_parent") is True:
+            graph.setdefault(str(parent_id), set()).add(row.id)
     return graph
 
 
