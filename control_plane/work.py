@@ -840,14 +840,26 @@ def suspend_work_item(
     reason: str,
     idempotency_key: str,
 ) -> WorkItemView:
-    row = _lock_work_item(session, work_item_id)
-    view = get_work_item(session, row.id)
-    if view.state is WorkState.DONE:
-        raise DomainError("completed work cannot be suspended")
     payload = {
         "actor": _safe_text(actor, "actor", 200),
         "reason": _safe_text(reason, "reason", 1000),
     }
+    existing = _event_by_idempotency(session, idempotency_key)
+    if existing is not None:
+        if (
+            existing.work_item_id != work_item_id
+            or existing.event_type != "WORK_SUSPENDED"
+            or _canonical(existing.payload) != _canonical(payload)
+        ):
+            raise DomainError("idempotency key was already used for another work command")
+        return get_work_item(session, work_item_id)
+
+    row = _lock_work_item(session, work_item_id)
+    view = get_work_item(session, row.id)
+    if view.state is WorkState.DONE:
+        raise DomainError("completed work cannot be suspended")
+    if view.state is WorkState.SUSPENDED:
+        raise DomainError("work item is already suspended")
     _append(
         session,
         row,
@@ -866,6 +878,17 @@ def resume_work_item(
     actor: str,
     idempotency_key: str,
 ) -> WorkItemView:
+    payload = {"actor": _safe_text(actor, "actor", 200)}
+    existing = _event_by_idempotency(session, idempotency_key)
+    if existing is not None:
+        if (
+            existing.work_item_id != work_item_id
+            or existing.event_type != "WORK_RESUMED"
+            or _canonical(existing.payload) != _canonical(payload)
+        ):
+            raise DomainError("idempotency key was already used for another work command")
+        return get_work_item(session, work_item_id)
+
     row = _lock_work_item(session, work_item_id)
     view = get_work_item(session, row.id)
     if view.state is not WorkState.SUSPENDED:
@@ -875,7 +898,7 @@ def resume_work_item(
         row,
         event_type="WORK_RESUMED",
         idempotency_key=idempotency_key,
-        payload={"actor": _safe_text(actor, "actor", 200)},
+        payload=payload,
     )
     session.commit()
     return get_work_item(session, row.id)
@@ -1061,22 +1084,32 @@ def release_claim(
     reason: str,
     idempotency_key: str,
 ) -> WorkItemView:
+    payload = {
+        "actor": _safe_text(actor, "actor", 200),
+        "reason": _safe_text(reason, "reason", 1000),
+    }
+    existing = _event_by_idempotency(session, idempotency_key)
+    if existing is not None:
+        if (
+            existing.work_item_id != work_item_id
+            or existing.event_type != "WORK_CLAIM_RELEASED"
+            or _canonical(existing.payload) != _canonical(payload)
+        ):
+            raise DomainError("idempotency key was already used for another work command")
+        return get_work_item(session, work_item_id)
+
     row = _lock_work_item(session, work_item_id)
     view = get_work_item(session, row.id)
-    normalized_actor = _safe_text(actor, "actor", 200)
     if view.state is not WorkState.IN_PROGRESS:
         raise DomainError("claim can be released only from IN_PROGRESS")
-    if view.implementer != normalized_actor:
+    if view.implementer != payload["actor"]:
         raise DomainError("only the current implementer can release the claim")
     _append(
         session,
         row,
         event_type="WORK_CLAIM_RELEASED",
         idempotency_key=idempotency_key,
-        payload={
-            "actor": normalized_actor,
-            "reason": _safe_text(reason, "reason", 1000),
-        },
+        payload=payload,
     )
     session.commit()
     return get_work_item(session, row.id)
@@ -1091,26 +1124,36 @@ def submit_work_implementation(
     evidence_sha256: str,
     idempotency_key: str,
 ) -> WorkItemView:
-    row = _lock_work_item(session, work_item_id)
-    view = get_work_item(session, row.id)
-    normalized_actor = _safe_text(actor, "actor", 200)
-    if view.state is not WorkState.IN_PROGRESS:
-        raise DomainError("implementation requires IN_PROGRESS work")
-    if view.implementer != normalized_actor:
-        raise DomainError("implementation actor is not the current implementer")
     evidence = evidence_sha256.lower()
     if not _EVIDENCE_RE.fullmatch(evidence):
         raise DomainError("implementation evidence must be a 64-hex SHA-256")
+    payload = {
+        "actor": _safe_text(actor, "actor", 200),
+        "summary": _safe_text(summary, "summary", 4000),
+        "evidence_sha256": evidence,
+    }
+    existing = _event_by_idempotency(session, idempotency_key)
+    if existing is not None:
+        if (
+            existing.work_item_id != work_item_id
+            or existing.event_type != "WORK_IMPLEMENTATION_COMPLETED"
+            or _canonical(existing.payload) != _canonical(payload)
+        ):
+            raise DomainError("idempotency key was already used for another work command")
+        return get_work_item(session, work_item_id)
+
+    row = _lock_work_item(session, work_item_id)
+    view = get_work_item(session, row.id)
+    if view.state is not WorkState.IN_PROGRESS:
+        raise DomainError("implementation requires IN_PROGRESS work")
+    if view.implementer != payload["actor"]:
+        raise DomainError("implementation actor is not the current implementer")
     _append(
         session,
         row,
         event_type="WORK_IMPLEMENTATION_COMPLETED",
         idempotency_key=idempotency_key,
-        payload={
-            "actor": normalized_actor,
-            "summary": _safe_text(summary, "summary", 4000),
-            "evidence_sha256": evidence,
-        },
+        payload=payload,
     )
     session.commit()
     return get_work_item(session, row.id)
@@ -1124,11 +1167,24 @@ def complete_work_item(
     evidence: str,
     idempotency_key: str,
 ) -> WorkItemView:
+    payload = {
+        "actor": _safe_text(actor, "actor", 200),
+        "evidence": _safe_text(evidence, "evidence", 4000),
+    }
+    existing = _event_by_idempotency(session, idempotency_key)
+    if existing is not None:
+        if (
+            existing.work_item_id != work_item_id
+            or existing.event_type != "WORK_COMPLETED"
+            or _canonical(existing.payload) != _canonical(payload)
+        ):
+            raise DomainError("idempotency key was already used for another work command")
+        return get_work_item(session, work_item_id)
+
     row = _lock_work_item(session, work_item_id)
     view = get_work_item(session, row.id)
     if view.state is WorkState.DONE:
-        session.commit()
-        return view
+        raise DomainError("work item is already complete")
     if view.state is not WorkState.REVIEW:
         raise DomainError("work item can complete only from REVIEW")
     _append(
@@ -1136,10 +1192,7 @@ def complete_work_item(
         row,
         event_type="WORK_COMPLETED",
         idempotency_key=idempotency_key,
-        payload={
-            "actor": _safe_text(actor, "actor", 200),
-            "evidence": _safe_text(evidence, "evidence", 4000),
-        },
+        payload=payload,
     )
     session.commit()
     return get_work_item(session, row.id)
