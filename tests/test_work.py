@@ -1,12 +1,16 @@
 import hashlib
+import threading
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from sqlalchemy import create_engine, select
+from sqlalchemy.orm import sessionmaker
 
 import control_plane.work as work_module
 
+from control_plane.db import Base
 from control_plane.domain import DomainError
-from control_plane.models import WorkItemRow
+from control_plane.models import WorkDependencyRow, WorkItemRow
 from control_plane.work import (
     NextAction,
     NextRole,
@@ -769,3 +773,125 @@ def test_parent_required_children_are_derived_from_child_ledger(session):
         match="immutable identity differs from its ledger",
     ):
         get_work_item(session, parent.work_item_id)
+
+
+def test_concurrent_opposite_dependencies_only_one_edge_can_commit(
+    tmp_path,
+    monkeypatch,
+):
+    database_path = tmp_path / "work-graph-race.db"
+    engine = create_engine(
+        "sqlite:///" + str(database_path),
+        connect_args={"check_same_thread": False, "timeout": 10},
+    )
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, expire_on_commit=False)
+
+    with Session() as bootstrap:
+        first = create_work_item(
+            bootstrap,
+            repository=REPOSITORY,
+            issue_number=2690,
+            context={"title": "first"},
+            released=False,
+        )
+        second = create_work_item(
+            bootstrap,
+            repository=REPOSITORY,
+            issue_number=2691,
+            context={"title": "second"},
+            released=False,
+        )
+        first_id = first.work_item_id
+        second_id = second.work_item_id
+
+    repository_gate = threading.Lock()
+    start_barrier = threading.Barrier(2)
+    results: list[str] = []
+    result_lock = threading.Lock()
+
+    def serialized_repository_scope(current_session, repository):
+        assert repository == REPOSITORY
+        repository_gate.acquire()
+        released = False
+        original_commit = current_session.commit
+        original_rollback = current_session.rollback
+
+        def release_once():
+            nonlocal released
+            if not released:
+                released = True
+                repository_gate.release()
+
+        def commit():
+            try:
+                return original_commit()
+            finally:
+                release_once()
+
+        def rollback():
+            try:
+                return original_rollback()
+            finally:
+                release_once()
+
+        current_session.commit = commit
+        current_session.rollback = rollback
+
+    monkeypatch.setattr(
+        work_module,
+        "_lock_scheduler_scope",
+        serialized_repository_scope,
+    )
+
+    def worker(target_id, dependency_id, key):
+        with Session() as current:
+            start_barrier.wait()
+            try:
+                add_dependency(
+                    current,
+                    target_id,
+                    dependency_id,
+                    idempotency_key=key,
+                )
+            except DomainError as exc:
+                current.rollback()
+                outcome = "CYCLE" if "blocking cycle" in str(exc) else "ERROR"
+            else:
+                outcome = "COMMITTED"
+
+            with result_lock:
+                results.append(outcome)
+
+    first_thread = threading.Thread(
+        target=worker,
+        args=(first_id, second_id, "2690:depends:2691"),
+    )
+    second_thread = threading.Thread(
+        target=worker,
+        args=(second_id, first_id, "2691:depends:2690"),
+    )
+
+    first_thread.start()
+    second_thread.start()
+    first_thread.join(timeout=10)
+    second_thread.join(timeout=10)
+
+    assert not first_thread.is_alive()
+    assert not second_thread.is_alive()
+    assert sorted(results) == ["COMMITTED", "CYCLE"]
+
+    with Session() as verify:
+        edges = list(
+            verify.scalars(
+                select(WorkDependencyRow).order_by(WorkDependencyRow.id.asc())
+            )
+        )
+        assert len(edges) == 1
+
+        first_view = get_work_item(verify, first_id)
+        second_view = get_work_item(verify, second_id)
+        assert not (
+            first_view.dependencies == (second_id,)
+            and second_view.dependencies == (first_id,)
+        )
