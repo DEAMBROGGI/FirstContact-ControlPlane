@@ -600,6 +600,19 @@ class GitHubWebhookGateway:
             token,
         )
         if current_base == candidate.base_sha:
+            existing_watch = session.get(ReviewWatchRow, publication_id)
+            if (
+                existing_watch is not None
+                and existing_watch.state == "STALE"
+                and existing_watch.watched_head_sha == view.remote_head_sha
+            ):
+                sync_review_watch(
+                    session,
+                    publication_id,
+                    expected_actors=self.expected_actors,
+                    last_delivery_id=last_delivery_id,
+                    state="ACTIVE",
+                )
             return True
         sync_review_watch(
             session,
@@ -1028,7 +1041,6 @@ class GitHubWebhookGateway:
                     state="STALE",
                 )
                 return "STALE_HEAD"
-            return "SYNCHRONIZE_MATCHED"
 
         if pull.head_sha != view.remote_head_sha:
             sync_review_watch(
@@ -1047,6 +1059,9 @@ class GitHubWebhookGateway:
             last_delivery_id=row.delivery_id,
         ):
             return "STALE_BASE"
+
+        if row.event_name == "pull_request" and row.action == "synchronize":
+            return "SYNCHRONIZE_MATCHED"
 
         if row.event_name == "issue_comment":
             raw_comment = row.payload.get("comment")
