@@ -29,6 +29,7 @@ class Settings(BaseSettings):
     codex_review_actors: str = ""
     github_webhook_secret: SecretStr = SecretStr("")
     github_webhook_max_payload_bytes: int = 1024 * 1024
+    github_webhook_startup_reconcile_limit: int = 100
     human_review_actors: str = ""
 
 
