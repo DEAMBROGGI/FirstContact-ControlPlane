@@ -24,6 +24,7 @@ class PullRequestSnapshot:
     head_sha: str
     merged: bool = False
     merge_commit_sha: str | None = None
+    mergeable: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -277,6 +278,9 @@ class GitHubRepositoryGateway:
                 if payload.get("merge_commit_sha") is not None
                 else None
             )
+            mergeable = payload.get("mergeable")
+            if mergeable is not None and not isinstance(mergeable, bool):
+                raise ValueError("invalid mergeable value")
             snapshot = PullRequestSnapshot(
                 number=int(payload["number"]),
                 state=str(payload["state"]),
@@ -285,6 +289,7 @@ class GitHubRepositoryGateway:
                 head_sha=str(payload["head"]["sha"]).lower(),
                 merged=bool(payload.get("merged", False)),
                 merge_commit_sha=merge_commit_sha,
+                mergeable=mergeable,
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise GitHubApiError("GitHub pull request response is invalid") from exc
