@@ -24,6 +24,7 @@ from control_plane.github_app import InstallationAccess
 from control_plane.github_webhook import (
     GitHubWebhookAuthError,
     GitHubWebhookGateway,
+    _lock_delivery_scope,
     get_review_watch,
     get_webhook_delivery,
     persist_webhook_delivery,
@@ -670,3 +671,48 @@ def test_usage_limit_with_mutated_trigger_marker_fails_closed(session):
 
     assert get_view(session, view.publication_id).automated_review_status is AutomatedReviewStatus.RUNNING
     assert get_webhook_delivery(session, receipt.delivery_id).state == "PENDING"
+
+
+
+def test_delivery_scope_uses_postgres_advisory_lock():
+    class Dialect:
+        name = "postgresql"
+
+    class Bind:
+        dialect = Dialect()
+
+    class FakeSession:
+        def __init__(self):
+            self.calls = []
+
+        def get_bind(self):
+            return Bind()
+
+        def execute(self, statement, params):
+            self.calls.append((str(statement), params))
+
+    session = FakeSession()
+    _lock_delivery_scope(session, "delivery-concurrent-1")
+
+    assert len(session.calls) == 1
+    sql, params = session.calls[0]
+    assert "pg_advisory_xact_lock" in sql
+    assert set(params) == {"webhook_delivery_key"}
+    assert isinstance(params["webhook_delivery_key"], int)
+
+
+def test_delivery_scope_is_noop_outside_postgres():
+    class Dialect:
+        name = "sqlite"
+
+    class Bind:
+        dialect = Dialect()
+
+    class FakeSession:
+        def get_bind(self):
+            return Bind()
+
+        def execute(self, *_args, **_kwargs):
+            raise AssertionError("SQLite must not execute PostgreSQL advisory locks")
+
+    _lock_delivery_scope(FakeSession(), "delivery-sqlite")
