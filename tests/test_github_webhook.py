@@ -336,7 +336,11 @@ def test_usage_limit_webhook_marks_matching_exact_run_unavailable(session):
         IssueCommentSnapshot(
             comment_id=700,
             actor=HUMAN_ACTOR,
-            body="@codex review",
+            body=(
+                "@codex review\n\n"
+                f"<!-- firstcontact-control-plane:codex-review "
+                f"run={view.automated_review_run_id} head={HEAD} -->"
+            ),
             created_at=TRIGGER_AT,
         ),
         IssueCommentSnapshot(
