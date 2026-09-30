@@ -1098,6 +1098,16 @@ class GitHubWebhookGateway:
                 row,
                 token=access.token,
             )
+            latest = get_view(session, publication_id)
+            if latest.state is PublicationState.APPROVED:
+                latest_pull = self._read_pull(latest, access.token)
+                mergeability_outcome = self._mergeability_if_ready(
+                    session,
+                    publication_id,
+                    pull=latest_pull,
+                )
+                if mergeability_outcome != "MERGEABILITY_NOT_ELIGIBLE":
+                    outcome = outcome + "+" + mergeability_outcome
             watch = sync_review_watch(
                 session,
                 publication_id,
