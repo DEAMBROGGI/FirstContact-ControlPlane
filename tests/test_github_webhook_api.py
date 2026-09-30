@@ -1,9 +1,11 @@
+import asyncio
 import hashlib
 import hmac
 import json
 
 from fastapi.testclient import TestClient
 
+import control_plane.main as main_module
 from control_plane.config import settings
 from control_plane.db import get_session
 from control_plane.github_webhook import GitHubWebhookGateway
@@ -111,3 +113,27 @@ def test_public_webhook_endpoint_rejects_bad_signature_without_persistence(sessi
         ) is None
     finally:
         app.dependency_overrides.clear()
+
+
+
+def test_lifespan_runs_pending_recovery_after_init(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(
+        main_module,
+        "init_db",
+        lambda: calls.append("init"),
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_startup_reconcile_pending_webhooks",
+        lambda: calls.append("recover") or 0,
+    )
+
+    async def run():
+        async with main_module.lifespan(main_module.app):
+            calls.append("yield")
+
+    asyncio.run(run())
+
+    assert calls == ["init", "recover", "yield"]
