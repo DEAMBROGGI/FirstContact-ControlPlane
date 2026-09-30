@@ -894,11 +894,11 @@ def test_base_push_back_to_candidate_sha_is_the_only_stale_watch_recovery(sessio
     assert stale_result.next_action == "BLOCKED"
     assert get_review_watch(session, view.publication_id).state == "STALE"
 
-    github.ref_shas["master"] = BASE_SHA
+    github.ref_shas["master"] = BASE
     recovery_body = json.dumps(
         {
             "ref": "refs/heads/master",
-            "after": BASE_SHA,
+            "after": BASE,
             "repository": {"full_name": REPOSITORY},
         },
         sort_keys=True,
