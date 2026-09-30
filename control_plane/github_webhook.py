@@ -611,13 +611,7 @@ class GitHubWebhookGateway:
                 and existing_watch.state == "STALE"
                 and existing_watch.watched_head_sha == view.remote_head_sha
             ):
-                sync_review_watch(
-                    session,
-                    publication_id,
-                    expected_actors=self.expected_actors,
-                    last_delivery_id=last_delivery_id,
-                    state="ACTIVE",
-                )
+                return False
             return True
         sync_review_watch(
             session,
@@ -1172,11 +1166,12 @@ class GitHubWebhookGateway:
             raise GitHubWebhookError("push ref readback failed closed") from exc
 
         stale = 0
+        recovered = 0
         watches = list(
             session.scalars(
                 select(ReviewWatchRow).where(
                     ReviewWatchRow.repository == row.repository,
-                    ReviewWatchRow.state == "ACTIVE",
+                    ReviewWatchRow.state.in_({"ACTIVE", "STALE"}),
                 )
             )
         )
@@ -1184,20 +1179,37 @@ class GitHubWebhookGateway:
             view = get_view(session, watch_row.publication_id)
             candidate = view.current_candidate
             if (
-                view.base_branch == branch
-                and candidate is not None
-                and current_sha is not None
-                and candidate.base_sha != current_sha
-                and view.state is not PublicationState.MERGED
+                view.base_branch != branch
+                or candidate is None
+                or current_sha is None
+                or view.state is PublicationState.MERGED
             ):
+                continue
+
+            if candidate.base_sha != current_sha:
                 watch_row.state = "STALE"
                 watch_row.next_role = "CONTROL_PLANE"
                 watch_row.next_action = "BLOCKED"
                 watch_row.last_delivery_id = row.delivery_id
                 watch_row.last_reconciled_at = _utcnow()
                 stale += 1
+                continue
+
+            if (
+                watch_row.state == "STALE"
+                and watch_row.watched_head_sha == view.remote_head_sha
+            ):
+                watch_row.state = "ACTIVE"
+                watch_row.next_role, watch_row.next_action = _derive_next(
+                    session,
+                    watch_row.publication_id,
+                )
+                watch_row.last_delivery_id = row.delivery_id
+                watch_row.last_reconciled_at = _utcnow()
+                recovered += 1
+
         session.commit()
-        return f"BASE_PUSH_STALE:{stale}"
+        return f"BASE_PUSH_STALE:{stale}:RECOVERED:{recovered}"
 
     def process_delivery(
         self,
