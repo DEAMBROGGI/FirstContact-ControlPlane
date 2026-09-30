@@ -77,3 +77,66 @@ class VerifyRemediationFindingRequest(BaseModel):
 
 class IdempotencyRequest(BaseModel):
     idempotency_key: str = Field(min_length=1, max_length=200)
+
+
+class CreateWorkItemRequest(BaseModel):
+    repository: str = Field(min_length=3, max_length=200)
+    issue_number: int = Field(gt=0)
+    context: dict[str, Any] = Field(default_factory=dict)
+    priority: int = Field(default=2, ge=0, le=4)
+    rank: int = Field(default=0, ge=0)
+    parent_work_item_id: str | None = Field(default=None, min_length=36, max_length=36)
+    required_for_parent: bool = True
+    executable: bool = True
+    released: bool = True
+
+
+class AddWorkDependencyRequest(BaseModel):
+    depends_on_work_item_id: str = Field(min_length=36, max_length=36)
+    idempotency_key: str = Field(min_length=1, max_length=200)
+
+
+class ClaimWorkItemRequest(BaseModel):
+    actor: str = Field(min_length=1, max_length=200)
+    idempotency_key: str = Field(min_length=1, max_length=200)
+
+
+class ClaimNextWorkRequest(BaseModel):
+    repository: str = Field(min_length=3, max_length=200)
+    actor: str = Field(min_length=1, max_length=200)
+    idempotency_key: str = Field(min_length=1, max_length=200)
+
+
+class SubmitWorkImplementationRequest(BaseModel):
+    actor: str = Field(min_length=1, max_length=200)
+    summary: str = Field(min_length=1, max_length=4000)
+    evidence_sha256: str
+    idempotency_key: str = Field(min_length=1, max_length=200)
+
+
+class CompleteWorkItemRequest(BaseModel):
+    actor: str = Field(min_length=1, max_length=200)
+    evidence: str = Field(min_length=1, max_length=4000)
+    idempotency_key: str = Field(min_length=1, max_length=200)
+
+
+class RenewWorkClaimRequest(BaseModel):
+    actor: str = Field(min_length=1, max_length=200)
+    idempotency_key: str = Field(min_length=1, max_length=200)
+
+
+class ReleaseWorkClaimRequest(BaseModel):
+    actor: str = Field(min_length=1, max_length=200)
+    reason: str = Field(min_length=1, max_length=1000)
+    idempotency_key: str = Field(min_length=1, max_length=200)
+
+
+class SuspendWorkItemRequest(BaseModel):
+    actor: str = Field(min_length=1, max_length=200)
+    reason: str = Field(min_length=1, max_length=1000)
+    idempotency_key: str = Field(min_length=1, max_length=200)
+
+
+class ResumeWorkItemRequest(BaseModel):
+    actor: str = Field(min_length=1, max_length=200)
+    idempotency_key: str = Field(min_length=1, max_length=200)

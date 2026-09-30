@@ -29,15 +29,25 @@ from .remediation_materializer import (
 )
 from .repository import load_events
 from .schemas import (
+    AddWorkDependencyRequest,
+    ClaimNextWorkRequest,
+    ClaimWorkItemRequest,
+    CompleteWorkItemRequest,
     CreatePublicationRequest,
+    CreateWorkItemRequest,
     CreateRemediationWorkPackageRequest,
     ClaimRemediationWorkPackageRequest,
     IdempotencyRequest,
     MergeabilityRequest,
     PlaneReviewRequest,
     ReviewRequest,
+    ReleaseWorkClaimRequest,
+    RenewWorkClaimRequest,
+    ResumeWorkItemRequest,
     StartSuccessorVerificationRequest,
     SubmitRemediationImplementationRequest,
+    SubmitWorkImplementationRequest,
+    SuspendWorkItemRequest,
     ValidationResultRequest,
     VerifyRemediationFindingRequest,
 )
@@ -59,6 +69,23 @@ from .service import (
     record_review,
     record_validation,
     submit_verified_candidate,
+)
+from .work import (
+    WorkItemView,
+    add_dependency,
+    claim_next_work,
+    claim_work_item,
+    complete_work_item,
+    create_work_item,
+    get_work_item,
+    load_work_item_events,
+    next_work,
+    release_claim,
+    release_work_item,
+    renew_claim,
+    resume_work_item,
+    submit_work_implementation,
+    suspend_work_item,
 )
 
 @asynccontextmanager
@@ -223,6 +250,14 @@ def _work_package_payload(view):
     return data
 
 
+def _work_item_payload(view: WorkItemView):
+    data = asdict(view)
+    data["state"] = view.state.value
+    data["next_role"] = view.next_role.value
+    data["next_action"] = view.next_action.value
+    return data
+
+
 def _conflict(exc: Exception) -> HTTPException:
     return HTTPException(status_code=409, detail=str(exc))
 
@@ -239,6 +274,307 @@ def health():
 @app.get("/api/v1/profiles")
 def profiles():
     return [asdict(profile) for profile in all_profiles()]
+
+
+@app.post("/api/v1/internal/work-items", dependencies=[Depends(require_token)])
+def work_item_create(
+    request: CreateWorkItemRequest,
+    session: Session = Depends(get_session),
+):
+    try:
+        return _work_item_payload(
+            create_work_item(
+                session,
+                repository=request.repository,
+                issue_number=request.issue_number,
+                context=request.context,
+                priority=request.priority,
+                rank=request.rank,
+                parent_work_item_id=request.parent_work_item_id,
+                required_for_parent=request.required_for_parent,
+                executable=request.executable,
+                released=request.released,
+            )
+        )
+    except (DomainError, ValueError) as exc:
+        raise _conflict(exc) from exc
+
+
+@app.get("/api/v1/work-items/{work_item_id}", dependencies=[Depends(require_token)])
+def work_item_get(
+    work_item_id: str,
+    session: Session = Depends(get_session),
+):
+    try:
+        return _work_item_payload(get_work_item(session, work_item_id))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="work item not found") from exc
+
+
+@app.get(
+    "/api/v1/work-items/{work_item_id}/events",
+    dependencies=[Depends(require_token)],
+)
+def work_item_event_list(
+    work_item_id: str,
+    session: Session = Depends(get_session),
+):
+    try:
+        return load_work_item_events(session, work_item_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="work item not found") from exc
+
+
+@app.post(
+    "/api/v1/internal/work-items/{work_item_id}/dependencies",
+    dependencies=[Depends(require_token)],
+)
+def work_item_dependency_add(
+    work_item_id: str,
+    request: AddWorkDependencyRequest,
+    session: Session = Depends(get_session),
+):
+    try:
+        return _work_item_payload(
+            add_dependency(
+                session,
+                work_item_id,
+                request.depends_on_work_item_id,
+                idempotency_key=request.idempotency_key,
+            )
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="work item not found") from exc
+    except DomainError as exc:
+        raise _conflict(exc) from exc
+
+
+@app.get("/api/v1/work/next", dependencies=[Depends(require_token)])
+def work_next(
+    repository: str,
+    session: Session = Depends(get_session),
+):
+    try:
+        view = next_work(session, repository)
+        return None if view is None else _work_item_payload(view)
+    except DomainError as exc:
+        raise _conflict(exc) from exc
+
+
+@app.post("/api/v1/work/claim-next", dependencies=[Depends(require_token)])
+def work_claim_next(
+    request: ClaimNextWorkRequest,
+    session: Session = Depends(get_session),
+):
+    try:
+        view = claim_next_work(
+            session,
+            request.repository,
+            actor=request.actor,
+            idempotency_key=request.idempotency_key,
+            lease_seconds=settings.work_claim_lease_seconds,
+        )
+        return None if view is None else _work_item_payload(view)
+    except DomainError as exc:
+        raise _conflict(exc) from exc
+
+
+@app.post(
+    "/api/v1/work-items/{work_item_id}/claim",
+    dependencies=[Depends(require_token)],
+)
+def work_item_claim(
+    work_item_id: str,
+    request: ClaimWorkItemRequest,
+    session: Session = Depends(get_session),
+):
+    try:
+        return _work_item_payload(
+            claim_work_item(
+                session,
+                work_item_id,
+                actor=request.actor,
+                idempotency_key=request.idempotency_key,
+                lease_seconds=settings.work_claim_lease_seconds,
+            )
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="work item not found") from exc
+    except DomainError as exc:
+        raise _conflict(exc) from exc
+
+
+@app.post(
+    "/api/v1/work-items/{work_item_id}/implementation",
+    dependencies=[Depends(require_token)],
+)
+def work_item_implementation(
+    work_item_id: str,
+    request: SubmitWorkImplementationRequest,
+    session: Session = Depends(get_session),
+):
+    try:
+        return _work_item_payload(
+            submit_work_implementation(
+                session,
+                work_item_id,
+                actor=request.actor,
+                summary=request.summary,
+                evidence_sha256=request.evidence_sha256,
+                idempotency_key=request.idempotency_key,
+            )
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="work item not found") from exc
+    except DomainError as exc:
+        raise _conflict(exc) from exc
+
+
+@app.post(
+    "/api/v1/internal/work-items/{work_item_id}/complete",
+    dependencies=[Depends(require_token)],
+)
+def work_item_complete(
+    work_item_id: str,
+    request: CompleteWorkItemRequest,
+    session: Session = Depends(get_session),
+):
+    try:
+        return _work_item_payload(
+            complete_work_item(
+                session,
+                work_item_id,
+                actor=request.actor,
+                evidence=request.evidence,
+                idempotency_key=request.idempotency_key,
+            )
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="work item not found") from exc
+    except DomainError as exc:
+        raise _conflict(exc) from exc
+
+
+@app.post(
+    "/api/v1/work-items/{work_item_id}/claim/renew",
+    dependencies=[Depends(require_token)],
+)
+def work_item_claim_renew(
+    work_item_id: str,
+    request: RenewWorkClaimRequest,
+    session: Session = Depends(get_session),
+):
+    try:
+        return _work_item_payload(
+            renew_claim(
+                session,
+                work_item_id,
+                actor=request.actor,
+                idempotency_key=request.idempotency_key,
+                lease_seconds=settings.work_claim_lease_seconds,
+            )
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="work item not found") from exc
+    except DomainError as exc:
+        raise _conflict(exc) from exc
+
+
+@app.post(
+    "/api/v1/work-items/{work_item_id}/claim/release",
+    dependencies=[Depends(require_token)],
+)
+def work_item_claim_release(
+    work_item_id: str,
+    request: ReleaseWorkClaimRequest,
+    session: Session = Depends(get_session),
+):
+    try:
+        return _work_item_payload(
+            release_claim(
+                session,
+                work_item_id,
+                actor=request.actor,
+                reason=request.reason,
+                idempotency_key=request.idempotency_key,
+            )
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="work item not found") from exc
+    except DomainError as exc:
+        raise _conflict(exc) from exc
+
+
+@app.post(
+    "/api/v1/internal/work-items/{work_item_id}/release",
+    dependencies=[Depends(require_token)],
+)
+def work_item_release(
+    work_item_id: str,
+    request: IdempotencyRequest,
+    session: Session = Depends(get_session),
+):
+    try:
+        return _work_item_payload(
+            release_work_item(
+                session,
+                work_item_id,
+                idempotency_key=request.idempotency_key,
+            )
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="work item not found") from exc
+    except DomainError as exc:
+        raise _conflict(exc) from exc
+
+
+@app.post(
+    "/api/v1/internal/work-items/{work_item_id}/suspend",
+    dependencies=[Depends(require_token)],
+)
+def work_item_suspend(
+    work_item_id: str,
+    request: SuspendWorkItemRequest,
+    session: Session = Depends(get_session),
+):
+    try:
+        return _work_item_payload(
+            suspend_work_item(
+                session,
+                work_item_id,
+                actor=request.actor,
+                reason=request.reason,
+                idempotency_key=request.idempotency_key,
+            )
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="work item not found") from exc
+    except DomainError as exc:
+        raise _conflict(exc) from exc
+
+
+@app.post(
+    "/api/v1/internal/work-items/{work_item_id}/resume",
+    dependencies=[Depends(require_token)],
+)
+def work_item_resume(
+    work_item_id: str,
+    request: ResumeWorkItemRequest,
+    session: Session = Depends(get_session),
+):
+    try:
+        return _work_item_payload(
+            resume_work_item(
+                session,
+                work_item_id,
+                actor=request.actor,
+                idempotency_key=request.idempotency_key,
+            )
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="work item not found") from exc
+    except DomainError as exc:
+        raise _conflict(exc) from exc
 @app.get("/api/v1/publications")
 def publications(session: Session = Depends(get_session)):
     return [_payload(get_view(session, publication_id)) for publication_id in list_publication_ids(session)]
