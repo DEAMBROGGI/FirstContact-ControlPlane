@@ -3,7 +3,7 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 
-from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 
@@ -14,6 +14,13 @@ from .domain import DomainError
 from .github_api import GitHubRepositoryGateway
 from .github_app import GitHubAppTokenProvider
 from .github_review_auth import GitHubReviewTokenProvider
+from .github_webhook import (
+    GitHubWebhookAuthError,
+    GitHubWebhookError,
+    GitHubWebhookGateway,
+    get_review_watch,
+    sync_review_watch,
+)
 from .merge import MergeCoordinator, MergeError
 from .profile_registry import all_profiles
 from .publisher import GitHubPublisher, PublicationError
@@ -155,6 +162,14 @@ def get_merge_coordinator():
         github.close()
 
 
+def _configured_actors(raw: str) -> tuple[str, ...]:
+    return tuple(
+        value.strip()
+        for value in raw.split(",")
+        if value.strip()
+    )
+
+
 def get_codex_review_broker():
     token_provider = GitHubAppTokenProvider(
         app_id=settings.github_app_id,
@@ -162,11 +177,7 @@ def get_codex_review_broker():
         api_url=settings.github_api_url,
     )
     github = GitHubRepositoryGateway(api_url=settings.github_api_url)
-    actors = tuple(
-        value.strip()
-        for value in settings.codex_review_actors.split(",")
-        if value.strip()
-    )
+    actors = _configured_actors(settings.codex_review_actors)
     trigger_user = GitHubReviewTokenProvider(
         token=settings.codex_review_user_token,
         expected_login=settings.codex_review_trigger_login,
@@ -179,6 +190,33 @@ def get_codex_review_broker():
             mode=settings.codex_review_mode,
             allowed_actors=actors,
             trigger_user=trigger_user,
+        )
+    finally:
+        token_provider.close()
+        github.close()
+
+
+def get_github_webhook_gateway():
+    if settings.publisher_mode != "github-app":
+        raise HTTPException(status_code=503, detail="GitHub webhook gateway is disabled")
+    webhook_secret = settings.github_webhook_secret.get_secret_value().strip()
+    if not webhook_secret:
+        raise HTTPException(status_code=503, detail="GitHub webhook secret is not configured")
+    token_provider = GitHubAppTokenProvider(
+        app_id=settings.github_app_id,
+        private_key_path=settings.github_app_private_key_path,
+        api_url=settings.github_api_url,
+    )
+    github = GitHubRepositoryGateway(api_url=settings.github_api_url)
+    try:
+        yield GitHubWebhookGateway(
+            token_provider=token_provider,
+            github=github,
+            codex_review_mode=settings.codex_review_mode,
+            codex_actors=_configured_actors(settings.codex_review_actors),
+            human_review_actors=_configured_actors(settings.human_review_actors),
+            webhook_secret=webhook_secret,
+            maximum_payload_bytes=settings.github_webhook_max_payload_bytes,
         )
     finally:
         token_provider.close()
@@ -674,7 +712,16 @@ def codex_review_request(
     if settings.codex_review_mode.strip().lower() == "disabled":
         raise HTTPException(status_code=503, detail="Codex review broker is disabled")
     try:
-        return _payload(broker.request(session, publication_id))
+        view = broker.request(session, publication_id)
+        sync_review_watch(
+            session,
+            publication_id,
+            expected_actors=(
+                *_configured_actors(settings.codex_review_actors),
+                *_configured_actors(settings.human_review_actors),
+            ),
+        )
+        return _payload(view)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="publication not found") from exc
     except DomainError as exc:
@@ -694,6 +741,14 @@ def codex_review_reconcile(
 ):
     try:
         observation = broker.reconcile(session, publication_id)
+        sync_review_watch(
+            session,
+            publication_id,
+            expected_actors=(
+                *_configured_actors(settings.codex_review_actors),
+                *_configured_actors(settings.human_review_actors),
+            ),
+        )
         return {
             "observation": asdict(observation),
             "publication": _payload(get_view(session, publication_id)),
@@ -704,6 +759,89 @@ def codex_review_reconcile(
         raise _conflict(exc) from exc
     except CodexReviewError as exc:
         raise HTTPException(status_code=502, detail="Codex review reconciliation failed closed") from exc
+
+
+@app.post("/api/v1/github/webhooks")
+async def github_webhook_receive(
+    request: Request,
+    x_hub_signature_256: str | None = Header(
+        default=None,
+        alias="X-Hub-Signature-256",
+    ),
+    x_github_delivery: str | None = Header(
+        default=None,
+        alias="X-GitHub-Delivery",
+    ),
+    x_github_event: str | None = Header(
+        default=None,
+        alias="X-GitHub-Event",
+    ),
+    session: Session = Depends(get_session),
+    gateway: GitHubWebhookGateway = Depends(get_github_webhook_gateway),
+):
+    body = await request.body()
+    try:
+        receipt = gateway.ingest(
+            session,
+            delivery_id=(x_github_delivery or ""),
+            event_name=(x_github_event or ""),
+            signature=x_hub_signature_256,
+            body=body,
+        )
+        processing = gateway.process_delivery(session, receipt.delivery_id)
+        return {
+            "delivery": asdict(receipt),
+            "processing": asdict(processing),
+        }
+    except GitHubWebhookAuthError as exc:
+        raise HTTPException(status_code=401, detail="invalid GitHub webhook signature") from exc
+    except DomainError as exc:
+        raise _conflict(exc) from exc
+    except GitHubWebhookError as exc:
+        raise HTTPException(status_code=502, detail="GitHub webhook processing failed closed") from exc
+
+
+@app.post(
+    "/api/v1/internal/github/webhooks/reconcile",
+    dependencies=[Depends(require_token)],
+)
+def github_webhook_reconcile(
+    publication_id: str | None = None,
+    session: Session = Depends(get_session),
+    gateway: GitHubWebhookGateway = Depends(get_github_webhook_gateway),
+):
+    try:
+        if publication_id is not None:
+            return asdict(
+                gateway.reconcile_publication(
+                    session,
+                    publication_id,
+                )
+            )
+        return [
+            asdict(item)
+            for item in gateway.reconcile_pending(session)
+        ]
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="webhook/publication not found") from exc
+    except DomainError as exc:
+        raise _conflict(exc) from exc
+    except GitHubWebhookError as exc:
+        raise HTTPException(status_code=502, detail="GitHub reconciliation failed closed") from exc
+
+
+@app.get(
+    "/api/v1/internal/github/review-watches/{publication_id}",
+    dependencies=[Depends(require_token)],
+)
+def github_review_watch_get(
+    publication_id: str,
+    session: Session = Depends(get_session),
+):
+    try:
+        return asdict(get_review_watch(session, publication_id))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="review watch not found") from exc
 
 
 @app.post(
