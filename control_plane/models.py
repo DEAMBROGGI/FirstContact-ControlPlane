@@ -302,3 +302,61 @@ class WorkItemEventRow(Base):
     payload: Mapped[dict] = mapped_column(JSON, nullable=False)
     previous_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     event_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+
+
+class GitHubWebhookDeliveryRow(Base):
+    """Durable GitHub delivery inbox; payloads are wake-up evidence, never authority."""
+
+    __tablename__ = "github_webhook_deliveries"
+
+    delivery_id: Mapped[str] = mapped_column(String(200), primary_key=True)
+    body_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    event_name: Mapped[str] = mapped_column(String(80), nullable=False, index=True)
+    action: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    repository: Mapped[str] = mapped_column(String(200), nullable=False, index=True)
+    pull_request_number: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    state: Mapped[str] = mapped_column(String(24), nullable=False)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    last_error: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    received_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utcnow,
+        nullable=False,
+    )
+    processed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+
+class ReviewWatchRow(Base):
+    """Recoverable exact-head review watch projection derived from publication authority."""
+
+    __tablename__ = "review_watches"
+
+    publication_id: Mapped[str] = mapped_column(
+        ForeignKey("publications.id"),
+        primary_key=True,
+    )
+    repository: Mapped[str] = mapped_column(String(200), nullable=False, index=True)
+    pull_request_number: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    watched_head_sha: Mapped[str] = mapped_column(String(40), nullable=False)
+    review_run_id: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    provider: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    trigger_comment_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    expected_actors: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    state: Mapped[str] = mapped_column(String(24), nullable=False, default="ACTIVE")
+    next_role: Mapped[str] = mapped_column(String(80), nullable=False, default="CONTROL_PLANE")
+    next_action: Mapped[str] = mapped_column(String(80), nullable=False, default="WAIT_PROVIDER")
+    last_delivery_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    last_reconciled_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utcnow,
+        onupdate=utcnow,
+        nullable=False,
+    )
