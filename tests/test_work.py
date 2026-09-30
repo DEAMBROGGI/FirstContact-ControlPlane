@@ -1,6 +1,9 @@
 import hashlib
+from datetime import datetime, timedelta, timezone
 
 import pytest
+
+import control_plane.work as work_module
 
 from control_plane.domain import DomainError
 from control_plane.work import (
@@ -17,6 +20,7 @@ from control_plane.work import (
     next_work,
     release_claim,
     release_work_item,
+    renew_claim,
     resume_work_item,
     submit_work_implementation,
     suspend_work_item,
@@ -417,3 +421,121 @@ def test_work_ledger_reconstructs_context_and_lifecycle(session):
 def test_next_work_returns_none_when_nothing_is_ready(session):
     create(session, 2610, released=False)
     assert next_work(session, REPOSITORY) is None
+
+
+def test_expired_claim_becomes_ready_and_stale_actor_cannot_submit(session, monkeypatch):
+    start = datetime(2026, 9, 30, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(work_module, "_utcnow", lambda: start)
+
+    view = create(session, 2620)
+    claimed = claim_work_item(
+        session,
+        view.work_item_id,
+        actor=ACTOR,
+        idempotency_key="2620:claim:one",
+        lease_seconds=60,
+    )
+
+    assert claimed.state is WorkState.IN_PROGRESS
+    assert claimed.claim_lease_id is not None
+    assert claimed.claim_expires_at is not None
+
+    monkeypatch.setattr(
+        work_module,
+        "_utcnow",
+        lambda: start + timedelta(seconds=61),
+    )
+
+    expired = get_work_item(session, view.work_item_id)
+    assert expired.state is WorkState.READY
+    assert expired.implementer is None
+    assert expired.claim_lease_id is None
+    assert expired.claim_expires_at is None
+
+    with pytest.raises(DomainError, match="IN_PROGRESS"):
+        submit_work_implementation(
+            session,
+            view.work_item_id,
+            actor=ACTOR,
+            summary="stale actor result",
+            evidence_sha256=EVIDENCE,
+            idempotency_key="2620:stale-implementation",
+        )
+
+    reclaimed = claim_work_item(
+        session,
+        view.work_item_id,
+        actor="implementer:recovery",
+        idempotency_key="2620:claim:recovery",
+        lease_seconds=60,
+    )
+    assert reclaimed.state is WorkState.IN_PROGRESS
+    assert reclaimed.implementer == "implementer:recovery"
+    assert reclaimed.claim_lease_id is not None
+
+
+def test_claim_renewal_extends_same_lease_identity(session, monkeypatch):
+    start = datetime(2026, 9, 30, 13, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(work_module, "_utcnow", lambda: start)
+
+    view = create(session, 2630)
+    claimed = claim_work_item(
+        session,
+        view.work_item_id,
+        actor=ACTOR,
+        idempotency_key="2630:claim",
+        lease_seconds=120,
+    )
+    original_lease = claimed.claim_lease_id
+    original_expiry = datetime.fromisoformat(claimed.claim_expires_at)
+
+    monkeypatch.setattr(
+        work_module,
+        "_utcnow",
+        lambda: start + timedelta(seconds=30),
+    )
+
+    renewed = renew_claim(
+        session,
+        view.work_item_id,
+        actor=ACTOR,
+        idempotency_key="2630:renew",
+        lease_seconds=120,
+    )
+
+    assert renewed.state is WorkState.IN_PROGRESS
+    assert renewed.claim_lease_id == original_lease
+    assert datetime.fromisoformat(renewed.claim_expires_at) > original_expiry
+
+    replay = renew_claim(
+        session,
+        view.work_item_id,
+        actor=ACTOR,
+        idempotency_key="2630:renew",
+        lease_seconds=120,
+    )
+    assert replay.claim_lease_id == original_lease
+    assert replay.claim_expires_at == renewed.claim_expires_at
+
+
+def test_dependency_cannot_be_added_after_claim(session):
+    dependency = create(session, 2640, released=False)
+    target = create(session, 2641)
+
+    claim_work_item(
+        session,
+        target.work_item_id,
+        actor=ACTOR,
+        idempotency_key="2641:claim",
+    )
+
+    with pytest.raises(
+        DomainError,
+        match="hard dependencies cannot change",
+    ):
+        add_dependency(
+            session,
+            target.work_item_id,
+            dependency.work_item_id,
+            idempotency_key="2641:depends:2640",
+        )
