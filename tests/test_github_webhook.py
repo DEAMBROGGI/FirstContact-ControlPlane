@@ -895,6 +895,10 @@ def test_base_push_back_to_candidate_sha_is_the_only_stale_watch_recovery(sessio
     assert get_review_watch(session, view.publication_id).state == "STALE"
 
     github.ref_shas["master"] = BASE
+    with pytest.raises(DomainError, match="publication base is stale"):
+        value.assert_review_write_current(session, view.publication_id)
+    assert get_review_watch(session, view.publication_id).state == "STALE"
+
     recovery_body = json.dumps(
         {
             "ref": "refs/heads/master",
