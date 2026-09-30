@@ -1017,9 +1017,13 @@ explicit.
 The executable queue orders candidates by:
 
 1. priority (`P0` before `P1`, represented as numeric 0..4);
-2. explicit rank;
-3. creation time;
+2. topology depth derived from hard dependencies and required-child blockers;
+3. explicit rank;
 4. stable work-item id.
+
+Topology depth is zero for work with no blockers and increases by one beyond the
+deepest blocker. This preserves blocker-before-dependent ordering even after an
+upstream item reaches `DONE` and the dependent becomes `READY`.
 
 Unsatisfied dependencies are derived as `BLOCKED` and therefore never enter the
 claimable set. PostgreSQL claim-next obtains a repository-scoped advisory
