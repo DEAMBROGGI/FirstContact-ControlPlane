@@ -974,3 +974,112 @@ no candidate identity or prior event is overwritten.
   compensation before candidate rejection. The previous governed ref is restored
   (or the initial ref removed) only while the remote ref still equals the rejected
   candidate SHA.
+
+
+---
+
+## Plan-owned work graph and deterministic claim-next
+
+The generic work scheduler is a separate authoritative aggregate from Publication and
+Remediation. GitHub Issues/Project fields remain projections; they are not used to
+decide whether work is executable.
+
+### Authoritative lifecycle
+
+```text
+BACKLOG
+  -> BLOCKED
+  -> READY
+  -> IN_PROGRESS
+  -> REVIEW
+  -> DONE
+
+SUSPENDED is an explicit pause state.
+```
+
+The effective state is reconstructed from the hash-chained work-item ledger plus
+the immutable work graph:
+
+- `READY` requires release, no suspension, no hard dependency that is not
+  `DONE`, and no required child that is not `DONE`;
+- `IN_PROGRESS` exists only after an atomic claim;
+- implementation completion produces `REVIEW`, never `DONE`;
+- `DONE` requires a separate authoritative completion command;
+- parent state is derived from required children on every read rather than being
+  manually copied from GitHub labels.
+
+A non-executable parent becomes `REVIEW` once it is released and every required
+descendant blocker is complete, leaving the parent-specific acceptance gate
+explicit.
+
+### Deterministic queue
+
+The executable queue orders candidates by:
+
+1. priority (`P0` before `P1`, represented as numeric 0..4);
+2. explicit rank;
+3. creation time;
+4. stable work-item id.
+
+Unsatisfied dependencies are derived as `BLOCKED` and therefore never enter the
+claimable set. PostgreSQL claim-next obtains a repository-scoped advisory
+transaction lock and then row-locks the selected item before re-reading state and
+appending `WORK_CLAIMED`. Specific-item claims also row-lock and re-read before
+mutation.
+
+### Fresh-session context
+
+Each work item stores an immutable versioned context snapshot and SHA-256 digest.
+A new implementer session receives the same context together with:
+
+```text
+state
+blockers
+dependencies
+required_children
+implementer
+next_role
+next_action
+```
+
+The initial next-action vocabulary is deliberately provider-neutral:
+
+```text
+WAIT_RELEASE
+WAIT_DEPENDENCIES
+CLAIM_WORK
+IMPLEMENT
+WAIT_REVIEW
+DONE
+SUSPENDED
+```
+
+The GitHub Webhook/Event Gateway roadmap consumes this derived contract after
+review/provider events: the webhook wakes Plane, Plane re-reads authoritative
+GitHub state, applies a legal domain transition, then asks the work/orchestration
+layer for the next role/action. The webhook payload itself never becomes
+lifecycle authority.
+
+### API slice
+
+```text
+POST /api/v1/internal/work-items
+POST /api/v1/internal/work-items/{id}/dependencies
+
+GET  /api/v1/work/next
+POST /api/v1/work/claim-next
+
+GET  /api/v1/work-items/{id}
+GET  /api/v1/work-items/{id}/events
+POST /api/v1/work-items/{id}/claim
+POST /api/v1/work-items/{id}/claim/release
+POST /api/v1/work-items/{id}/implementation
+
+POST /api/v1/internal/work-items/{id}/complete
+POST /api/v1/internal/work-items/{id}/suspend
+POST /api/v1/internal/work-items/{id}/resume
+```
+
+Every mutating command is idempotency-keyed where caller retries are possible.
+Lifecycle reconstruction verifies the per-item event hash chain before returning
+state.
