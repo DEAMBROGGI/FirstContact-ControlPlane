@@ -968,13 +968,29 @@ def review_record(
         ) from exc
 
 @app.post("/api/v1/internal/publications/{publication_id}/mergeability", dependencies=[Depends(require_token)])
-def mergeability_record(publication_id: str, request: MergeabilityRequest, session: Session = Depends(get_session)):
+def mergeability_record(
+    publication_id: str,
+    request: MergeabilityRequest,
+    session: Session = Depends(get_session),
+    gateway: GitHubWebhookGateway = Depends(get_github_webhook_gateway),
+):
     try:
-        view = record_mergeability(
+        pull = gateway.assert_mergeability_write_current(
             session,
             publication_id,
             head_sha=request.head_sha,
-            mergeable=request.mergeable,
+        )
+        if pull.mergeable is None:
+            raise DomainError("GitHub mergeability is still pending")
+        if request.mergeable is not pull.mergeable:
+            raise DomainError(
+                "reported mergeability does not match current GitHub state"
+            )
+        view = record_mergeability(
+            session,
+            publication_id,
+            head_sha=pull.head_sha,
+            mergeable=pull.mergeable,
         )
         _sync_publication_watch(session, publication_id)
         return _payload(view)
@@ -982,6 +998,11 @@ def mergeability_record(publication_id: str, request: MergeabilityRequest, sessi
         raise HTTPException(status_code=404, detail="publication not found") from exc
     except DomainError as exc:
         raise _conflict(exc) from exc
+    except GitHubWebhookError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="GitHub mergeability readback failed closed",
+        ) from exc
 
 
 @app.post(

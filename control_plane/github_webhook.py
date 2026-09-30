@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 
 from .codex_review import CodexReviewBroker, CodexReviewError
 from .domain import AutomatedReviewStatus, DomainError, PublicationState, ReviewDecision
-from .github_api import GitHubApiError, GitHubRepositoryGateway
+from .github_api import GitHubApiError, GitHubRepositoryGateway, PullRequestSnapshot
 from .github_app import GitHubAppTokenProvider, GitHubAuthError
 from .merge import MergeCoordinator, MergeError
 from .models import GitHubWebhookDeliveryRow, PublicationRow, ReviewWatchRow
@@ -389,7 +389,9 @@ def sync_review_watch(
         if state is not None:
             row.state = state
         elif head_changed:
-            row.state = "ACTIVE"
+            # A changed head is not evidence that a stale base recovered. Only
+            # the authoritative base-push readback may clear a STALE watch.
+            row.state = "STALE" if effective_state == "STALE" else "ACTIVE"
         elif view.state is PublicationState.MERGED:
             row.state = "DONE"
         row.next_role = next_role
@@ -606,11 +608,19 @@ class GitHubWebhookGateway:
         )
         if current_base == candidate.base_sha:
             existing_watch = session.get(ReviewWatchRow, publication_id)
-            if (
-                existing_watch is not None
-                and existing_watch.state == "STALE"
-                and existing_watch.watched_head_sha == view.remote_head_sha
-            ):
+            if existing_watch is not None and existing_watch.state == "STALE":
+                if (
+                    existing_watch.watched_head_sha != view.remote_head_sha
+                    or existing_watch.next_role != "CONTROL_PLANE"
+                    or existing_watch.next_action != "BLOCKED"
+                ):
+                    sync_review_watch(
+                        session,
+                        publication_id,
+                        expected_actors=self.expected_actors,
+                        last_delivery_id=last_delivery_id,
+                        state="STALE",
+                    )
                 return False
             return True
         sync_review_watch(
@@ -628,6 +638,32 @@ class GitHubWebhookGateway:
         publication_id: str,
     ) -> None:
         """Fail closed before accepting a direct Human Review write."""
+        self._assert_live_head_and_base(session, publication_id, action="human review")
+
+    def assert_mergeability_write_current(
+        self,
+        session: Session,
+        publication_id: str,
+        *,
+        head_sha: str,
+    ) -> PullRequestSnapshot:
+        """Return GitHub's current mergeability only for the exact live head/base."""
+        pull = self._assert_live_head_and_base(
+            session,
+            publication_id,
+            action="mergeability",
+        )
+        if pull.head_sha != head_sha:
+            raise DomainError("mergeability evidence head is stale")
+        return pull
+
+    def _assert_live_head_and_base(
+        self,
+        session: Session,
+        publication_id: str,
+        *,
+        action: str,
+    ) -> PullRequestSnapshot:
         view = get_view(session, publication_id)
         if view.pull_request_number is None or view.remote_head_sha is None:
             raise GitHubWebhookError("publication is not published")
@@ -636,7 +672,9 @@ class GitHubWebhookGateway:
             access = self._access(view.repository)
             pull = self._read_pull(view, access.token)
         except (GitHubAuthError, GitHubApiError) as exc:
-            raise GitHubWebhookError("GitHub review write readback failed closed") from exc
+            raise GitHubWebhookError(
+                f"GitHub {action} write readback failed closed"
+            ) from exc
 
         if pull.head_sha != view.remote_head_sha:
             sync_review_watch(
@@ -645,14 +683,19 @@ class GitHubWebhookGateway:
                 expected_actors=self.expected_actors,
                 state="STALE",
             )
-            raise DomainError("human review is blocked because the published PR head is stale")
+            raise DomainError(
+                f"{action} is blocked because the published PR head is stale"
+            )
 
         if not self._base_is_current(
             session,
             publication_id,
             token=access.token,
         ):
-            raise DomainError("human review is blocked because the publication base is stale")
+            raise DomainError(
+                f"{action} is blocked because the publication base is stale"
+            )
+        return pull
 
     def _codex_broker(self) -> CodexReviewBroker:
         return CodexReviewBroker(

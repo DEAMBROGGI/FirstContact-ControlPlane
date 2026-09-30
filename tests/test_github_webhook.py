@@ -34,9 +34,9 @@ from control_plane.github_webhook import (
     persist_webhook_delivery,
     sync_review_watch,
 )
-from control_plane.models import GitHubWebhookDeliveryRow
-from control_plane.main import review_record
-from control_plane.schemas import ReviewRequest
+from control_plane.models import GitHubWebhookDeliveryRow, ReviewWatchRow
+from control_plane.main import mergeability_record, review_record
+from control_plane.schemas import MergeabilityRequest, ReviewRequest
 from control_plane.profile_registry import profile_for_repository
 from control_plane.quarantine import VerifiedCandidateSource
 from control_plane.repository import load_events
@@ -620,6 +620,152 @@ def test_direct_human_review_endpoint_allows_current_base(session):
     assert get_review_watch(session, view.publication_id).state == "ACTIVE"
 
 
+def test_stale_watch_cannot_rearm_when_watched_head_changes(session):
+    view = complete_codex_pass(session, start_codex(session, published(session)))
+    stale = sync_review_watch(
+        session,
+        view.publication_id,
+        expected_actors=(CODEX_ACTOR, HUMAN_ACTOR),
+        state="STALE",
+    )
+    assert stale.state == "STALE"
+
+    row = session.get(ReviewWatchRow, view.publication_id)
+    assert row is not None
+    row.watched_head_sha = "9" * 40
+    session.commit()
+
+    current = sync_review_watch(
+        session,
+        view.publication_id,
+        expected_actors=(CODEX_ACTOR, HUMAN_ACTOR),
+    )
+
+    assert current.state == "STALE"
+    assert current.watched_head_sha == HEAD
+    assert current.next_role == "CONTROL_PLANE"
+    assert current.next_action == "BLOCKED"
+
+
+def test_direct_human_review_stays_blocked_after_base_returns_without_push(
+    session,
+):
+    view = complete_codex_pass(session, start_codex(session, published(session)))
+    github = FakeGitHub()
+    github.ref_shas["master"] = "4" * 40
+    value = gateway(github)
+
+    with pytest.raises(DomainError, match="publication base is stale"):
+        value.assert_review_write_current(session, view.publication_id)
+
+    github.ref_shas["master"] = BASE
+    row = session.get(ReviewWatchRow, view.publication_id)
+    assert row is not None
+    row.watched_head_sha = "9" * 40
+    session.commit()
+
+    with pytest.raises(HTTPException) as caught:
+        review_record(
+            view.publication_id,
+            ReviewRequest(
+                reviewed_head_sha=HEAD,
+                decision=ReviewDecision.APPROVED,
+            ),
+            session,
+            value,
+        )
+
+    assert caught.value.status_code == 409
+    current = get_view(session, view.publication_id)
+    watch = get_review_watch(session, view.publication_id)
+    review_events = [
+        event
+        for event in load_events(session, view.publication_id)
+        if event["event_type"] == EventType.REVIEW_RECORDED.value
+    ]
+    assert current.state is PublicationState.IN_REVIEW
+    assert review_events == []
+    assert watch.state == "STALE"
+    assert watch.next_role == "CONTROL_PLANE"
+    assert watch.next_action == "BLOCKED"
+
+
+def test_direct_mergeability_endpoint_blocks_stale_base(session):
+    view = complete_codex_pass(session, start_codex(session, published(session)))
+    github = FakeGitHub()
+    github.mergeable = True
+    value = gateway(github)
+    approved = review_record(
+        view.publication_id,
+        ReviewRequest(
+            reviewed_head_sha=HEAD,
+            decision=ReviewDecision.APPROVED,
+        ),
+        session,
+        value,
+    )
+    assert approved["state"] == PublicationState.APPROVED.value
+
+    github.ref_shas["master"] = "4" * 40
+    with pytest.raises(HTTPException) as caught:
+        mergeability_record(
+            view.publication_id,
+            MergeabilityRequest(head_sha=HEAD, mergeable=True),
+            session,
+            value,
+        )
+
+    assert caught.value.status_code == 409
+    current = get_view(session, view.publication_id)
+    watch = get_review_watch(session, view.publication_id)
+    mergeability_events = [
+        event
+        for event in load_events(session, view.publication_id)
+        if event["event_type"] == EventType.MERGEABILITY_RECORDED.value
+    ]
+    assert current.state is PublicationState.APPROVED
+    assert current.mergeable is None
+    assert mergeability_events == []
+    assert watch.state == "STALE"
+    assert watch.next_role == "CONTROL_PLANE"
+    assert watch.next_action == "BLOCKED"
+
+
+def test_direct_mergeability_endpoint_rejects_client_value_mismatch(session):
+    view = complete_codex_pass(session, start_codex(session, published(session)))
+    github = FakeGitHub()
+    github.mergeable = False
+    value = gateway(github)
+    review_record(
+        view.publication_id,
+        ReviewRequest(
+            reviewed_head_sha=HEAD,
+            decision=ReviewDecision.APPROVED,
+        ),
+        session,
+        value,
+    )
+
+    with pytest.raises(HTTPException) as caught:
+        mergeability_record(
+            view.publication_id,
+            MergeabilityRequest(head_sha=HEAD, mergeable=True),
+            session,
+            value,
+        )
+
+    assert caught.value.status_code == 409
+    current = get_view(session, view.publication_id)
+    mergeability_events = [
+        event
+        for event in load_events(session, view.publication_id)
+        if event["event_type"] == EventType.MERGEABILITY_RECORDED.value
+    ]
+    assert current.state is PublicationState.APPROVED
+    assert current.mergeable is None
+    assert mergeability_events == []
+
+
 
 def test_duplicate_human_review_delivery_does_not_duplicate_review_event(session):
     view = complete_codex_pass(session, start_codex(session, published(session)))
@@ -856,6 +1002,65 @@ def test_base_push_stale_blocks_later_human_review_and_mergeability(session):
         expected_actors=(CODEX_ACTOR, HUMAN_ACTOR),
     )
 
+    push_payload = {
+        "ref": "refs/heads/master",
+        "after": "8" * 40,
+        "repository": {"full_name": REPOSITORY},
+    }
+    push_body = json.dumps(
+        push_payload,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    push_signature = "sha256=" + hmac.new(
+        SECRET.encode("utf-8"),
+        push_body,
+        hashlib.sha256,
+    ).hexdigest()
+    push_receipt = value.ingest(
+        session,
+        delivery_id="delivery-base-push-stale",
+        event_name="push",
+        signature=push_signature,
+        body=push_body,
+    )
+    push_result = value.process_delivery(session, push_receipt.delivery_id)
+
+    assert push_result.outcome == "BASE_PUSH_STALE:1:RECOVERED:0"
+    assert get_review_watch(session, view.publication_id).state == "STALE"
+
+    review_body, review_signature = raw_delivery(
+        event_name="pull_request_review",
+        review_id=812,
+        review_actor=HUMAN_ACTOR,
+    )
+    review_receipt = value.ingest(
+        session,
+        delivery_id="delivery-human-after-base-drift",
+        event_name="pull_request_review",
+        signature=review_signature,
+        body=review_body,
+    )
+    review_result = value.process_delivery(session, review_receipt.delivery_id)
+
+    current = get_view(session, view.publication_id)
+    watch = get_review_watch(session, view.publication_id)
+    assert current.state is PublicationState.IN_REVIEW
+    assert current.review_decision is None
+    assert current.mergeable is None
+    assert review_result.outcome == "STALE_BASE"
+    assert review_result.next_role == "CONTROL_PLANE"
+    assert review_result.next_action == "BLOCKED"
+    assert watch.state == "STALE"
+
+    review_events = [
+        event
+        for event in load_events(session, view.publication_id)
+        if event["event_type"] == EventType.REVIEW_RECORDED.value
+    ]
+    assert review_events == []
+
+
 def test_base_push_back_to_candidate_sha_is_the_only_stale_watch_recovery(session):
     view = complete_codex_pass(session, start_codex(session, published(session)))
     github = FakeGitHub()
@@ -928,65 +1133,6 @@ def test_base_push_back_to_candidate_sha_is_the_only_stale_watch_recovery(sessio
     assert watch.state == "ACTIVE"
     assert watch.next_role == "HUMAN_REVIEWER"
     assert watch.next_action == "WAIT_HUMAN_REVIEW"
-
-
-    push_payload = {
-        "ref": "refs/heads/master",
-        "after": "8" * 40,
-        "repository": {"full_name": REPOSITORY},
-    }
-    push_body = json.dumps(
-        push_payload,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    push_signature = "sha256=" + hmac.new(
-        SECRET.encode("utf-8"),
-        push_body,
-        hashlib.sha256,
-    ).hexdigest()
-    push_receipt = value.ingest(
-        session,
-        delivery_id="delivery-base-push-stale",
-        event_name="push",
-        signature=push_signature,
-        body=push_body,
-    )
-    push_result = value.process_delivery(session, push_receipt.delivery_id)
-
-    assert push_result.outcome == "BASE_PUSH_STALE:1:RECOVERED:0"
-    assert get_review_watch(session, view.publication_id).state == "STALE"
-
-    review_body, review_signature = raw_delivery(
-        event_name="pull_request_review",
-        review_id=812,
-        review_actor=HUMAN_ACTOR,
-    )
-    review_receipt = value.ingest(
-        session,
-        delivery_id="delivery-human-after-base-drift",
-        event_name="pull_request_review",
-        signature=review_signature,
-        body=review_body,
-    )
-    review_result = value.process_delivery(session, review_receipt.delivery_id)
-
-    current = get_view(session, view.publication_id)
-    watch = get_review_watch(session, view.publication_id)
-    assert current.state is PublicationState.IN_REVIEW
-    assert current.review_decision is None
-    assert current.mergeable is None
-    assert review_result.outcome == "STALE_BASE"
-    assert review_result.next_role == "CONTROL_PLANE"
-    assert review_result.next_action == "BLOCKED"
-    assert watch.state == "STALE"
-
-    review_events = [
-        event
-        for event in load_events(session, view.publication_id)
-        if event["event_type"] == EventType.REVIEW_RECORDED.value
-    ]
-    assert review_events == []
 
 
 def test_best_effort_pending_recovery_isolates_one_failed_delivery(session):
