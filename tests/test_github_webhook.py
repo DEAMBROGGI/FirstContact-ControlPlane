@@ -856,6 +856,76 @@ def test_base_push_stale_blocks_later_human_review_and_mergeability(session):
         expected_actors=(CODEX_ACTOR, HUMAN_ACTOR),
     )
 
+def test_base_push_back_to_candidate_sha_is_the_only_stale_watch_recovery(session):
+    view = complete_codex_pass(session, start_codex(session, published(session)))
+    github = FakeGitHub()
+    github.ref_shas["master"] = "8" * 40
+    value = gateway(github)
+    sync_review_watch(
+        session,
+        view.publication_id,
+        expected_actors=(CODEX_ACTOR, HUMAN_ACTOR),
+    )
+
+    stale_body = json.dumps(
+        {
+            "ref": "refs/heads/master",
+            "after": "8" * 40,
+            "repository": {"full_name": REPOSITORY},
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    stale_signature = "sha256=" + hmac.new(
+        SECRET.encode("utf-8"),
+        stale_body,
+        hashlib.sha256,
+    ).hexdigest()
+    stale_receipt = value.ingest(
+        session,
+        delivery_id="delivery-base-push-stale-recovery-1",
+        event_name="push",
+        signature=stale_signature,
+        body=stale_body,
+    )
+    stale_result = value.process_delivery(session, stale_receipt.delivery_id)
+
+    assert stale_result.outcome == "BASE_PUSH_STALE:1:RECOVERED:0"
+    assert stale_result.next_action == "BLOCKED"
+    assert get_review_watch(session, view.publication_id).state == "STALE"
+
+    github.ref_shas["master"] = BASE_SHA
+    recovery_body = json.dumps(
+        {
+            "ref": "refs/heads/master",
+            "after": BASE_SHA,
+            "repository": {"full_name": REPOSITORY},
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    recovery_signature = "sha256=" + hmac.new(
+        SECRET.encode("utf-8"),
+        recovery_body,
+        hashlib.sha256,
+    ).hexdigest()
+    recovery_receipt = value.ingest(
+        session,
+        delivery_id="delivery-base-push-recovery-2",
+        event_name="push",
+        signature=recovery_signature,
+        body=recovery_body,
+    )
+    recovery_result = value.process_delivery(session, recovery_receipt.delivery_id)
+
+    watch = get_review_watch(session, view.publication_id)
+    assert recovery_result.outcome == "BASE_PUSH_STALE:0:RECOVERED:1"
+    assert recovery_result.next_action == "DONE"
+    assert watch.state == "ACTIVE"
+    assert watch.next_role == "PROVIDER"
+    assert watch.next_action == "WAIT_PROVIDER"
+
+
     push_payload = {
         "ref": "refs/heads/master",
         "after": "8" * 40,
@@ -880,7 +950,7 @@ def test_base_push_stale_blocks_later_human_review_and_mergeability(session):
     )
     push_result = value.process_delivery(session, push_receipt.delivery_id)
 
-    assert push_result.outcome == "BASE_PUSH_STALE:1"
+    assert push_result.outcome == "BASE_PUSH_STALE:1:RECOVERED:0"
     assert get_review_watch(session, view.publication_id).state == "STALE"
 
     review_body, review_signature = raw_delivery(
