@@ -5,6 +5,7 @@ import json
 import re
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from enum import StrEnum
 from typing import Any, Mapping
 
@@ -17,6 +18,8 @@ from .repository import ZERO_HASH
 
 _CONTEXT_NAMESPACE = uuid.UUID("abf32b46-34a6-40b2-a86a-2b8734ad192e")
 _EVIDENCE_RE = re.compile(r"^[0-9a-f]{64}$")
+_MIN_LEASE_SECONDS = 60
+_MAX_LEASE_SECONDS = 24 * 60 * 60
 
 
 class WorkState(StrEnum):
@@ -63,6 +66,8 @@ class WorkItemView:
     released: bool
     suspended: bool
     implementer: str | None
+    claim_lease_id: str | None
+    claim_expires_at: str | None
     implementation_summary: str | None
     implementation_evidence_sha256: str | None
     dependencies: tuple[str, ...]
@@ -77,6 +82,8 @@ class _LocalState:
     released: bool
     suspended: bool
     implementer: str | None
+    claim_lease_id: str | None
+    claim_expires_at: datetime | None
     implementation_summary: str | None
     implementation_evidence_sha256: str | None
     implemented: bool
@@ -92,6 +99,30 @@ def _safe_text(value: str, field: str, maximum: int) -> str:
     if not normalized or len(normalized) > maximum:
         raise DomainError(f"{field} must contain 1..{maximum} characters")
     return normalized
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _lease_seconds(value: int) -> int:
+    if value < _MIN_LEASE_SECONDS or value > _MAX_LEASE_SECONDS:
+        raise DomainError(
+            f"claim lease must be between {_MIN_LEASE_SECONDS} and {_MAX_LEASE_SECONDS} seconds"
+        )
+    return value
+
+
+def _parse_lease_time(value: Any) -> datetime:
+    if not isinstance(value, str) or not value.strip():
+        raise RuntimeError("work claim lease timestamp is missing")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise RuntimeError("work claim lease timestamp is invalid") from exc
+    if parsed.tzinfo is None:
+        raise RuntimeError("work claim lease timestamp has no timezone")
+    return parsed.astimezone(timezone.utc)
 
 
 def _context_payload(context: Mapping[str, Any]) -> tuple[dict[str, Any], str]:
@@ -294,6 +325,8 @@ def _fold_local(session: Session, work_item_id: str) -> _LocalState:
     released = False
     suspended = False
     implementer: str | None = None
+    claim_lease_id: str | None = None
+    claim_expires_at: datetime | None = None
     implementation_summary: str | None = None
     implementation_evidence: str | None = None
     implemented = False
@@ -310,8 +343,18 @@ def _fold_local(session: Session, work_item_id: str) -> _LocalState:
             suspended = False
         elif event_type == "WORK_CLAIMED":
             implementer = str(payload["actor"])
+            claim_lease_id = str(payload["lease_id"])
+            claim_expires_at = _parse_lease_time(payload["lease_expires_at"])
+        elif event_type == "WORK_CLAIM_RENEWED":
+            if implementer != str(payload["actor"]):
+                raise RuntimeError("work claim renewal actor differs from active claim")
+            if claim_lease_id != str(payload["lease_id"]):
+                raise RuntimeError("work claim renewal lease differs from active claim")
+            claim_expires_at = _parse_lease_time(payload["lease_expires_at"])
         elif event_type == "WORK_CLAIM_RELEASED":
             implementer = None
+            claim_lease_id = None
+            claim_expires_at = None
         elif event_type == "WORK_IMPLEMENTATION_COMPLETED":
             implemented = True
             implementation_summary = str(payload["summary"])
@@ -323,10 +366,23 @@ def _fold_local(session: Session, work_item_id: str) -> _LocalState:
         else:
             raise RuntimeError(f"unknown work-item event type: {event_type}")
 
+    if (
+        implementer is not None
+        and not implemented
+        and not completed
+        and claim_expires_at is not None
+        and claim_expires_at <= _utcnow()
+    ):
+        implementer = None
+        claim_lease_id = None
+        claim_expires_at = None
+
     return _LocalState(
         released=released,
         suspended=suspended,
         implementer=implementer,
+        claim_lease_id=claim_lease_id,
+        claim_expires_at=claim_expires_at,
         implementation_summary=implementation_summary,
         implementation_evidence_sha256=implementation_evidence,
         implemented=implemented,
@@ -468,6 +524,12 @@ def _view(
             released=local.released,
             suspended=local.suspended,
             implementer=local.implementer,
+            claim_lease_id=local.claim_lease_id,
+            claim_expires_at=(
+                local.claim_expires_at.isoformat()
+                if local.claim_expires_at is not None
+                else None
+            ),
             implementation_summary=local.implementation_summary,
             implementation_evidence_sha256=local.implementation_evidence_sha256,
             dependencies=dependencies,
@@ -825,19 +887,27 @@ def _claim_locked(
     *,
     actor: str,
     idempotency_key: str,
+    lease_seconds: int,
 ) -> WorkItemView:
     normalized_actor = _safe_text(actor, "actor", 200)
+    lease_seconds = _lease_seconds(lease_seconds)
     view = get_work_item(session, row.id)
     if view.state is not WorkState.READY:
         raise DomainError(f"work item is not READY: {view.state.value}")
     if not row.executable:
         raise DomainError("non-executable work item cannot be claimed")
+    lease_id = str(uuid.uuid4())
+    lease_expires_at = (_utcnow() + timedelta(seconds=lease_seconds)).isoformat()
     _append(
         session,
         row,
         event_type="WORK_CLAIMED",
         idempotency_key=idempotency_key,
-        payload={"actor": normalized_actor},
+        payload={
+            "actor": normalized_actor,
+            "lease_id": lease_id,
+            "lease_expires_at": lease_expires_at,
+        },
     )
     session.commit()
     return get_work_item(session, row.id)
@@ -849,6 +919,7 @@ def claim_work_item(
     *,
     actor: str,
     idempotency_key: str,
+    lease_seconds: int = 4 * 60 * 60,
 ) -> WorkItemView:
     existing = _event_by_idempotency(session, idempotency_key)
     if existing is not None:
@@ -865,6 +936,7 @@ def claim_work_item(
         row,
         actor=actor,
         idempotency_key=idempotency_key,
+        lease_seconds=lease_seconds,
     )
 
 
@@ -884,6 +956,7 @@ def claim_next_work(
     *,
     actor: str,
     idempotency_key: str,
+    lease_seconds: int = 4 * 60 * 60,
 ) -> WorkItemView | None:
     normalized_repository = _safe_text(repository, "repository", 200)
     normalized_actor = _safe_text(actor, "actor", 200)
@@ -928,9 +1001,56 @@ def claim_next_work(
             row,
             actor=normalized_actor,
             idempotency_key=idempotency_key,
+            lease_seconds=lease_seconds,
         )
     session.commit()
     return None
+
+
+def renew_claim(
+    session: Session,
+    work_item_id: str,
+    *,
+    actor: str,
+    idempotency_key: str,
+    lease_seconds: int = 4 * 60 * 60,
+) -> WorkItemView:
+    normalized_actor = _safe_text(actor, "actor", 200)
+    lease_seconds = _lease_seconds(lease_seconds)
+
+    existing = _event_by_idempotency(session, idempotency_key)
+    if existing is not None:
+        if (
+            existing.work_item_id != work_item_id
+            or existing.event_type != "WORK_CLAIM_RENEWED"
+            or str(existing.payload.get("actor")) != normalized_actor
+        ):
+            raise DomainError("idempotency key was already used for another work command")
+        return get_work_item(session, work_item_id)
+
+    row = _lock_work_item(session, work_item_id)
+    view = get_work_item(session, row.id)
+    if view.state is not WorkState.IN_PROGRESS:
+        raise DomainError("claim can be renewed only while IN_PROGRESS")
+    if view.implementer != normalized_actor:
+        raise DomainError("only the current implementer can renew the claim")
+    if view.claim_lease_id is None or view.claim_expires_at is None:
+        raise RuntimeError("active work claim is missing lease identity")
+
+    lease_expires_at = (_utcnow() + timedelta(seconds=lease_seconds)).isoformat()
+    _append(
+        session,
+        row,
+        event_type="WORK_CLAIM_RENEWED",
+        idempotency_key=idempotency_key,
+        payload={
+            "actor": normalized_actor,
+            "lease_id": view.claim_lease_id,
+            "lease_expires_at": lease_expires_at,
+        },
+    )
+    session.commit()
+    return get_work_item(session, row.id)
 
 
 def release_claim(
