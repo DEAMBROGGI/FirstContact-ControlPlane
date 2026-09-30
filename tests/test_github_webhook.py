@@ -602,6 +602,24 @@ def test_direct_human_review_endpoint_is_blocked_when_base_ref_drifted(session):
     assert watch.next_action == "BLOCKED"
 
 
+def test_direct_human_review_endpoint_allows_current_base(session):
+    view = complete_codex_pass(session, start_codex(session, published(session)))
+    value = gateway(FakeGitHub())
+
+    approved = review_record(
+        view.publication_id,
+        ReviewRequest(
+            reviewed_head_sha=HEAD,
+            decision=ReviewDecision.APPROVED,
+        ),
+        session,
+        value,
+    )
+
+    assert approved["state"] == PublicationState.APPROVED.value
+    assert get_review_watch(session, view.publication_id).state == "ACTIVE"
+
+
 
 def test_duplicate_human_review_delivery_does_not_duplicate_review_event(session):
     view = complete_codex_pass(session, start_codex(session, published(session)))
