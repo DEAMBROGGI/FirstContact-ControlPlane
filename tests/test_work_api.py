@@ -208,3 +208,42 @@ def test_work_api_rejects_unauthorized_and_conflicting_claim(session):
         assert "not READY" in second.json()["detail"]
     finally:
         app.dependency_overrides.clear()
+
+
+def test_work_api_explicit_release_moves_backlog_to_ready(session):
+    client = client_for(session)
+    try:
+        item = create_item(
+            client,
+            2730,
+            released=False,
+        )
+        assert item["state"] == "BACKLOG"
+        assert item["next_action"] == "WAIT_RELEASE"
+
+        empty = client.get(
+            "/api/v1/work/next",
+            headers=HEADERS,
+            params={"repository": REPOSITORY},
+        )
+        assert empty.status_code == 200
+        assert empty.json() is None
+
+        released = client.post(
+            f"/api/v1/internal/work-items/{item['work_item_id']}/release",
+            headers=HEADERS,
+            json={"idempotency_key": "api:2730:release"},
+        )
+        assert released.status_code == 200
+        assert released.json()["state"] == "READY"
+        assert released.json()["next_action"] == "CLAIM_WORK"
+
+        replay = client.post(
+            f"/api/v1/internal/work-items/{item['work_item_id']}/release",
+            headers=HEADERS,
+            json={"idempotency_key": "api:2730:release"},
+        )
+        assert replay.status_code == 200
+        assert replay.json()["state"] == "READY"
+    finally:
+        app.dependency_overrides.clear()
