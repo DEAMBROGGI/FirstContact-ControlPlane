@@ -23,10 +23,12 @@ from control_plane.github_api import (
 from control_plane.github_app import InstallationAccess
 from control_plane.github_webhook import (
     GitHubWebhookAuthError,
+    GitHubWebhookError,
     GitHubWebhookGateway,
     _lock_delivery_scope,
     get_review_watch,
     get_webhook_delivery,
+    mark_delivery_retry,
     persist_webhook_delivery,
     sync_review_watch,
 )
@@ -672,6 +674,199 @@ def test_usage_limit_with_mutated_trigger_marker_fails_closed(session):
     assert get_view(session, view.publication_id).automated_review_status is AutomatedReviewStatus.RUNNING
     assert get_webhook_delivery(session, receipt.delivery_id).state == "PENDING"
 
+
+
+
+@pytest.mark.parametrize("wakeup_review_id", [810, 811])
+def test_out_of_order_human_review_wakeup_uses_latest_remote_decision(
+    session,
+    wakeup_review_id,
+):
+    view = complete_codex_pass(session, start_codex(session, published(session)))
+    github = FakeGitHub()
+    github.reviews = [
+        PullReviewSnapshot(
+            review_id=810,
+            actor=HUMAN_ACTOR,
+            body="older approval",
+            state="APPROVED",
+            commit_id=HEAD,
+            submitted_at="2026-09-30T12:10:00Z",
+        ),
+        PullReviewSnapshot(
+            review_id=811,
+            actor=HUMAN_ACTOR,
+            body="newer changes requested",
+            state="CHANGES_REQUESTED",
+            commit_id=HEAD,
+            submitted_at="2026-09-30T12:11:00Z",
+        ),
+    ]
+    value = gateway(github)
+
+    body, signature = raw_delivery(
+        event_name="pull_request_review",
+        review_id=wakeup_review_id,
+        review_actor=HUMAN_ACTOR,
+    )
+    receipt = value.ingest(
+        session,
+        delivery_id=f"delivery-human-order-{wakeup_review_id}",
+        event_name="pull_request_review",
+        signature=signature,
+        body=body,
+    )
+    result = value.process_delivery(session, receipt.delivery_id)
+
+    current = get_view(session, view.publication_id)
+    assert current.state is PublicationState.CHANGES_REQUIRED
+    assert current.review_decision is not None
+    assert current.review_decision.value == "CHANGES_REQUIRED"
+    assert result.outcome == "HUMAN_CHANGES_REQUIRED"
+
+    review_events = [
+        event
+        for event in load_events(session, view.publication_id)
+        if event["event_type"] == EventType.REVIEW_RECORDED.value
+    ]
+    assert len(review_events) == 1
+    assert review_events[0]["payload"]["decision"] == "CHANGES_REQUIRED"
+
+
+def test_base_push_stale_blocks_later_human_review_and_mergeability(session):
+    view = complete_codex_pass(session, start_codex(session, published(session)))
+    github = FakeGitHub()
+    github.ref_shas["master"] = "8" * 40
+    github.mergeable = True
+    github.reviews = [
+        PullReviewSnapshot(
+            review_id=812,
+            actor=HUMAN_ACTOR,
+            body="approval after base drift",
+            state="APPROVED",
+            commit_id=HEAD,
+            submitted_at="2026-09-30T12:12:00Z",
+        )
+    ]
+    value = gateway(github)
+    sync_review_watch(
+        session,
+        view.publication_id,
+        expected_actors=(CODEX_ACTOR, HUMAN_ACTOR),
+    )
+
+    push_payload = {
+        "ref": "refs/heads/master",
+        "after": "8" * 40,
+        "repository": {"full_name": REPOSITORY},
+    }
+    push_body = json.dumps(
+        push_payload,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    push_signature = "sha256=" + hmac.new(
+        SECRET.encode("utf-8"),
+        push_body,
+        hashlib.sha256,
+    ).hexdigest()
+    push_receipt = value.ingest(
+        session,
+        delivery_id="delivery-base-push-stale",
+        event_name="push",
+        signature=push_signature,
+        body=push_body,
+    )
+    push_result = value.process_delivery(session, push_receipt.delivery_id)
+
+    assert push_result.outcome == "BASE_PUSH_STALE:1"
+    assert get_review_watch(session, view.publication_id).state == "STALE"
+
+    review_body, review_signature = raw_delivery(
+        event_name="pull_request_review",
+        review_id=812,
+        review_actor=HUMAN_ACTOR,
+    )
+    review_receipt = value.ingest(
+        session,
+        delivery_id="delivery-human-after-base-drift",
+        event_name="pull_request_review",
+        signature=review_signature,
+        body=review_body,
+    )
+    review_result = value.process_delivery(session, review_receipt.delivery_id)
+
+    current = get_view(session, view.publication_id)
+    watch = get_review_watch(session, view.publication_id)
+    assert current.state is PublicationState.IN_REVIEW
+    assert current.review_decision is None
+    assert current.mergeable is None
+    assert review_result.outcome == "STALE_BASE"
+    assert review_result.next_role == "CONTROL_PLANE"
+    assert review_result.next_action == "BLOCKED"
+    assert watch.state == "STALE"
+
+    review_events = [
+        event
+        for event in load_events(session, view.publication_id)
+        if event["event_type"] == EventType.REVIEW_RECORDED.value
+    ]
+    assert review_events == []
+
+
+def test_best_effort_pending_recovery_isolates_one_failed_delivery(session):
+    published(session)
+    value = gateway(FakeGitHub())
+
+    first_body, first_signature = raw_delivery(
+        event_name="issue_comment",
+        comment_id=720,
+    )
+    second_body, second_signature = raw_delivery(
+        event_name="issue_comment",
+        comment_id=721,
+    )
+    value.ingest(
+        session,
+        delivery_id="delivery-startup-bad",
+        event_name="issue_comment",
+        signature=first_signature,
+        body=first_body,
+    )
+    value.ingest(
+        session,
+        delivery_id="delivery-startup-good",
+        event_name="issue_comment",
+        signature=second_signature,
+        body=second_body,
+    )
+
+    original = value.process_delivery
+    seen = []
+
+    def flaky_process(supplied_session, delivery_id):
+        seen.append(delivery_id)
+        if delivery_id == "delivery-startup-bad":
+            mark_delivery_retry(
+                supplied_session,
+                delivery_id,
+                "simulated startup recovery failure",
+            )
+            raise GitHubWebhookError("simulated startup recovery failure")
+        return original(supplied_session, delivery_id)
+
+    value.process_delivery = flaky_process
+    recovered = value.reconcile_pending_best_effort(session, limit=2)
+
+    assert seen == ["delivery-startup-bad", "delivery-startup-good"]
+    assert len(recovered) == 1
+    assert recovered[0].delivery_id == "delivery-startup-good"
+    assert get_webhook_delivery(session, "delivery-startup-bad").state == "PENDING"
+    assert (
+        get_webhook_delivery(session, "delivery-startup-bad").last_error
+        == "simulated startup recovery failure"
+    )
+    assert get_webhook_delivery(session, "delivery-startup-good").state == "PROCESSED"
 
 
 def test_delivery_scope_uses_postgres_advisory_lock():
