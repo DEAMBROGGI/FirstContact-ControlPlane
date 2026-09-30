@@ -42,6 +42,7 @@ from .schemas import (
     PlaneReviewRequest,
     ReviewRequest,
     ReleaseWorkClaimRequest,
+    RenewWorkClaimRequest,
     ResumeWorkItemRequest,
     StartSuccessorVerificationRequest,
     SubmitRemediationImplementationRequest,
@@ -80,6 +81,7 @@ from .work import (
     load_work_item_events,
     next_work,
     release_claim,
+    renew_claim,
     resume_work_item,
     submit_work_implementation,
     suspend_work_item,
@@ -369,6 +371,7 @@ def work_claim_next(
             request.repository,
             actor=request.actor,
             idempotency_key=request.idempotency_key,
+            lease_seconds=settings.work_claim_lease_seconds,
         )
         return None if view is None else _work_item_payload(view)
     except DomainError as exc:
@@ -391,6 +394,7 @@ def work_item_claim(
                 work_item_id,
                 actor=request.actor,
                 idempotency_key=request.idempotency_key,
+                lease_seconds=settings.work_claim_lease_seconds,
             )
         )
     except KeyError as exc:
@@ -442,6 +446,31 @@ def work_item_complete(
                 actor=request.actor,
                 evidence=request.evidence,
                 idempotency_key=request.idempotency_key,
+            )
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="work item not found") from exc
+    except DomainError as exc:
+        raise _conflict(exc) from exc
+
+
+@app.post(
+    "/api/v1/work-items/{work_item_id}/claim/renew",
+    dependencies=[Depends(require_token)],
+)
+def work_item_claim_renew(
+    work_item_id: str,
+    request: RenewWorkClaimRequest,
+    session: Session = Depends(get_session),
+):
+    try:
+        return _work_item_payload(
+            renew_claim(
+                session,
+                work_item_id,
+                actor=request.actor,
+                idempotency_key=request.idempotency_key,
+                lease_seconds=settings.work_claim_lease_seconds,
             )
         )
     except KeyError as exc:
