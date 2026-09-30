@@ -591,6 +591,21 @@ class GitHubWebhookGateway:
             view.pull_request_number,
             token,
         )
+        trigger_matches = [
+            item
+            for item in comments
+            if item.comment_id == view.automated_review_trigger_comment_id
+        ]
+        if len(trigger_matches) != 1:
+            raise GitHubWebhookError("governed Codex trigger receipt is missing or ambiguous")
+        trigger = trigger_matches[0]
+        if _normalize_actor(trigger.actor) != _normalize_actor(
+            view.automated_review_trigger_actor or ""
+        ):
+            raise GitHubWebhookError("governed Codex trigger actor changed")
+        if _parse_time(trigger.created_at) != trigger_time:
+            raise GitHubWebhookError("governed Codex trigger timestamp changed")
+
         matches = []
         for item in comments:
             if comment_id is not None and item.comment_id != comment_id:
