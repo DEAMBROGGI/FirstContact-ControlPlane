@@ -878,6 +878,17 @@ def add_dependency(
 ) -> WorkItemView:
     if work_item_id == depends_on_work_item_id:
         raise DomainError("work item cannot depend on itself")
+
+    seed = session.get(WorkItemRow, work_item_id)
+    if seed is None:
+        raise KeyError(work_item_id)
+
+    # Dependency mutations share the repository transaction lock with claim-next.
+    # The repository lock must be acquired before the target row lock so opposite
+    # concurrent edges cannot each validate against the same pre-write graph, and
+    # so graph mutation and claim paths preserve one lock ordering.
+    _lock_scheduler_scope(session, seed.repository)
+
     row = _lock_work_item(session, work_item_id)
     dependency = session.get(WorkItemRow, depends_on_work_item_id)
     if dependency is None:
