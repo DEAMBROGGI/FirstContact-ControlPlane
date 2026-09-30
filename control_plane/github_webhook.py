@@ -1259,12 +1259,18 @@ class GitHubWebhookGateway:
         if row.event_name == "push":
             outcome = self._process_push(session, row)
             mark_delivery_processed(session, delivery_id)
+            stale_count = 0
+            if outcome.startswith("BASE_PUSH_STALE:"):
+                try:
+                    stale_count = int(outcome.split(":", 2)[1])
+                except (IndexError, TypeError, ValueError):
+                    raise GitHubWebhookError("base push reconciliation result is malformed")
             return WebhookProcessResult(
                 delivery_id=delivery_id,
                 publication_id=None,
                 outcome=outcome,
                 next_role="CONTROL_PLANE",
-                next_action="BLOCKED" if "STALE:" in outcome and not outcome.endswith(":0") else "DONE",
+                next_action="BLOCKED" if stale_count > 0 else "DONE",
                 watch_state=None,
             )
 
