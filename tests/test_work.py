@@ -6,6 +6,7 @@ import pytest
 import control_plane.work as work_module
 
 from control_plane.domain import DomainError
+from control_plane.models import WorkItemRow
 from control_plane.work import (
     NextAction,
     NextRole,
@@ -710,3 +711,61 @@ def test_resume_and_complete_commands_are_retry_idempotent(session):
 
     assert completed.state is WorkState.DONE
     assert replayed_complete.state is WorkState.DONE
+
+
+def test_context_is_reconstructed_from_ledger_and_projection_drift_fails_closed(session):
+    view = create(
+        session,
+        2670,
+        context={
+            "title": "ledger-owned context",
+            "instructions": ["one", "two"],
+        },
+    )
+
+    reconstructed = get_work_item(session, view.work_item_id)
+    assert reconstructed.context == {
+        "title": "ledger-owned context",
+        "instructions": ["one", "two"],
+    }
+
+    row = session.get(WorkItemRow, view.work_item_id)
+    row.context_data = {"title": "tampered projection"}
+    session.commit()
+
+    with pytest.raises(
+        RuntimeError,
+        match="context projection differs from its ledger",
+    ):
+        get_work_item(session, view.work_item_id)
+
+
+def test_parent_required_children_are_derived_from_child_ledger(session):
+    parent = create(
+        session,
+        2680,
+        executable=False,
+        released=False,
+        context={"title": "parent"},
+    )
+    child = create(
+        session,
+        2681,
+        parent=parent,
+        required=True,
+        context={"title": "child"},
+    )
+
+    before = get_work_item(session, parent.work_item_id)
+    assert before.state is WorkState.BLOCKED
+    assert before.required_children == (child.work_item_id,)
+
+    child_row = session.get(WorkItemRow, child.work_item_id)
+    child_row.parent_work_item_id = None
+    session.commit()
+
+    with pytest.raises(
+        RuntimeError,
+        match="immutable identity differs from its ledger",
+    ):
+        get_work_item(session, parent.work_item_id)
