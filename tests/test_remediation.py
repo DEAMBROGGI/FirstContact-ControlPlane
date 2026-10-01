@@ -27,6 +27,7 @@ from control_plane.github_api import (
     PullReviewCommentSnapshot,
 )
 from control_plane.github_app import InstallationAccess
+from control_plane.github_webhook import _parse_time, _required_adjudication_time
 from control_plane.main import app, get_remediation_materializer
 from control_plane.models import RemediationEventRow, RemediationWorkPackageRow
 from control_plane.profile_registry import profile_for_repository
@@ -64,6 +65,7 @@ from control_plane.service import (
     record_review,
     record_validation,
     request_codex_review,
+    required_review_adjudication,
     submit_verified_candidate,
 )
 
@@ -1049,6 +1051,19 @@ def test_rejected_only_package_finalizes_without_candidate_or_successor_review(s
     assert publication.automated_review_status is AutomatedReviewStatus.CHANGES_REQUIRED
     assert publication.remediation_cleared_review_run_id == source_run
     assert publication.remediation_cleared_head_sha == HEAD
+    adjudication = required_review_adjudication(session, view.publication_id)
+    assert adjudication is not None
+    assert adjudication["kind"] == "REMEDIATION_CLEARED"
+    cleared_event = next(
+        event
+        for event in load_events(session, view.publication_id)
+        if event["event_type"] == "REMEDIATION_CLEARED"
+    )
+    assert _required_adjudication_time(
+        session,
+        view.publication_id,
+        adjudication,
+    ) == _parse_time(cleared_event["occurred_at"])
     approved = record_review(
         session,
         view.publication_id,

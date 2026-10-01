@@ -23,6 +23,10 @@ from control_plane.github_api import (
     PullReviewSnapshot,
 )
 from control_plane.github_app import InstallationAccess
+from control_plane.plane_review import (
+    complete_plane_review_materialization,
+    record_plane_review,
+)
 from control_plane.github_webhook import (
     GitHubWebhookAuthError,
     GitHubWebhookError,
@@ -46,7 +50,10 @@ from control_plane.service import (
     complete_codex_review_trigger_dispatch,
     create_publication,
     get_view,
+    mark_codex_review_unavailable,
     mark_remote_published,
+    record_mergeability,
+    record_review,
     record_validation,
     request_codex_review,
     submit_verified_candidate,
@@ -131,11 +138,11 @@ def publish_next_head(session, view):
     )
 
 
-def start_codex(session, view, *, expected_head_sha=HEAD):
+def start_codex(session, view, *, expected_head_sha=HEAD, mode="required"):
     running = request_codex_review(
         session,
         view.publication_id,
-        mode="required",
+        mode=mode,
         expected_head_sha=expected_head_sha,
     )
     assert running.automated_review_run_id is not None
@@ -169,6 +176,22 @@ def complete_codex_pass(session, view):
         provider_review_ids=[501],
         provider_comment_ids=[],
         provider_reaction_ids=[],
+    )
+
+
+def codex_gate_time(session, view):
+    event = next(
+        event
+        for event in load_events(session, view.publication_id)
+        if event["event_type"] == EventType.CODEX_REVIEW_COMPLETED.value
+        and event["payload"].get("run_id") == view.automated_review_run_id
+        and event["payload"].get("result") == AutomatedReviewStatus.PASS.value
+    )
+    timestamp = datetime.fromisoformat(event["occurred_at"])
+    return (
+        timestamp.replace(tzinfo=timezone.utc)
+        if timestamp.tzinfo is None
+        else timestamp.astimezone(timezone.utc)
     )
 
 
@@ -213,6 +236,38 @@ def raw_delivery(
     return body, signature
 
 
+def raw_wakeup_delivery(
+    event_name,
+    *,
+    repository=REPOSITORY,
+    head_sha=HEAD,
+    pull_numbers=(44,),
+):
+    payload = {"repository": {"full_name": repository}}
+    if event_name == "check_run":
+        payload.update(
+            {
+                "action": "completed",
+                "check_run": {
+                    "head_sha": head_sha,
+                    "pull_requests": [
+                        {"number": number}
+                        for number in pull_numbers
+                    ],
+                },
+            }
+        )
+    else:
+        payload.update({"state": "success", "sha": head_sha})
+    body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    signature = "sha256=" + hmac.new(
+        SECRET.encode("utf-8"),
+        body,
+        hashlib.sha256,
+    ).hexdigest()
+    return body, signature
+
+
 class FakeTokenProvider:
     def __init__(self):
         self.requests = []
@@ -231,6 +286,7 @@ class FakeGitHub:
         self.head_sha = HEAD
         self.mergeable = None
         self.merged = False
+        self.closed = False
         self.issue_comments = []
         self.reviews = []
         self.pull_review_list_calls = 0
@@ -244,7 +300,7 @@ class FakeGitHub:
         assert token == "installation-token"
         return PullRequestSnapshot(
             number=44,
-            state="closed" if self.merged else "open",
+            state="closed" if self.merged or self.closed else "open",
             base_ref="master",
             head_ref="control-plane/issue-2601-webhook",
             head_sha=self.head_sha,
@@ -293,11 +349,11 @@ class FakeGitHub:
         )
 
 
-def gateway(github=None):
+def gateway(github=None, *, mode="required"):
     return GitHubWebhookGateway(
         token_provider=FakeTokenProvider(),
         github=github or FakeGitHub(),
-        codex_review_mode="required",
+        codex_review_mode=mode,
         codex_actors=(CODEX_ACTOR,),
         human_review_actors=(HUMAN_ACTOR,),
         webhook_secret=SECRET,
@@ -499,6 +555,162 @@ def test_stale_human_review_cannot_advance_exact_head(session):
     assert result.next_action == "WAIT_HUMAN_REVIEW"
 
 
+def test_closed_unmerged_pr_blocks_watch_and_later_human_approval(session):
+    view = complete_codex_pass(session, start_codex(session, published(session)))
+    github = FakeGitHub()
+    github.closed = True
+    github.reviews = [
+        PullReviewSnapshot(
+            review_id=806,
+            actor=HUMAN_ACTOR,
+            body="approval after close",
+            state="APPROVED",
+            commit_id=HEAD,
+            submitted_at=(codex_gate_time(session, view) + timedelta(seconds=1)).isoformat(),
+        )
+    ]
+    value = gateway(github)
+
+    closed_body, closed_signature = raw_delivery(
+        event_name="pull_request",
+        action="closed",
+    )
+    closed_receipt = value.ingest(
+        session,
+        delivery_id="delivery-pr-closed-unmerged",
+        event_name="pull_request",
+        signature=closed_signature,
+        body=closed_body,
+    )
+    closed_result = value.process_delivery(session, closed_receipt.delivery_id)
+
+    assert closed_result.outcome == "PULL_CLOSED_UNMERGED"
+    watch = get_review_watch(session, view.publication_id)
+    assert watch.state == "CLOSED_UNMERGED"
+    assert watch.next_role == "CONTROL_PLANE"
+    assert watch.next_action == "BLOCKED"
+    with pytest.raises(DomainError, match="closed unmerged"):
+        value.assert_review_write_current(session, view.publication_id)
+
+    review_body, review_signature = raw_delivery(
+        event_name="pull_request_review",
+        review_id=806,
+        review_actor=HUMAN_ACTOR,
+    )
+    review_receipt = value.ingest(
+        session,
+        delivery_id="delivery-review-after-pr-close",
+        event_name="pull_request_review",
+        signature=review_signature,
+        body=review_body,
+    )
+    review_result = value.process_delivery(session, review_receipt.delivery_id)
+
+    assert review_result.outcome == "PULL_CLOSED_UNMERGED"
+    assert get_view(session, view.publication_id).state is PublicationState.IN_REVIEW
+    assert get_view(session, view.publication_id).review_decision is None
+    assert get_review_watch(session, view.publication_id).state == "CLOSED_UNMERGED"
+    assert not [
+        event
+        for event in load_events(session, view.publication_id)
+        if event["event_type"] == EventType.REVIEW_RECORDED.value
+    ]
+
+
+def test_verified_merge_completes_watch_after_unmerged_close(session):
+    view = complete_codex_pass(session, start_codex(session, published(session)))
+    record_review(
+        session,
+        view.publication_id,
+        reviewed_head_sha=HEAD,
+        decision=ReviewDecision.APPROVED,
+        require_codex_review=True,
+    )
+    record_mergeability(
+        session,
+        view.publication_id,
+        head_sha=HEAD,
+        mergeable=True,
+    )
+    github = FakeGitHub()
+    github.closed = True
+    value = gateway(github)
+    sync_review_watch(session, view.publication_id)
+
+    unmerged_body, unmerged_signature = raw_delivery(
+        event_name="pull_request",
+        action="closed",
+    )
+    unmerged_receipt = value.ingest(
+        session,
+        delivery_id="delivery-pr-close-before-merge",
+        event_name="pull_request",
+        signature=unmerged_signature,
+        body=unmerged_body,
+    )
+    value.process_delivery(session, unmerged_receipt.delivery_id)
+    assert get_review_watch(session, view.publication_id).state == "CLOSED_UNMERGED"
+
+    github.merged = True
+    merged_body, merged_signature = raw_delivery(
+        event_name="pull_request",
+        action="closed",
+    )
+    merged_receipt = value.ingest(
+        session,
+        delivery_id="delivery-pr-merged-after-close",
+        event_name="pull_request",
+        signature=merged_signature,
+        body=merged_body,
+    )
+    result = value.process_delivery(session, merged_receipt.delivery_id)
+
+    assert result.outcome == "PULL_CLOSED_RECONCILED"
+    assert get_view(session, view.publication_id).state is PublicationState.MERGED
+    watch = get_review_watch(session, view.publication_id)
+    assert watch.state == "DONE"
+    assert watch.next_role == "NONE"
+    assert watch.next_action == "DONE"
+
+
+def test_closed_unmerged_pr_cannot_become_merge_ready_from_old_approval(session):
+    view = complete_codex_pass(session, start_codex(session, published(session)))
+    record_review(
+        session,
+        view.publication_id,
+        reviewed_head_sha=HEAD,
+        decision=ReviewDecision.APPROVED,
+        require_codex_review=True,
+    )
+    github = FakeGitHub()
+    github.closed = True
+    github.mergeable = True
+    value = gateway(github)
+    sync_review_watch(session, view.publication_id)
+    body, signature = raw_delivery(
+        event_name="pull_request",
+        action="closed",
+    )
+    receipt = value.ingest(
+        session,
+        delivery_id="delivery-approved-pr-closed-unmerged",
+        event_name="pull_request",
+        signature=signature,
+        body=body,
+    )
+
+    result = value.process_delivery(session, receipt.delivery_id)
+
+    current = get_view(session, view.publication_id)
+    assert result.outcome == "PULL_CLOSED_UNMERGED"
+    assert current.state is PublicationState.APPROVED
+    assert current.mergeable is None
+    watch = get_review_watch(session, view.publication_id)
+    assert watch.state == "CLOSED_UNMERGED"
+    assert watch.next_role == "CONTROL_PLANE"
+    assert watch.next_action == "BLOCKED"
+
+
 def test_exact_human_approval_can_advance_directly_to_ready_to_merge(session):
     view = complete_codex_pass(session, start_codex(session, published(session)))
     github = FakeGitHub()
@@ -510,7 +722,7 @@ def test_exact_human_approval_can_advance_directly_to_ready_to_merge(session):
             body="approved exact head",
             state="APPROVED",
             commit_id=HEAD,
-            submitted_at="2026-09-30T12:06:00Z",
+            submitted_at=(codex_gate_time(session, view) + timedelta(seconds=1)).isoformat(),
         )
     ]
     value = gateway(github)
@@ -536,7 +748,7 @@ def test_exact_human_approval_can_advance_directly_to_ready_to_merge(session):
     assert result.next_action == "MERGE"
 
 
-def test_pending_human_delivery_can_resume_after_restart_when_gate_becomes_ready(session):
+def test_pending_pre_gate_human_approval_stays_stale_after_codex_completes(session):
     view = start_codex(session, published(session))
     github = FakeGitHub()
     github.reviews = [
@@ -546,7 +758,7 @@ def test_pending_human_delivery_can_resume_after_restart_when_gate_becomes_ready
             body="approved before provider finished",
             state="APPROVED",
             commit_id=HEAD,
-            submitted_at="2026-09-30T12:07:00Z",
+            submitted_at=(datetime.now(timezone.utc) - timedelta(days=1)).isoformat(),
         )
     ]
 
@@ -579,11 +791,201 @@ def test_pending_human_delivery_can_resume_after_restart_when_gate_becomes_ready
 
     assert len(resumed) == 1
     assert resumed[0].delivery_id == receipt.delivery_id
-    assert get_view(session, view.publication_id).state is PublicationState.APPROVED
+    assert resumed[0].outcome == "STALE_HUMAN_REVIEW"
+    current = get_view(session, view.publication_id)
+    assert current.state is PublicationState.IN_REVIEW
+    assert current.review_decision is None
     assert get_webhook_delivery(session, receipt.delivery_id).state == "PROCESSED"
 
     watch = get_review_watch(session, view.publication_id)
-    assert watch.next_action == "CHECK_MERGEABILITY"
+    assert watch.next_action == "WAIT_HUMAN_REVIEW"
+
+
+@pytest.mark.parametrize(
+    ("mode", "review_state", "expected_state"),
+    [
+        ("disabled", "APPROVED", PublicationState.APPROVED),
+        ("advisory", "APPROVED", PublicationState.APPROVED),
+        ("required", "CHANGES_REQUESTED", PublicationState.CHANGES_REQUIRED),
+    ],
+)
+def test_webhook_human_review_gate_applies_only_to_required_approvals(
+    session,
+    mode,
+    review_state,
+    expected_state,
+):
+    view = published(session)
+    github = FakeGitHub()
+    github.reviews = [
+        PullReviewSnapshot(
+            review_id=804,
+            actor=HUMAN_ACTOR,
+            body="human decision",
+            state=review_state,
+            commit_id=HEAD,
+            submitted_at=datetime.now(timezone.utc).isoformat(),
+        )
+    ]
+    value = gateway(github, mode=mode)
+    body, signature = raw_delivery(
+        event_name="pull_request_review",
+        review_id=804,
+        review_actor=HUMAN_ACTOR,
+    )
+    receipt = value.ingest(
+        session,
+        delivery_id=f"delivery-human-mode-{mode}-{review_state}",
+        event_name="pull_request_review",
+        signature=signature,
+        body=body,
+    )
+
+    result = value.process_delivery(session, receipt.delivery_id)
+
+    current = get_view(session, view.publication_id)
+    assert current.state is expected_state
+    assert current.review_decision is not None
+    assert get_webhook_delivery(session, receipt.delivery_id).state == "PROCESSED"
+    assert result.outcome.startswith("HUMAN_")
+
+
+@pytest.mark.parametrize(
+    ("offset_seconds", "expected_state"),
+    [
+        (-1, PublicationState.IN_REVIEW),
+        (0, PublicationState.IN_REVIEW),
+        (1, PublicationState.APPROVED),
+    ],
+)
+def test_required_approval_must_follow_exact_head_codex_adjudication(
+    session,
+    offset_seconds,
+    expected_state,
+):
+    view = complete_codex_pass(session, start_codex(session, published(session)))
+    gate_time = codex_gate_time(session, view)
+    github = FakeGitHub()
+    github.reviews = [
+        PullReviewSnapshot(
+            review_id=805,
+            actor=HUMAN_ACTOR,
+            body="approval timestamp boundary",
+            state="APPROVED",
+            commit_id=HEAD,
+            submitted_at=(
+                gate_time + timedelta(seconds=offset_seconds)
+            ).isoformat(),
+        )
+    ]
+    value = gateway(github)
+    body, signature = raw_delivery(
+        event_name="pull_request_review",
+        review_id=805,
+        review_actor=HUMAN_ACTOR,
+    )
+    receipt = value.ingest(
+        session,
+        delivery_id=f"delivery-human-gate-{offset_seconds}",
+        event_name="pull_request_review",
+        signature=signature,
+        body=body,
+    )
+
+    result = value.process_delivery(session, receipt.delivery_id)
+
+    assert get_view(session, view.publication_id).state is expected_state
+    if expected_state is PublicationState.IN_REVIEW:
+        assert result.outcome == "STALE_HUMAN_REVIEW"
+        assert get_view(session, view.publication_id).review_decision is None
+    else:
+        assert result.outcome.startswith("HUMAN_APPROVED")
+
+
+@pytest.mark.parametrize(
+    ("offset_seconds", "expected_state"),
+    [
+        (-1, PublicationState.IN_REVIEW),
+        (0, PublicationState.IN_REVIEW),
+        (1, PublicationState.APPROVED),
+    ],
+)
+def test_required_approval_timestamp_uses_exact_plane_fallback_gate(
+    session,
+    offset_seconds,
+    expected_state,
+):
+    view = start_codex(session, published(session))
+    unavailable = mark_codex_review_unavailable(
+        session,
+        view.publication_id,
+        run_id=view.automated_review_run_id,
+        reviewed_head_sha=HEAD,
+        reason="provider unavailable for timestamp test",
+    )
+    plane_run_id = "principal-review:test-fallback-timestamp"
+    record_plane_review(
+        session,
+        view.publication_id,
+        run_id=plane_run_id,
+        reviewer_kind="FALLBACK_REVIEWER",
+        reviewer="principal-reviewer:test",
+        reviewed_head_sha=HEAD,
+        body="Exact-head fallback review.",
+        comments=[],
+        idempotency_key="fallback-timestamp-record",
+    )
+    complete_plane_review_materialization(
+        session,
+        view.publication_id,
+        run_id=plane_run_id,
+        provider_review_id=9010,
+        receipts=[],
+    )
+    fallback_event = next(
+        event
+        for event in load_events(session, view.publication_id)
+        if event["event_type"] == EventType.PLANE_REVIEW_MATERIALIZED.value
+        and event["payload"].get("run_id") == plane_run_id
+    )
+    gate_time = datetime.fromisoformat(fallback_event["occurred_at"])
+    if gate_time.tzinfo is None:
+        gate_time = gate_time.replace(tzinfo=timezone.utc)
+    github = FakeGitHub()
+    github.reviews = [
+        PullReviewSnapshot(
+            review_id=807,
+            actor=HUMAN_ACTOR,
+            body="approval timestamp boundary",
+            state="APPROVED",
+            commit_id=HEAD,
+            submitted_at=(
+                gate_time + timedelta(seconds=offset_seconds)
+            ).isoformat(),
+        )
+    ]
+    value = gateway(github)
+    body, signature = raw_delivery(
+        event_name="pull_request_review",
+        review_id=807,
+        review_actor=HUMAN_ACTOR,
+    )
+    receipt = value.ingest(
+        session,
+        delivery_id=f"delivery-fallback-gate-{offset_seconds}",
+        event_name="pull_request_review",
+        signature=signature,
+        body=body,
+    )
+
+    result = value.process_delivery(session, receipt.delivery_id)
+
+    assert unavailable.automated_review_status is AutomatedReviewStatus.UNAVAILABLE
+    assert get_view(session, view.publication_id).state is expected_state
+    if expected_state is PublicationState.IN_REVIEW:
+        assert result.outcome == "STALE_HUMAN_REVIEW"
+    else:
+        assert result.outcome.startswith("HUMAN_APPROVED")
 
 
 def test_review_watch_reconstructs_provider_next_action_from_publication(session):
@@ -963,7 +1365,7 @@ def test_duplicate_human_review_delivery_does_not_duplicate_review_event(session
             body="same approval replayed",
             state="APPROVED",
             commit_id=HEAD,
-            submitted_at="2026-09-30T12:08:00Z",
+            submitted_at=(codex_gate_time(session, view) + timedelta(seconds=1)).isoformat(),
         )
     ]
     value = gateway(github)
@@ -1417,6 +1819,167 @@ def test_base_push_stale_blocks_later_human_review_and_mergeability(session):
     assert review_events == []
 
 
+@pytest.mark.parametrize(
+    ("branch", "expected_stale"),
+    [("master", 1), ("unrelated", 0)],
+)
+def test_deleted_base_ref_stales_only_publications_watching_that_base(
+    session,
+    branch,
+    expected_stale,
+):
+    view = published(session)
+    github = FakeGitHub()
+    github.ref_shas.pop(branch, None)
+    value = gateway(github)
+    sync_review_watch(
+        session,
+        view.publication_id,
+        expected_actors=(CODEX_ACTOR, HUMAN_ACTOR),
+    )
+
+    body = json.dumps(
+        {
+            "ref": f"refs/heads/{branch}",
+            "before": BASE,
+            "after": "0" * 40,
+            "repository": {"full_name": REPOSITORY},
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    signature = "sha256=" + hmac.new(
+        SECRET.encode("utf-8"),
+        body,
+        hashlib.sha256,
+    ).hexdigest()
+    receipt = value.ingest(
+        session,
+        delivery_id=f"delivery-deleted-base-{branch}",
+        event_name="push",
+        signature=signature,
+        body=body,
+    )
+
+    result = value.process_delivery(session, receipt.delivery_id)
+
+    assert result.outcome == f"BASE_PUSH_STALE:{expected_stale}:RECOVERED:0"
+    watch = get_review_watch(session, view.publication_id)
+    assert watch.state == ("STALE" if expected_stale else "ACTIVE")
+    if expected_stale:
+        assert watch.next_role == "CONTROL_PLANE"
+        assert watch.next_action == "BLOCKED"
+
+
+@pytest.mark.parametrize("event_name", ["check_run", "status"])
+def test_check_and_status_wake_exact_governed_publication(session, event_name):
+    view = complete_codex_pass(session, start_codex(session, published(session)))
+    record_review(
+        session,
+        view.publication_id,
+        reviewed_head_sha=HEAD,
+        decision=ReviewDecision.APPROVED,
+        require_codex_review=True,
+    )
+    sync_review_watch(
+        session,
+        view.publication_id,
+        expected_actors=(CODEX_ACTOR, HUMAN_ACTOR),
+    )
+    github = FakeGitHub()
+    github.mergeable = True
+    value = gateway(github)
+    body, signature = raw_wakeup_delivery(event_name)
+    receipt = value.ingest(
+        session,
+        delivery_id=f"delivery-{event_name}-governed-target",
+        event_name=event_name,
+        signature=signature,
+        body=body,
+    )
+
+    result = value.process_delivery(session, receipt.delivery_id)
+
+    assert result.publication_id == view.publication_id
+    assert result.outcome == "EVENT_OBSERVED+MERGEABILITY_RECORDED"
+    assert get_view(session, view.publication_id).state is PublicationState.READY_TO_MERGE
+    assert get_view(session, view.publication_id).mergeable is True
+
+
+@pytest.mark.parametrize(
+    ("event_name", "repository", "head_sha", "pull_numbers"),
+    [
+        ("check_run", REPOSITORY, HEAD, (999,)),
+        ("check_run", REPOSITORY, "4" * 40, (44,)),
+        ("status", REPOSITORY, "4" * 40, (44,)),
+        ("status", "DEAMBROGGI/FirstContact", HEAD, (44,)),
+    ],
+)
+def test_check_and_status_ignore_foreign_or_unmatched_targets(
+    session,
+    event_name,
+    repository,
+    head_sha,
+    pull_numbers,
+):
+    view = published(session)
+    sync_review_watch(session, view.publication_id)
+    value = gateway(FakeGitHub())
+    body, signature = raw_wakeup_delivery(
+        event_name,
+        repository=repository,
+        head_sha=head_sha,
+        pull_numbers=pull_numbers,
+    )
+    receipt = value.ingest(
+        session,
+        delivery_id=f"delivery-{event_name}-unmatched-{pull_numbers[0]}",
+        event_name=event_name,
+        signature=signature,
+        body=body,
+    )
+
+    result = value.process_delivery(session, receipt.delivery_id)
+
+    assert result.publication_id is None
+    assert result.outcome == "NO_GOVERNED_TARGET"
+    assert get_view(session, view.publication_id).state is PublicationState.IN_REVIEW
+
+    replay = value.process_delivery(session, receipt.delivery_id)
+    assert replay.publication_id is None
+    assert replay.next_role == "NONE"
+    assert replay.next_action == "DONE"
+
+
+@pytest.mark.parametrize("event_name", ["check_run", "status"])
+def test_check_and_status_fail_closed_for_ambiguous_governed_targets(
+    session,
+    event_name,
+):
+    first = published(session, issue_number=2601)
+    second = published(session, issue_number=2602)
+    sync_review_watch(session, first.publication_id)
+    sync_review_watch(session, second.publication_id)
+    value = gateway(FakeGitHub())
+    body, signature = raw_wakeup_delivery(event_name)
+    receipt = value.ingest(
+        session,
+        delivery_id=f"delivery-{event_name}-ambiguous-target",
+        event_name=event_name,
+        signature=signature,
+        body=body,
+    )
+
+    result = value.process_delivery(session, receipt.delivery_id)
+
+    assert result.publication_id is None
+    assert result.outcome == "AMBIGUOUS_GOVERNED_TARGET"
+    assert result.next_role == "CONTROL_PLANE"
+    assert result.next_action == "BLOCKED"
+    assert get_view(session, first.publication_id).state is PublicationState.IN_REVIEW
+    assert get_view(session, second.publication_id).state is PublicationState.IN_REVIEW
+
+
 def test_base_push_back_to_candidate_sha_is_the_only_stale_watch_recovery(session):
     view = complete_codex_pass(session, start_codex(session, published(session)))
     github = FakeGitHub()
@@ -1544,6 +2107,60 @@ def test_best_effort_pending_recovery_isolates_one_failed_delivery(session):
         == "simulated startup recovery failure"
     )
     assert get_webhook_delivery(session, "delivery-startup-good").state == "PROCESSED"
+
+
+def test_pending_reconciliation_reports_failure_and_continues(session):
+    published(session)
+    value = gateway(FakeGitHub())
+    first_body, first_signature = raw_delivery(
+        event_name="issue_comment",
+        comment_id=722,
+    )
+    second_body, second_signature = raw_delivery(
+        event_name="issue_comment",
+        comment_id=723,
+    )
+    value.ingest(
+        session,
+        delivery_id="delivery-manual-bad",
+        event_name="issue_comment",
+        signature=first_signature,
+        body=first_body,
+    )
+    value.ingest(
+        session,
+        delivery_id="delivery-manual-good",
+        event_name="issue_comment",
+        signature=second_signature,
+        body=second_body,
+    )
+
+    original = value.process_delivery
+    seen = []
+
+    def flaky_process(supplied_session, delivery_id):
+        seen.append(delivery_id)
+        if delivery_id == "delivery-manual-bad":
+            mark_delivery_retry(
+                supplied_session,
+                delivery_id,
+                "simulated manual recovery failure",
+            )
+            raise GitHubWebhookError("simulated manual recovery failure")
+        return original(supplied_session, delivery_id)
+
+    value.process_delivery = flaky_process
+    results = value.reconcile_pending(session)
+
+    assert seen == ["delivery-manual-bad", "delivery-manual-good"]
+    assert [result.outcome for result in results] == [
+        "FAILED_PENDING",
+        "CODEX_NOT_RUNNING",
+    ]
+    assert results[0].error == "simulated manual recovery failure"
+    assert results[0].next_action == "RETRY"
+    assert get_webhook_delivery(session, "delivery-manual-bad").state == "PENDING"
+    assert get_webhook_delivery(session, "delivery-manual-good").state == "PROCESSED"
 
 
 def test_delivery_scope_uses_postgres_advisory_lock():

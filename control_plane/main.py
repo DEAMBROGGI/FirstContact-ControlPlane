@@ -5,6 +5,7 @@ from dataclasses import asdict
 
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.concurrency import run_in_threadpool
 from sqlalchemy.orm import Session
 
 from .codex_review import CodexReviewBroker, CodexReviewError
@@ -362,6 +363,34 @@ def _sync_publication_watch(session: Session, publication_id: str):
 
 def _conflict(exc: Exception) -> HTTPException:
     return HTTPException(status_code=409, detail=str(exc))
+
+
+async def _read_limited_webhook_body(request: Request, maximum_bytes: int) -> bytes:
+    if maximum_bytes <= 0:
+        raise HTTPException(status_code=400, detail="webhook payload limit is invalid")
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            declared_bytes = int(content_length)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail="webhook content length is invalid",
+            ) from exc
+        if declared_bytes < 0:
+            raise HTTPException(
+                status_code=400,
+                detail="webhook content length is invalid",
+            )
+        if declared_bytes > maximum_bytes:
+            raise HTTPException(status_code=413, detail="webhook payload is too large")
+
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > maximum_bytes:
+            raise HTTPException(status_code=413, detail="webhook payload is too large")
+        body.extend(chunk)
+    return bytes(body)
 
 
 @app.get("/api/v1/health")
@@ -754,7 +783,9 @@ def publication_publish(
     publisher: GitHubPublisher = Depends(get_publisher),
 ):
     try:
-        return _payload(publisher.publish(session, publication_id))
+        view = publisher.publish(session, publication_id)
+        _sync_publication_watch(session, publication_id)
+        return _payload(view)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="publication not found") from exc
     except DomainError as exc:
@@ -836,7 +867,10 @@ async def github_webhook_receive(
     session: Session = Depends(get_session),
     gateway: GitHubWebhookGateway = Depends(get_github_webhook_gateway),
 ):
-    body = await request.body()
+    body = await _read_limited_webhook_body(
+        request,
+        gateway.maximum_payload_bytes,
+    )
     try:
         receipt = gateway.ingest(
             session,
@@ -853,7 +887,11 @@ async def github_webhook_receive(
         raise HTTPException(status_code=400, detail="invalid GitHub webhook delivery") from exc
 
     try:
-        processing = gateway.process_delivery(session, receipt.delivery_id)
+        processing = await run_in_threadpool(
+            gateway.process_delivery,
+            session,
+            receipt.delivery_id,
+        )
         return {
             "delivery": asdict(receipt),
             "processing": asdict(processing),

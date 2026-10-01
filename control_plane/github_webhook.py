@@ -47,6 +47,7 @@ _SUPPORTED_EVENTS = frozenset(
 _DELIVERY_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,200}$")
 _EVENT_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,80}$")
 _SHA256_SIGNATURE_RE = re.compile(r"^sha256=([0-9a-f]{64})$")
+_BLOCKED_WATCH_STATES = frozenset({"STALE", "CLOSED_UNMERGED"})
 
 
 class GitHubWebhookError(RuntimeError):
@@ -214,6 +215,23 @@ def _pull_request_number(payload: Mapping[str, Any]) -> int | None:
             number = 0
         if number > 0:
             return number
+
+    check_run = payload.get("check_run")
+    if isinstance(check_run, Mapping):
+        pull_requests = check_run.get("pull_requests")
+        if isinstance(pull_requests, list):
+            numbers: set[int] = set()
+            for pull in pull_requests:
+                if not isinstance(pull, Mapping):
+                    continue
+                try:
+                    number = int(pull.get("number"))
+                except (TypeError, ValueError):
+                    continue
+                if number > 0:
+                    numbers.add(number)
+            if len(numbers) == 1:
+                return next(iter(numbers))
     return None
 
 
@@ -405,7 +423,9 @@ def sync_review_watch(
             else (row.state if row is not None else None)
         )
     )
-    if effective_state == "STALE":
+    if view.state is PublicationState.MERGED:
+        next_role, next_action = _derive_next(session, publication_id)
+    elif effective_state in _BLOCKED_WATCH_STATES:
         next_role, next_action = "CONTROL_PLANE", "BLOCKED"
     else:
         next_role, next_action = _derive_next(session, publication_id)
@@ -445,8 +465,8 @@ def sync_review_watch(
             # history proves that Plane governed and published this new head.
             row.state = (
                 "ACTIVE"
-                if generation_advanced or effective_state != "STALE"
-                else "STALE"
+                if generation_advanced or effective_state not in _BLOCKED_WATCH_STATES
+                else effective_state
             )
         elif view.state is PublicationState.MERGED:
             row.state = "DONE"
@@ -552,17 +572,75 @@ class WebhookProcessResult:
     next_role: str
     next_action: str
     watch_state: str | None
+    error: str | None = None
 
 
 def _parse_time(value: str | None) -> datetime | None:
     if not value:
         return None
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(
-            timezone.utc
-        )
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError as exc:
         raise GitHubWebhookError("GitHub evidence timestamp is invalid") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _required_adjudication_time(
+    session: Session,
+    publication_id: str,
+    adjudication: Mapping[str, Any],
+) -> datetime:
+    kind = adjudication.get("kind")
+    run_id = adjudication.get("codex_run_id")
+    head_sha = adjudication.get("head_sha")
+
+    def matches(event: Mapping[str, Any]) -> bool:
+        payload = event["payload"]
+        if kind == "CODEX_PASS":
+            return (
+                event["event_type"] == EventType.CODEX_REVIEW_COMPLETED.value
+                and payload.get("run_id") == run_id
+                and payload.get("head_sha") == head_sha
+                and payload.get("result") == AutomatedReviewStatus.PASS.value
+            )
+        if kind == "REMEDIATION_CLEARED":
+            return (
+                event["event_type"] == EventType.REMEDIATION_CLEARED.value
+                and payload.get("run_id") == run_id
+                and payload.get("head_sha") == head_sha
+            )
+        if kind == "PLANE_FALLBACK":
+            return (
+                event["event_type"] == EventType.PLANE_REVIEW_MATERIALIZED.value
+                and payload.get("run_id") == adjudication.get("plane_run_id")
+                and payload.get("head_sha") == head_sha
+                and payload.get("provider") == "PLANE_REVIEW"
+                and payload.get("reviewer_kind") == "FALLBACK_REVIEWER"
+                and payload.get("reviewer") == adjudication.get("plane_reviewer")
+                and payload.get("result") == "PASS"
+                and payload.get("findings_count") == 0
+                and payload.get("findings") == []
+                and payload.get("provider_review_ids")
+                == [adjudication.get("provider_review_id")]
+                and payload.get("provider_comment_ids") == []
+            )
+        return False
+
+    events = [
+        event
+        for event in load_events(session, publication_id)
+        if matches(event)
+    ]
+    if len(events) != 1:
+        raise GitHubWebhookError(
+            "required review adjudication timestamp is missing or ambiguous"
+        )
+    adjudicated_at = _parse_time(events[0].get("occurred_at"))
+    if adjudicated_at is None:
+        raise GitHubWebhookError("required review adjudication timestamp is missing")
+    return adjudicated_at
 
 
 def _issue_comment_id(row: GitHubWebhookDeliveryRow) -> int | None:
@@ -605,6 +683,109 @@ class GitHubWebhookGateway:
     @property
     def expected_actors(self) -> tuple[str, ...]:
         return tuple(sorted(set(self.codex_actors) | set(self.human_review_actors)))
+
+    def _requires_codex_adjudication(self, view) -> bool:
+        return (
+            self.codex_review_mode == "required"
+            or view.automated_review_mode == "required"
+        )
+
+    @staticmethod
+    def _normalized_wakeup_sha(value: Any) -> str | None:
+        if not isinstance(value, str):
+            return None
+        normalized = value.strip().lower()
+        if len(normalized) != 40 or any(
+            character not in "0123456789abcdef" for character in normalized
+        ):
+            return None
+        return normalized
+
+    def _resolve_wakeup_publication(
+        self,
+        session: Session,
+        row: GitHubWebhookDeliveryRow,
+    ) -> tuple[str | None, str]:
+        candidates: set[str] = set()
+        if row.event_name == "check_run":
+            check_run = row.payload.get("check_run")
+            if not isinstance(check_run, Mapping):
+                return None, "NO_GOVERNED_TARGET"
+            head_sha = self._normalized_wakeup_sha(check_run.get("head_sha"))
+            pull_requests = check_run.get("pull_requests")
+            if head_sha is None or not isinstance(pull_requests, list):
+                return None, "NO_GOVERNED_TARGET"
+            pull_numbers: set[int] = set()
+            for pull in pull_requests:
+                if not isinstance(pull, Mapping):
+                    continue
+                raw_number = pull.get("number")
+                if isinstance(raw_number, bool):
+                    continue
+                try:
+                    number = int(raw_number)
+                except (TypeError, ValueError):
+                    continue
+                if number > 0:
+                    pull_numbers.add(number)
+
+            for number in pull_numbers:
+                try:
+                    publication_id = publication_for_pull(
+                        session,
+                        row.repository,
+                        number,
+                    )
+                except DomainError:
+                    return None, "AMBIGUOUS_GOVERNED_TARGET"
+                if publication_id is None:
+                    continue
+                view = get_view(session, publication_id)
+                watch = session.get(ReviewWatchRow, publication_id)
+                if (
+                    view.repository == row.repository
+                    and view.pull_request_number == number
+                    and view.remote_head_sha == head_sha
+                    and watch is not None
+                    and watch.repository == row.repository
+                    and watch.pull_request_number == number
+                    and watch.watched_head_sha == head_sha
+                ):
+                    candidates.add(publication_id)
+        else:
+            head_sha = self._normalized_wakeup_sha(row.payload.get("sha"))
+            if head_sha is None:
+                return None, "NO_GOVERNED_TARGET"
+            watches = session.scalars(
+                select(ReviewWatchRow).where(
+                    ReviewWatchRow.repository == row.repository,
+                    ReviewWatchRow.watched_head_sha == head_sha,
+                )
+            )
+            for watch in watches:
+                view = get_view(session, watch.publication_id)
+                try:
+                    canonical_publication_id = publication_for_pull(
+                        session,
+                        row.repository,
+                        watch.pull_request_number,
+                    )
+                except DomainError:
+                    return None, "AMBIGUOUS_GOVERNED_TARGET"
+                if (
+                    canonical_publication_id == watch.publication_id
+                    and view.repository == row.repository
+                    and view.pull_request_number == watch.pull_request_number
+                    and view.remote_head_sha == head_sha
+                    and watch.repository == row.repository
+                ):
+                    candidates.add(watch.publication_id)
+
+        if len(candidates) > 1:
+            return None, "AMBIGUOUS_GOVERNED_TARGET"
+        if not candidates:
+            return None, "NO_GOVERNED_TARGET"
+        return next(iter(candidates)), "GOVERNED_TARGET"
 
     def ingest(
         self,
@@ -753,6 +934,17 @@ class GitHubWebhookGateway:
             raise GitHubWebhookError(
                 f"GitHub {action} write readback failed closed"
             ) from exc
+
+        if pull.state.strip().lower() == "closed" and not pull.merged:
+            sync_review_watch(
+                session,
+                publication_id,
+                expected_actors=self.expected_actors,
+                state="CLOSED_UNMERGED",
+            )
+            raise DomainError(
+                f"{action} is blocked because the canonical PR is closed unmerged"
+            )
 
         if pull.head_sha != view.remote_head_sha:
             sync_review_watch(
@@ -1040,6 +1232,8 @@ class GitHubWebhookGateway:
 
         if (
             view.state is PublicationState.IN_REVIEW
+            and receipt.state.strip().upper() == ReviewDecision.APPROVED.value
+            and self._requires_codex_adjudication(view)
             and required_review_adjudication(session, publication_id) is None
         ):
             raise GitHubWebhookDeferred(
@@ -1062,6 +1256,15 @@ class GitHubWebhookGateway:
         last_delivery_id: str | None = None,
     ) -> str:
         view = get_view(session, publication_id)
+        if pull.state.strip().lower() == "closed" and not pull.merged:
+            sync_review_watch(
+                session,
+                publication_id,
+                expected_actors=self.expected_actors,
+                last_delivery_id=last_delivery_id,
+                state="CLOSED_UNMERGED",
+            )
+            return "PULL_CLOSED_UNMERGED"
         if view.state is not PublicationState.APPROVED:
             return "MERGEABILITY_NOT_ELIGIBLE"
         if pull.head_sha != view.remote_head_sha:
@@ -1113,15 +1316,25 @@ class GitHubWebhookGateway:
                 return "HUMAN_" + decision.value + "_ALREADY_RECORDED"
             return "HUMAN_NOT_ELIGIBLE"
 
-        if required_review_adjudication(session, publication_id) is None:
-            return "HUMAN_NOT_ELIGIBLE"
+        if decision is ReviewDecision.APPROVED and self._requires_codex_adjudication(view):
+            adjudication = required_review_adjudication(session, publication_id)
+            if adjudication is None:
+                return "HUMAN_NOT_ELIGIBLE"
+            submitted_at = _parse_time(selected.submitted_at)
+            adjudicated_at = _required_adjudication_time(
+                session,
+                publication_id,
+                adjudication,
+            )
+            if submitted_at is None or submitted_at <= adjudicated_at:
+                return "STALE_HUMAN_REVIEW"
 
         record_review(
             session,
             publication_id,
             reviewed_head_sha=selected.commit_id,
             decision=decision,
-            require_codex_review=(self.codex_review_mode == "required"),
+            require_codex_review=self._requires_codex_adjudication(view),
         )
         return "HUMAN_" + decision.value
 
@@ -1141,6 +1354,23 @@ class GitHubWebhookGateway:
             pull = self._read_pull(view, access.token)
         except (GitHubAuthError, GitHubApiError) as exc:
             raise GitHubWebhookError("GitHub review readback failed closed") from exc
+
+        if pull.state.strip().lower() == "closed" and not pull.merged:
+            watch = sync_review_watch(
+                session,
+                publication_id,
+                expected_actors=self.expected_actors,
+                last_delivery_id=last_delivery_id,
+                state="CLOSED_UNMERGED",
+            )
+            return WebhookProcessResult(
+                delivery_id=last_delivery_id,
+                publication_id=publication_id,
+                outcome="PULL_CLOSED_UNMERGED",
+                next_role="CONTROL_PLANE",
+                next_action="BLOCKED",
+                watch_state=watch.state,
+            )
 
         if view.automated_review_status is AutomatedReviewStatus.RUNNING:
             self._reconcile_codex_unavailability_only(
@@ -1243,6 +1473,16 @@ class GitHubWebhookGateway:
     ) -> str:
         view = get_view(session, publication_id)
         pull = self._read_pull(view, token)
+
+        if pull.state.strip().lower() == "closed" and not pull.merged:
+            sync_review_watch(
+                session,
+                publication_id,
+                expected_actors=self.expected_actors,
+                last_delivery_id=row.delivery_id,
+                state="CLOSED_UNMERGED",
+            )
+            return "PULL_CLOSED_UNMERGED"
 
         codex_unavailable = False
         if view.automated_review_status is AutomatedReviewStatus.RUNNING:
@@ -1384,12 +1624,11 @@ class GitHubWebhookGateway:
             if (
                 view.base_branch != branch
                 or candidate is None
-                or current_sha is None
                 or view.state is PublicationState.MERGED
             ):
                 continue
 
-            if candidate.base_sha != current_sha:
+            if current_sha is None or candidate.base_sha != current_sha:
                 watch_row.state = "STALE"
                 watch_row.next_role = "CONTROL_PLANE"
                 watch_row.next_action = "BLOCKED"
@@ -1429,11 +1668,17 @@ class GitHubWebhookGateway:
             raise KeyError(delivery_id)
 
         if row.state in {"PROCESSED", "IGNORED"}:
-            publication_id = (
-                publication_for_pull(session, row.repository, row.pull_request_number)
-                if row.pull_request_number is not None
-                else None
-            )
+            publication_id = None
+            if row.event_name not in {"check_run", "status"}:
+                publication_id = (
+                    publication_for_pull(
+                        session,
+                        row.repository,
+                        row.pull_request_number,
+                    )
+                    if row.pull_request_number is not None
+                    else None
+                )
             watch = (
                 session.get(ReviewWatchRow, publication_id)
                 if publication_id is not None
@@ -1477,7 +1722,23 @@ class GitHubWebhookGateway:
                 watch_state=None,
             )
 
-        if row.pull_request_number is None:
+        if row.event_name in {"check_run", "status"}:
+            publication_id, target_outcome = self._resolve_wakeup_publication(
+                session,
+                row,
+            )
+            if publication_id is None:
+                mark_delivery_processed(session, delivery_id, state="IGNORED")
+                ambiguous = target_outcome == "AMBIGUOUS_GOVERNED_TARGET"
+                return WebhookProcessResult(
+                    delivery_id=delivery_id,
+                    publication_id=None,
+                    outcome=target_outcome,
+                    next_role="CONTROL_PLANE" if ambiguous else "NONE",
+                    next_action="BLOCKED" if ambiguous else "DONE",
+                    watch_state=None,
+                )
+        elif row.pull_request_number is None:
             mark_delivery_processed(session, delivery_id, state="IGNORED")
             return WebhookProcessResult(
                 delivery_id=delivery_id,
@@ -1488,21 +1749,22 @@ class GitHubWebhookGateway:
                 watch_state=None,
             )
 
-        publication_id = publication_for_pull(
-            session,
-            row.repository,
-            row.pull_request_number,
-        )
-        if publication_id is None:
-            mark_delivery_processed(session, delivery_id, state="IGNORED")
-            return WebhookProcessResult(
-                delivery_id=delivery_id,
-                publication_id=None,
-                outcome="UNMANAGED_PULL_REQUEST",
-                next_role="NONE",
-                next_action="DONE",
-                watch_state=None,
+        else:
+            publication_id = publication_for_pull(
+                session,
+                row.repository,
+                row.pull_request_number,
             )
+            if publication_id is None:
+                mark_delivery_processed(session, delivery_id, state="IGNORED")
+                return WebhookProcessResult(
+                    delivery_id=delivery_id,
+                    publication_id=None,
+                    outcome="UNMANAGED_PULL_REQUEST",
+                    next_role="NONE",
+                    next_action="DONE",
+                    watch_state=None,
+                )
 
         try:
             access = self._access(row.repository)
@@ -1513,7 +1775,10 @@ class GitHubWebhookGateway:
                 token=access.token,
             )
             latest = get_view(session, publication_id)
-            if latest.state is PublicationState.APPROVED:
+            if (
+                latest.state is PublicationState.APPROVED
+                and outcome != "PULL_CLOSED_UNMERGED"
+            ):
                 latest_pull = self._read_pull(latest, access.token)
                 mergeability_outcome = self._mergeability_if_ready(
                     session,
@@ -1570,7 +1835,27 @@ class GitHubWebhookGateway:
     def reconcile_pending(self, session: Session) -> tuple[WebhookProcessResult, ...]:
         results = []
         for delivery_id in list_pending_delivery_ids(session):
-            results.append(self.process_delivery(session, delivery_id))
+            try:
+                results.append(self.process_delivery(session, delivery_id))
+            except (
+                DomainError,
+                GitHubAuthError,
+                GitHubApiError,
+                CodexReviewError,
+                GitHubWebhookError,
+            ) as exc:
+                session.rollback()
+                results.append(
+                    WebhookProcessResult(
+                        delivery_id=delivery_id,
+                        publication_id=None,
+                        outcome="FAILED_PENDING",
+                        next_role="CONTROL_PLANE",
+                        next_action="RETRY",
+                        watch_state=None,
+                        error=str(exc)[:1000],
+                    )
+                )
         return tuple(results)
 
     def reconcile_pending_best_effort(

@@ -560,6 +560,32 @@ def test_required_mode_blocks_human_review_before_codex_pass(session):
         )
 
 
+@pytest.mark.parametrize(
+    ("decision", "require_codex_review", "expected_state"),
+    [
+        (ReviewDecision.APPROVED, False, PublicationState.APPROVED),
+        (ReviewDecision.CHANGES_REQUIRED, True, PublicationState.CHANGES_REQUIRED),
+    ],
+)
+def test_direct_review_only_requires_codex_adjudication_for_required_approval(
+    session,
+    decision,
+    require_codex_review,
+    expected_state,
+):
+    view = published_publication(session)
+
+    reviewed = record_review(
+        session,
+        view.publication_id,
+        reviewed_head_sha=HEAD,
+        decision=decision,
+        require_codex_review=require_codex_review,
+    )
+
+    assert reviewed.state is expected_state
+
+
 def test_clean_native_codex_review_releases_human_review(session):
     view = published_publication(session)
     value, _tokens, github = broker()

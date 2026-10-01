@@ -2,8 +2,11 @@ import asyncio
 import hashlib
 import hmac
 import json
+import threading
 from types import SimpleNamespace
 
+import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
@@ -12,7 +15,11 @@ from control_plane.config import settings
 from control_plane.db import get_session
 from control_plane.domain import ValidationStatus
 from control_plane.github_api import PullRequestSnapshot
-from control_plane.github_webhook import GitHubWebhookGateway, sync_review_watch
+from control_plane.github_webhook import (
+    GitHubWebhookGateway,
+    WebhookProcessResult,
+    sync_review_watch,
+)
 from control_plane.main import (
     app,
     get_github_authoritative_gateway,
@@ -20,6 +27,7 @@ from control_plane.main import (
 )
 from control_plane.models import GitHubWebhookDeliveryRow, ReviewWatchRow
 from control_plane.profile_registry import profile_for_repository
+from control_plane.publisher import PublicationError
 from control_plane.quarantine import VerifiedCandidateSource
 from control_plane.service import (
     create_publication,
@@ -235,6 +243,91 @@ def test_public_webhook_endpoint_rejects_bad_signature_without_persistence(sessi
         app.dependency_overrides.clear()
 
 
+def test_webhook_stream_body_enforces_limit_with_and_without_content_length():
+    class OversizedDeclaredRequest:
+        headers = {"content-length": "6"}
+
+        async def stream(self):
+            raise AssertionError("oversized declared body must not be consumed")
+            yield b""
+
+    with pytest.raises(HTTPException) as declared_error:
+        asyncio.run(
+            main_module._read_limited_webhook_body(
+                OversizedDeclaredRequest(),
+                maximum_bytes=5,
+            )
+        )
+    assert declared_error.value.status_code == 413
+
+    class ChunkedRequest:
+        headers = {}
+
+        async def stream(self):
+            yield b"1234"
+            yield b"56"
+
+    with pytest.raises(HTTPException) as streamed_error:
+        asyncio.run(
+            main_module._read_limited_webhook_body(
+                ChunkedRequest(),
+                maximum_bytes=5,
+            )
+        )
+    assert streamed_error.value.status_code == 413
+
+
+def test_public_webhook_runs_sync_delivery_processing_in_threadpool(
+    session,
+    monkeypatch,
+):
+    thread_ids = {}
+    original_run_in_threadpool = main_module.run_in_threadpool
+
+    def process_delivery(_gateway, _session, delivery_id):
+        thread_ids["worker"] = threading.get_ident()
+        return WebhookProcessResult(
+            delivery_id=delivery_id,
+            publication_id=None,
+            outcome="IGNORED",
+            next_role="NONE",
+            next_action="DONE",
+            watch_state=None,
+        )
+
+    async def observed_run_in_threadpool(function, *args):
+        thread_ids["event_loop"] = threading.get_ident()
+        return await original_run_in_threadpool(function, *args)
+
+    monkeypatch.setattr(
+        GitHubWebhookGateway,
+        "process_delivery",
+        process_delivery,
+    )
+    monkeypatch.setattr(
+        main_module,
+        "run_in_threadpool",
+        observed_run_in_threadpool,
+    )
+    client = client_for(session)
+    body, signature = signed_body()
+    try:
+        response = client.post(
+            "/api/v1/github/webhooks",
+            content=body,
+            headers={
+                "Content-Type": "application/json",
+                "X-Hub-Signature-256": signature,
+                "X-GitHub-Delivery": "api-threadpool-delivery",
+                "X-GitHub-Event": "ping",
+            },
+        )
+        assert response.status_code == 200, response.text
+        assert thread_ids["worker"] != thread_ids["event_loop"]
+    finally:
+        app.dependency_overrides.clear()
+
+
 def test_public_webhook_endpoint_requires_configured_secret(session, monkeypatch):
     configure_github_app_without_webhook_secret(monkeypatch)
     client = client_for_session(session)
@@ -334,6 +427,45 @@ def test_internal_reconcile_reconstructs_missing_legacy_review_watch(
         assert reconstructed.json()["watched_head_sha"] == HEAD
     finally:
         app.dependency_overrides.clear()
+
+
+def test_successful_publication_materializes_watch_without_codex_request(
+    session,
+    monkeypatch,
+):
+    configure_github_app_without_webhook_secret(monkeypatch)
+    view = published_publication(session)
+    assert session.get(ReviewWatchRow, view.publication_id) is None
+
+    class FailedPublisher:
+        def publish(self, _session, _publication_id):
+            raise PublicationError("simulated publication failure")
+
+    with pytest.raises(HTTPException) as failed:
+        main_module.publication_publish(
+            view.publication_id,
+            session=session,
+            publisher=FailedPublisher(),
+        )
+    assert failed.value.status_code == 502
+    assert session.get(ReviewWatchRow, view.publication_id) is None
+
+    class SuccessfulPublisher:
+        def publish(self, _session, publication_id):
+            assert publication_id == view.publication_id
+            return view
+
+    response = main_module.publication_publish(
+        view.publication_id,
+        session=session,
+        publisher=SuccessfulPublisher(),
+    )
+
+    assert response["publication_id"] == view.publication_id
+    watch = session.get(ReviewWatchRow, view.publication_id)
+    assert watch is not None
+    assert watch.watched_head_sha == HEAD
+    assert watch.state == "ACTIVE"
 
 
 
