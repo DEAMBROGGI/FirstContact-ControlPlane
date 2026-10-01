@@ -122,6 +122,45 @@ multiple packages.
    admission path. The submission must identify the publication's current
    candidate and its exact head. The normal validations and publisher then
    publish that candidate to the same canonical pull request.
+
+### Implementer/Codex handoff contract
+
+The implementation actor may commit locally, but a local commit is not an authoritative implementation submission and must not be pushed directly to the governed repository or canonical PR branch. The remote-write boundary is the Control Plane publisher.
+
+The implementation actor delivers the candidate by creating a Git bundle that advertises exactly `refs/controlplane/base` and `refs/controlplane/head`, then uploading that bundle to:
+
+```text
+POST /api/v1/publications/{publication_id}/candidate-bundle
+multipart field: bundle
+```
+
+The Control Plane imports the bundle into its private quarantine and derives base/head/tree, bundle digest, ancestry, Git integrity, and candidate identity itself. The caller does not establish candidate identity by supplying SHAs. The resulting candidate then follows the normal validation -> admission -> publication path and is the only path that may update the canonical PR branch.
+
+For Codex specifically, the required behavior after implementation is:
+
+1. run the required local validation gates;
+2. create the candidate bundle without pushing the candidate commit or temporary control-plane refs to GitHub;
+3. upload the bundle to the publication's `candidate-bundle` endpoint;
+4. wait for the Plane response and governed admission/publication result;
+5. only after the exact candidate is published, participate in the successor review lifecycle.
+
+If the Plane handoff fails, preserve the local commit/bundle for retry and report the failure. Do not bypass the Control Plane with `git push`, GitHub Contents writes, direct PR branch mutation, or another remote-write path.
+
+The authoritative lifecycle is therefore:
+
+```text
+implement locally
+    -> candidate bundle
+    -> Plane quarantine
+    -> validation
+    -> admission
+    -> Plane publisher
+    -> canonical PR
+    -> exact-head review
+```
+
+This contract is provider-neutral: another implementer may use a different local build/test toolchain, but every governed implementation must cross the same candidate-bundle boundary before remote publication.
+
 4. Bind a terminal automated review attempt to the exact published successor
    head. `PASS` and `CHANGES_REQUIRED` bind directly. `UNAVAILABLE` may bind
    only with an explicit Principal Reviewer fallback actor and bounded reason
