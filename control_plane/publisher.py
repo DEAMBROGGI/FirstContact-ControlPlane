@@ -367,12 +367,16 @@ class GitHubPublisher:
         branch: str,
         token: str,
         candidate_head_sha: str,
+        restore_head_sha: str | None,
+        prewrite_head_sha: str | None,
     ) -> None:
         current = self.github.ref_sha(view.repository, branch, token)
-        expected_restored = view.remote_head_sha
+        expected_restored = restore_head_sha
         if current == expected_restored:
             return
         if current != candidate_head_sha:
+            if current == prewrite_head_sha:
+                return
             raise PublicationError(
                 "rejected publication branch changed before compensation"
             )
@@ -399,6 +403,8 @@ class GitHubPublisher:
         token: str,
         candidate_id: str,
         candidate_head_sha: str,
+        observed_remote_head_sha: str | None,
+        prewrite_head_sha: str | None,
         message: str,
     ) -> None:
         self._compensate_rejected_candidate_write(
@@ -407,6 +413,12 @@ class GitHubPublisher:
             branch=branch,
             token=token,
             candidate_head_sha=candidate_head_sha,
+            restore_head_sha=(
+                observed_remote_head_sha
+                if observed_remote_head_sha is not None
+                else view.remote_head_sha
+            ),
+            prewrite_head_sha=prewrite_head_sha,
         )
         reject_admitted_candidate(
             session,
@@ -444,6 +456,19 @@ class GitHubPublisher:
             repository = self.github.repository(view.repository, token)
             base_branch = view.base_branch or repository.default_branch
 
+            target_before = self.github.ref_sha(view.repository, branch, token)
+            observed_remote_head_sha = None
+            if view.remote_head_sha is not None:
+                if target_before is None:
+                    raise PublicationError("published branch disappeared")
+                if target_before not in {
+                    view.remote_head_sha,
+                    candidate.head_sha,
+                }:
+                    if view.state is not PublicationState.ADMITTED:
+                        raise PublicationError("publication branch collision")
+                    observed_remote_head_sha = target_before
+
             if view.state is PublicationState.ADMITTED:
                 remote_base = self.github.ref_sha(view.repository, base_branch, token)
                 if remote_base != candidate.base_sha:
@@ -456,18 +481,12 @@ class GitHubPublisher:
                         token=token,
                         candidate_id=candidate.candidate_id,
                         candidate_head_sha=candidate.head_sha,
+                        observed_remote_head_sha=observed_remote_head_sha,
+                        prewrite_head_sha=target_before,
                         message="remote base moved after candidate admission",
                     )
 
-            target_before = self.github.ref_sha(view.repository, branch, token)
             if view.remote_head_sha is not None:
-                if target_before is None:
-                    raise PublicationError("published branch disappeared")
-                if target_before not in {
-                    view.remote_head_sha,
-                    candidate.head_sha,
-                }:
-                    raise PublicationError("publication branch collision")
                 assert view.pull_request_number is not None
                 existing_pull = self.github.pull_request(
                     view.repository,
@@ -482,7 +501,7 @@ class GitHubPublisher:
                         base_branch=base_branch,
                         expected_head_sha=target_before,
                     )
-                else:
+                elif target_before == candidate.head_sha:
                     self._verify_canonical_pull_request_identity(
                         existing_pull,
                         view=view,
@@ -495,6 +514,34 @@ class GitHubPublisher:
                     }:
                         raise PublicationError(
                             "canonical pull request head does not match governed publication"
+                        )
+                else:
+                    assert observed_remote_head_sha == target_before
+                    try:
+                        monotonic_chain = self.quarantine.is_ancestor(
+                            source.quarantine_id,
+                            view.remote_head_sha,
+                            observed_remote_head_sha,
+                        ) and self.quarantine.is_ancestor(
+                            source.quarantine_id,
+                            observed_remote_head_sha,
+                            candidate.head_sha,
+                        )
+                    except CandidateQuarantineError as exc:
+                        raise PublicationError(
+                            "publication branch collision"
+                        ) from exc
+                    if not monotonic_chain:
+                        raise PublicationError("publication branch collision")
+                    self._verify_canonical_pull_request_identity(
+                        existing_pull,
+                        view=view,
+                        branch=branch,
+                        base_branch=base_branch,
+                    )
+                    if existing_pull.head_sha != target_before:
+                        raise PublicationError(
+                            "canonical pull request head does not match observed branch"
                         )
 
             if view.state is PublicationState.ADMITTED:
@@ -511,6 +558,8 @@ class GitHubPublisher:
                         token=token,
                         candidate_id=candidate.candidate_id,
                         candidate_head_sha=candidate.head_sha,
+                        observed_remote_head_sha=observed_remote_head_sha,
+                        prewrite_head_sha=target_before,
                         message="remote base moved at publication write boundary",
                     )
 
@@ -553,6 +602,14 @@ class GitHubPublisher:
                         raise PublicationError(
                             "successor candidate is not a fast-forward"
                         )
+                elif target_before == observed_remote_head_sha:
+                    self.git_push.push_governed_head(
+                        repo_path=self.quarantine.repo_path(source.quarantine_id),
+                        repository=view.repository,
+                        branch=branch,
+                        token=token,
+                        expected_old_sha=observed_remote_head_sha,
+                    )
                 else:
                     raise PublicationError("publication branch collision")
             elif target_before != candidate.head_sha:
@@ -565,7 +622,11 @@ class GitHubPublisher:
                 view=view,
                 base_branch=base_branch,
                 expected_head_sha=candidate.head_sha,
-                previous_head_sha=view.remote_head_sha,
+                previous_head_sha=(
+                    observed_remote_head_sha
+                    if observed_remote_head_sha is not None
+                    else view.remote_head_sha
+                ),
             )
             if pull is None:
                 pull = self.github.ensure_pull_request(
@@ -596,6 +657,8 @@ class GitHubPublisher:
                     token=token,
                     candidate_id=candidate.candidate_id,
                     candidate_head_sha=candidate.head_sha,
+                    observed_remote_head_sha=observed_remote_head_sha,
+                    prewrite_head_sha=target_before,
                     message="remote base moved before publication authority was recorded",
                 )
 
@@ -618,4 +681,5 @@ class GitHubPublisher:
             branch=branch,
             base_branch=base_branch,
             pull_request_number=pull.number,
+            observed_remote_head_sha=observed_remote_head_sha,
         )

@@ -280,6 +280,57 @@ def successor_source(
         return quarantine.import_stream(stream)
 
 
+def merge_shaped_successor_source(quarantine, first_source, tmp_path):
+    source_repo = quarantine.repo_path(first_source.quarantine_id)
+    work_repo = tmp_path / "successor-merge-shaped"
+    subprocess.run(
+        ["git", "clone", "--quiet", str(source_repo), str(work_repo)],
+        check=True,
+        capture_output=True,
+    )
+    git(work_repo, "checkout", "--quiet", "--detach", first_source.base_sha)
+    (work_repo / "sibling.txt").write_text("sibling\n", encoding="utf-8")
+    git(work_repo, "add", "sibling.txt")
+    git(
+        work_repo,
+        "-c",
+        "user.email=publisher@example.invalid",
+        "-c",
+        "user.name=Publisher Test",
+        "commit",
+        "--quiet",
+        "-m",
+        "sibling remote head",
+    )
+    observed_head = git(work_repo, "rev-parse", "HEAD")
+    git(work_repo, "checkout", "--quiet", "--detach", first_source.head_sha)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(work_repo),
+            "-c",
+            "user.email=publisher@example.invalid",
+            "-c",
+            "user.name=Publisher Test",
+            "merge",
+            "--no-ff",
+            "--no-edit",
+            observed_head,
+        ],
+        check=True,
+        capture_output=True,
+    )
+    candidate_head = git(work_repo, "rev-parse", "HEAD")
+    git(work_repo, "update-ref", BASE_REF, first_source.base_sha)
+    git(work_repo, "update-ref", HEAD_REF, candidate_head)
+    bundle = tmp_path / "successor-merge-shaped.bundle"
+    git(work_repo, "bundle", "create", str(bundle), BASE_REF, HEAD_REF)
+    with bundle.open("rb") as stream:
+        source = quarantine.import_stream(stream)
+    return source, observed_head
+
+
 def admit_successor(session, view, new_source):
     updated = submit_verified_candidate(session, view.publication_id, new_source)
     profile = profile_for_repository(updated.repository)
@@ -473,6 +524,328 @@ def test_successor_fast_forward_reuses_same_branch_and_pull_request(session, tmp
         [event for event in load_events(session, second.publication_id)
          if event["event_type"] == "REMOTE_PUBLISHED"]
     ) == 2
+
+
+def test_governed_remote_drift_chain_uses_observed_sha_lease_and_audits_it(
+    session,
+    tmp_path,
+):
+    intermediate = []
+    (
+        first,
+        second,
+        _quarantine,
+        _source,
+        gateway,
+        publisher,
+        _push_a,
+        push,
+    ) = successor_setup(
+        session,
+        tmp_path,
+        intermediate_out=intermediate,
+    )
+    observed_head = intermediate[0]
+    gateway.target_sha = observed_head
+    gateway.pull_head_sha = observed_head
+
+    published = publisher.publish(session, second.publication_id)
+
+    assert published.state is PublicationState.IN_REVIEW
+    assert published.remote_head_sha == second.current_candidate.head_sha
+    assert push.calls == 1
+    assert push.expected_old_shas == [observed_head]
+    remote_events = remote_published_events(session, second.publication_id)
+    assert len(remote_events) == 2
+    recovered_event = remote_events[-1]["payload"]
+    assert recovered_event["previous_head_sha"] == first.remote_head_sha
+    assert recovered_event["head_sha"] == second.current_candidate.head_sha
+    assert recovered_event["observed_remote_head_sha"] == observed_head
+
+    retried = publisher.publish(session, second.publication_id)
+
+    assert retried == published
+    assert push.calls == 1
+    assert len(remote_published_events(session, second.publication_id)) == 2
+
+
+def test_merge_shaped_remote_head_is_rejected_without_strict_h1_to_h2_chain(
+    session,
+    tmp_path,
+):
+    first, quarantine, first_source = admitted_publication(session, tmp_path)
+    publisher_a, gateway, _push_a = publisher_for(first, quarantine, first_source)
+    published_first = publisher_a.publish(session, first.publication_id)
+    merge_source, observed_head = merge_shaped_successor_source(
+        quarantine,
+        first_source,
+        tmp_path,
+    )
+    second = admit_successor(session, published_first, merge_source)
+    gateway.head_sha = second.current_candidate.head_sha
+    publisher, _gateway, push = publisher_for(
+        second,
+        quarantine,
+        merge_source,
+        gateway=gateway,
+    )
+    gateway.target_sha = observed_head
+    gateway.pull_head_sha = observed_head
+
+    assert quarantine.is_ancestor(
+        merge_source.quarantine_id,
+        published_first.remote_head_sha,
+        second.current_candidate.head_sha,
+    )
+    assert quarantine.is_ancestor(
+        merge_source.quarantine_id,
+        observed_head,
+        second.current_candidate.head_sha,
+    )
+    assert not quarantine.is_ancestor(
+        merge_source.quarantine_id,
+        published_first.remote_head_sha,
+        observed_head,
+    )
+
+    with pytest.raises(PublicationError, match="branch collision"):
+        publisher.publish(session, second.publication_id)
+
+    assert gateway.target_sha == observed_head
+    assert push.calls == 0
+    assert (
+        get_view(session, second.publication_id).remote_head_sha
+        == published_first.remote_head_sha
+    )
+    assert len(remote_published_events(session, second.publication_id)) == 1
+
+
+def test_observed_head_descendant_of_h1_but_outside_candidate_fails_closed(
+    session,
+    tmp_path,
+):
+    first, second, quarantine, source, gateway, publisher, _push_a, push = successor_setup(
+        session,
+        tmp_path,
+    )
+    outside_repo = tmp_path / "observed-outside-candidate"
+    subprocess.run(
+        [
+            "git",
+            "clone",
+            "--quiet",
+            str(quarantine.repo_path(source.quarantine_id)),
+            str(outside_repo),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    git(outside_repo, "checkout", "--quiet", "--detach", first.remote_head_sha)
+    (outside_repo / "outside.txt").write_text("outside candidate\n", encoding="utf-8")
+    git(outside_repo, "add", "outside.txt")
+    git(
+        outside_repo,
+        "-c",
+        "user.email=publisher@example.invalid",
+        "-c",
+        "user.name=Publisher Test",
+        "commit",
+        "--quiet",
+        "-m",
+        "remote head outside candidate",
+    )
+    observed_head = git(outside_repo, "rev-parse", "HEAD")
+    gateway.target_sha = observed_head
+    gateway.pull_head_sha = observed_head
+
+    with pytest.raises(PublicationError, match="branch collision"):
+        publisher.publish(session, second.publication_id)
+
+    assert gateway.target_sha == observed_head
+    assert push.calls == 0
+    assert get_view(session, second.publication_id).remote_head_sha == first.remote_head_sha
+    assert len(remote_published_events(session, second.publication_id)) == 1
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        ("closed", "not open"),
+        ("number", "number changed"),
+        ("head_ref", "branch changed"),
+        ("base_ref", "base changed"),
+        ("head_sha", "observed branch"),
+    ],
+)
+def test_observed_remote_recovery_rejects_changed_canonical_pr_before_push(
+    session,
+    tmp_path,
+    change,
+    message,
+):
+    intermediate = []
+    first, second, _quarantine, _source, gateway, publisher, _push_a, push = successor_setup(
+        session,
+        tmp_path,
+        intermediate_out=intermediate,
+    )
+    observed_head = intermediate[0]
+    gateway.target_sha = observed_head
+    gateway.pull_head_sha = observed_head
+    if change == "closed":
+        gateway.pull_state = "closed"
+    elif change == "number":
+        gateway.returned_pull_number = 999
+    elif change == "head_ref":
+        gateway.pull_head_ref = "unexpected-branch"
+    elif change == "base_ref":
+        gateway.pull_base_ref = "unexpected-base"
+    else:
+        gateway.pull_head_sha = "e" * 40
+
+    with pytest.raises(PublicationError, match=message):
+        publisher.publish(session, second.publication_id)
+
+    assert gateway.target_sha == observed_head
+    assert push.calls == 0
+    assert get_view(session, second.publication_id).remote_head_sha == first.remote_head_sha
+    assert len(remote_published_events(session, second.publication_id)) == 1
+
+
+def test_observed_branch_pr_head_disagreement_fails_before_push(session, tmp_path):
+    intermediate = []
+    first, second, _quarantine, _source, gateway, publisher, _push_a, push = successor_setup(
+        session,
+        tmp_path,
+        intermediate_out=intermediate,
+    )
+    observed_head = intermediate[0]
+    gateway.target_sha = observed_head
+    gateway.pull_head_sha = "e" * 40
+
+    with pytest.raises(PublicationError, match="observed branch"):
+        publisher.publish(session, second.publication_id)
+
+    assert gateway.target_sha == observed_head
+    assert push.calls == 0
+    assert get_view(session, second.publication_id).remote_head_sha == first.remote_head_sha
+    assert len(remote_published_events(session, second.publication_id)) == 1
+
+
+def test_observed_remote_recovery_base_drift_before_push_preserves_remote_head(
+    session,
+    tmp_path,
+):
+    intermediate = []
+    first, second, _quarantine, _source, gateway, publisher, _push_a, push = successor_setup(
+        session,
+        tmp_path,
+        intermediate_out=intermediate,
+    )
+    observed_head = intermediate[0]
+    gateway.target_sha = observed_head
+    gateway.pull_head_sha = observed_head
+    gateway.base_sha = "f" * 40
+
+    with pytest.raises(PublicationError, match="remote base moved after candidate admission"):
+        publisher.publish(session, second.publication_id)
+
+    assert gateway.target_sha == observed_head
+    assert push.calls == 0
+    assert get_view(session, second.publication_id).state is PublicationState.VALIDATION_FAILED
+    assert get_view(session, second.publication_id).remote_head_sha == first.remote_head_sha
+    assert len(remote_published_events(session, second.publication_id)) == 1
+
+
+def test_observed_remote_recovery_base_drift_after_push_restores_observed_head(
+    session,
+    tmp_path,
+):
+    intermediate = []
+    first, second, _quarantine, _source, gateway, publisher, _push_a, push = successor_setup(
+        session,
+        tmp_path,
+        intermediate_out=intermediate,
+    )
+    observed_head = intermediate[0]
+    gateway.target_sha = observed_head
+    gateway.pull_head_sha = observed_head
+    push.race_base_sha = "f" * 40
+
+    with pytest.raises(PublicationError, match="before publication authority was recorded"):
+        publisher.publish(session, second.publication_id)
+
+    assert push.calls == 1
+    assert push.expected_old_shas == [observed_head]
+    assert push.restore_calls == [(second.current_candidate.head_sha, observed_head)]
+    assert gateway.target_sha == observed_head
+    assert get_view(session, second.publication_id).state is PublicationState.VALIDATION_FAILED
+    assert get_view(session, second.publication_id).remote_head_sha == first.remote_head_sha
+    assert len(remote_published_events(session, second.publication_id)) == 1
+
+
+def test_observed_remote_recovery_lease_rejects_branch_race(session, tmp_path):
+    intermediate = []
+    first, second, _quarantine, _source, gateway, publisher, _push_a, push = successor_setup(
+        session,
+        tmp_path,
+        intermediate_out=intermediate,
+    )
+    observed_head = intermediate[0]
+    raced_head = "e" * 40
+    gateway.target_sha = observed_head
+    gateway.pull_head_sha = observed_head
+    push.race_remote_sha = raced_head
+
+    with pytest.raises(PublicationError, match="exact expected-old lease"):
+        publisher.publish(session, second.publication_id)
+
+    assert push.calls == 1
+    assert push.expected_old_shas == [observed_head]
+    assert gateway.target_sha == raced_head
+    assert get_view(session, second.publication_id).remote_head_sha == first.remote_head_sha
+    assert len(remote_published_events(session, second.publication_id)) == 1
+
+
+@pytest.mark.parametrize("unexpected_source", ["branch", "pull_request"])
+def test_observed_remote_recovery_rejects_unexpected_post_push_readback(
+    session,
+    tmp_path,
+    unexpected_source,
+):
+    intermediate = []
+    first, second, _quarantine, _source, gateway, publisher, _push_a, push = successor_setup(
+        session,
+        tmp_path,
+        intermediate_out=intermediate,
+    )
+    observed_head = intermediate[0]
+    gateway.target_sha = observed_head
+    gateway.pull_head_sha = observed_head
+    before_events = len(remote_published_events(session, second.publication_id))
+    if unexpected_source == "branch":
+        gateway.target_sha_reads.extend([observed_head, "e" * 40])
+    else:
+        gateway.pull_responses.extend(
+            [
+                pull_snapshot(second, head_sha=observed_head),
+                pull_snapshot(second, head_sha="e" * 40),
+            ]
+        )
+
+    message = (
+        "publication branch changed during readback"
+        if unexpected_source == "branch"
+        else "canonical pull request head changed during readback"
+    )
+    with pytest.raises(PublicationError, match=message):
+        publisher.publish(session, second.publication_id)
+
+    assert push.calls == 1
+    assert push.expected_old_shas == [observed_head]
+    assert get_view(session, second.publication_id).state is PublicationState.ADMITTED
+    assert get_view(session, second.publication_id).remote_head_sha == first.remote_head_sha
+    assert len(remote_published_events(session, second.publication_id)) == before_events
 
 
 def pull_snapshot(view, *, head_sha=None, state="open", head_ref=None, base_ref=None, number=None):

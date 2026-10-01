@@ -422,6 +422,14 @@ def validate_transition(
             raise DomainError("remote publication requires an admitted candidate")
         if payload.get("head_sha") != view.current_candidate.head_sha:
             raise DomainError("published head must equal admitted candidate head")
+        observed_head = payload.get("observed_remote_head_sha")
+        if observed_head is not None and (
+            view.remote_head_sha is None
+            or observed_head in {view.remote_head_sha, view.current_candidate.head_sha}
+        ):
+            raise DomainError(
+                "observed remote head must differ from governed and candidate heads"
+            )
         if view.remote_head_sha is not None:
             if payload.get("previous_head_sha") != view.remote_head_sha:
                 raise DomainError("successor publication must name the governed prior head")

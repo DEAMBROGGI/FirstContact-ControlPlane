@@ -445,6 +445,7 @@ def mark_remote_published(
     branch: str | None = None,
     base_branch: str | None = None,
     pull_request_number: int | None = None,
+    observed_remote_head_sha: str | None = None,
 ) -> PublicationView:
     view = _locked_publication_view(session, publication_id)
     payload: dict[str, Any] = {"head_sha": _sha(head_sha, "head_sha")}
@@ -458,6 +459,11 @@ def mark_remote_published(
         if pull_request_number <= 0:
             raise DomainError("pull_request_number must be positive")
         payload["pull_request_number"] = pull_request_number
+    if observed_remote_head_sha is not None:
+        payload["observed_remote_head_sha"] = _sha(
+            observed_remote_head_sha,
+            "observed_remote_head_sha",
+        )
     validate_transition(view, EventType.REMOTE_PUBLISHED, payload)
     append_event(session, publication_id, EventType.REMOTE_PUBLISHED, payload)
     session.commit()
