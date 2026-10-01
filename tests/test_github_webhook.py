@@ -57,6 +57,8 @@ REPOSITORY = "DEAMBROGGI/FirstContact-ControlPlane"
 BASE = "1" * 40
 HEAD = "2" * 40
 TREE = "3" * 40
+NEXT_HEAD = "5" * 40
+NEXT_TREE = "6" * 40
 TRIGGER_AT = "2026-09-30T12:00:00Z"
 CODEX_ACTOR = "chatgpt-codex-connector[bot]"
 HUMAN_ACTOR = "DEAMBROGGI"
@@ -100,12 +102,41 @@ def published(session, issue_number=2601):
     )
 
 
-def start_codex(session, view):
+def publish_next_head(session, view):
+    source = VerifiedCandidateSource(
+        bundle_sha256="b" * 64,
+        byte_length=2345,
+        quarantine_id="b" * 64,
+        base_sha=BASE,
+        head_sha=NEXT_HEAD,
+        tree_sha=NEXT_TREE,
+    )
+    submit_verified_candidate(session, view.publication_id, source)
+    profile = profile_for_repository(view.repository)
+    for index, job_id in enumerate(profile.required_jobs, 1):
+        record_validation(
+            session,
+            view.publication_id,
+            job_id=job_id,
+            status=ValidationStatus.PASS,
+            evidence_sha256=f"{index + 20:064x}",
+        )
+    return mark_remote_published(
+        session,
+        view.publication_id,
+        NEXT_HEAD,
+        branch=view.remote_branch,
+        base_branch=view.base_branch,
+        pull_request_number=view.pull_request_number,
+    )
+
+
+def start_codex(session, view, *, expected_head_sha=HEAD):
     running = request_codex_review(
         session,
         view.publication_id,
         mode="required",
-        expected_head_sha=HEAD,
+        expected_head_sha=expected_head_sha,
     )
     assert running.automated_review_run_id is not None
     lease_id = "lease-webhook-test"
@@ -594,6 +625,111 @@ def test_stale_review_watch_is_fail_closed_even_when_publication_is_in_review(se
     assert replayed.state == "STALE"
     assert replayed.next_role == "CONTROL_PLANE"
     assert replayed.next_action == "BLOCKED"
+
+
+def test_same_generation_stale_watch_remains_blocked_after_base_returns(session):
+    view = complete_codex_pass(session, start_codex(session, published(session)))
+    github = FakeGitHub()
+    github.ref_shas["master"] = "8" * 40
+    value = gateway(github)
+
+    with pytest.raises(DomainError, match="publication base is stale"):
+        value.assert_review_write_current(session, view.publication_id)
+    assert get_review_watch(session, view.publication_id).state == "STALE"
+
+    github.ref_shas["master"] = BASE
+    with pytest.raises(DomainError, match="publication base is stale"):
+        value.assert_review_write_current(session, view.publication_id)
+
+    watch = get_review_watch(session, view.publication_id)
+    assert watch.watched_head_sha == HEAD
+    assert watch.state == "STALE"
+    assert watch.next_role == "CONTROL_PLANE"
+    assert watch.next_action == "BLOCKED"
+
+
+def test_governed_remote_publication_starts_active_review_watch_generation(session):
+    view = complete_codex_pass(session, start_codex(session, published(session)))
+    stale = sync_review_watch(session, view.publication_id, state="STALE")
+    assert stale.watched_head_sha == HEAD
+    assert stale.state == "STALE"
+
+    published_next = publish_next_head(session, view)
+    watch = sync_review_watch(session, published_next.publication_id)
+
+    assert published_next.remote_head_sha == NEXT_HEAD
+    assert watch.watched_head_sha == NEXT_HEAD
+    assert watch.state == "ACTIVE"
+    assert watch.next_role == "PROVIDER"
+    assert watch.next_action == "WAIT_PROVIDER"
+
+
+def test_new_codex_run_on_governed_head_keeps_watch_active_waiting_for_provider(
+    session,
+):
+    view = complete_codex_pass(session, start_codex(session, published(session)))
+    sync_review_watch(session, view.publication_id, state="STALE")
+    published_next = publish_next_head(session, view)
+    running = start_codex(
+        session,
+        published_next,
+        expected_head_sha=NEXT_HEAD,
+    )
+
+    watch = sync_review_watch(session, running.publication_id)
+
+    assert watch.watched_head_sha == NEXT_HEAD
+    assert watch.review_run_id == running.automated_review_run_id
+    assert watch.state == "ACTIVE"
+    assert watch.next_role == "PROVIDER"
+    assert watch.next_action == "WAIT_PROVIDER"
+
+
+def test_external_pull_head_drift_does_not_clear_stale_watch(session):
+    view = complete_codex_pass(session, start_codex(session, published(session)))
+    sync_review_watch(session, view.publication_id)
+    github = FakeGitHub()
+    github.head_sha = "4" * 40
+    value = gateway(github)
+
+    drifted = value.reconcile_publication(session, view.publication_id)
+    assert drifted.outcome == "STALE_HEAD"
+    assert get_review_watch(session, view.publication_id).state == "STALE"
+
+    github.head_sha = HEAD
+    recovered_externally = value.reconcile_publication(session, view.publication_id)
+
+    assert recovered_externally.outcome == "STALE_BASE"
+    watch = get_review_watch(session, view.publication_id)
+    assert watch.watched_head_sha == HEAD
+    assert watch.state == "STALE"
+    assert watch.next_role == "CONTROL_PLANE"
+    assert watch.next_action == "BLOCKED"
+
+
+def test_h2_reconcile_is_not_blocked_by_h1_stale_watch(session):
+    view = complete_codex_pass(session, start_codex(session, published(session)))
+    sync_review_watch(session, view.publication_id, state="STALE")
+    published_next = publish_next_head(session, view)
+    running = start_codex(
+        session,
+        published_next,
+        expected_head_sha=NEXT_HEAD,
+    )
+    github = FakeGitHub()
+    github.head_sha = NEXT_HEAD
+    github.issue_comments = [governed_codex_trigger(running)]
+
+    result = gateway(github).reconcile_publication(session, running.publication_id)
+
+    watch = get_review_watch(session, running.publication_id)
+    assert result.outcome == "RECONCILED"
+    assert result.watch_state == "ACTIVE"
+    assert result.next_role == "PROVIDER"
+    assert result.next_action == "WAIT_PROVIDER"
+    assert watch.watched_head_sha == NEXT_HEAD
+    assert watch.review_run_id == running.automated_review_run_id
+    assert watch.state == "ACTIVE"
 
 
 def test_direct_human_review_is_blocked_when_base_ref_drifted(session):

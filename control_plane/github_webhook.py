@@ -12,12 +12,19 @@ from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from .codex_review import CodexReviewBroker, CodexReviewError
-from .domain import AutomatedReviewStatus, DomainError, PublicationState, ReviewDecision
+from .domain import (
+    AutomatedReviewStatus,
+    DomainError,
+    EventType,
+    PublicationState,
+    ReviewDecision,
+)
 from .github_api import GitHubApiError, GitHubRepositoryGateway, PullRequestSnapshot
 from .github_app import GitHubAppTokenProvider, GitHubAuthError
 from .merge import MergeCoordinator, MergeError
 from .models import GitHubWebhookDeliveryRow, PublicationRow, ReviewWatchRow
 from .profile_registry import ProfileError, profile_for_repository
+from .repository import load_events
 from .service import (
     get_view,
     mark_codex_review_unavailable,
@@ -325,6 +332,34 @@ def _derive_next(session: Session, publication_id: str) -> tuple[str, str]:
     return "CONTROL_PLANE", "BLOCKED"
 
 
+def _governed_watch_generation_advanced(
+    session: Session,
+    publication_id: str,
+    *,
+    watched_head_sha: str,
+    remote_head_sha: str,
+) -> bool:
+    """Return whether verified REMOTE_PUBLISHED events advance this watch.
+
+    The event chain must terminate at the current governed remote head.
+    """
+    current_head = watched_head_sha
+    advanced = False
+    for event in load_events(session, publication_id):
+        if event["event_type"] != EventType.REMOTE_PUBLISHED.value:
+            continue
+        payload = event["payload"]
+        published_head = payload.get("head_sha")
+        if (
+            payload.get("previous_head_sha") == current_head
+            and isinstance(published_head, str)
+            and published_head != current_head
+        ):
+            current_head = published_head
+            advanced = True
+    return advanced and current_head == remote_head_sha
+
+
 def sync_review_watch(
     session: Session,
     publication_id: str,
@@ -351,14 +386,31 @@ def sync_review_watch(
         )
     )
     row = session.get(ReviewWatchRow, publication_id)
-    effective_state = state if state is not None else (row.state if row is not None else None)
+    generation_advanced = bool(
+        row is not None
+        and row.watched_head_sha != view.remote_head_sha
+        and _governed_watch_generation_advanced(
+            session,
+            publication_id,
+            watched_head_sha=row.watched_head_sha,
+            remote_head_sha=view.remote_head_sha,
+        )
+    )
+    effective_state = (
+        state
+        if state is not None
+        else (
+            None
+            if generation_advanced
+            else (row.state if row is not None else None)
+        )
+    )
     if effective_state == "STALE":
         next_role, next_action = "CONTROL_PLANE", "BLOCKED"
     else:
         next_role, next_action = _derive_next(session, publication_id)
     provider = "CODEX" if view.automated_review_run_id is not None else None
 
-    row = session.get(ReviewWatchRow, publication_id)
     if row is None:
         row = ReviewWatchRow(
             publication_id=publication_id,
@@ -389,9 +441,13 @@ def sync_review_watch(
         if state is not None:
             row.state = state
         elif head_changed:
-            # A changed head is not evidence that a stale base recovered. Only
-            # the authoritative base-push readback may clear a STALE watch.
-            row.state = "STALE" if effective_state == "STALE" else "ACTIVE"
+            # A prior generation stays stale unless the append-only publication
+            # history proves that Plane governed and published this new head.
+            row.state = (
+                "ACTIVE"
+                if generation_advanced or effective_state != "STALE"
+                else "STALE"
+            )
         elif view.state is PublicationState.MERGED:
             row.state = "DONE"
         row.next_role = next_role
@@ -624,9 +680,16 @@ class GitHubWebhookGateway:
         if current_base == candidate.base_sha:
             existing_watch = session.get(ReviewWatchRow, publication_id)
             if existing_watch is not None and existing_watch.state == "STALE":
+                if existing_watch.watched_head_sha != view.remote_head_sha:
+                    refreshed_watch = sync_review_watch(
+                        session,
+                        publication_id,
+                        expected_actors=self.expected_actors,
+                        last_delivery_id=last_delivery_id,
+                    )
+                    return refreshed_watch.state != "STALE"
                 if (
-                    existing_watch.watched_head_sha != view.remote_head_sha
-                    or existing_watch.next_role != "CONTROL_PLANE"
+                    existing_watch.next_role != "CONTROL_PLANE"
                     or existing_watch.next_action != "BLOCKED"
                 ):
                     sync_review_watch(
