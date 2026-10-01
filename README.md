@@ -87,6 +87,13 @@ available.
 The publisher remains disabled.
 
 
+## Implementer handoff to Plane
+
+Governed implementers, including Codex, do not push implementation commits directly to the canonical PR branch. A local commit becomes a governed candidate only after the implementer creates a Git bundle advertising exactly `refs/controlplane/base` and `refs/controlplane/head` and uploads it to `POST /api/v1/publications/{publicationId}/candidate-bundle` as multipart field `bundle`.
+
+Plane imports the bundle into its own quarantine and derives the base/head/tree and candidate identity itself. It then runs the configured validation/admission lifecycle before the publisher writes the candidate to the canonical PR. Therefore a local commit or a GitHub branch push performed by the implementer is not a valid Plane implementation submission.
+
+
 ## GitHub App publisher
 
 Issue #6 adds the exclusive repository publication boundary.
