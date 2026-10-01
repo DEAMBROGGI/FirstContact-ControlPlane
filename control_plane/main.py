@@ -236,12 +236,7 @@ def get_codex_review_broker():
         github.close()
 
 
-def get_github_webhook_gateway():
-    if settings.publisher_mode != "github-app":
-        raise HTTPException(status_code=503, detail="GitHub webhook gateway is disabled")
-    webhook_secret = settings.github_webhook_secret.get_secret_value().strip()
-    if not webhook_secret:
-        raise HTTPException(status_code=503, detail="GitHub webhook secret is not configured")
+def _github_webhook_gateway(*, webhook_secret: str | None):
     token_provider = GitHubAppTokenProvider(
         app_id=settings.github_app_id,
         private_key_path=settings.github_app_private_key_path,
@@ -261,6 +256,21 @@ def get_github_webhook_gateway():
     finally:
         token_provider.close()
         github.close()
+
+
+def get_github_authoritative_gateway():
+    if settings.publisher_mode != "github-app":
+        raise HTTPException(status_code=503, detail="GitHub webhook gateway is disabled")
+    yield from _github_webhook_gateway(webhook_secret=None)
+
+
+def get_github_webhook_gateway():
+    if settings.publisher_mode != "github-app":
+        raise HTTPException(status_code=503, detail="GitHub webhook gateway is disabled")
+    webhook_secret = settings.github_webhook_secret.get_secret_value().strip()
+    if not webhook_secret:
+        raise HTTPException(status_code=503, detail="GitHub webhook secret is not configured")
+    yield from _github_webhook_gateway(webhook_secret=webhook_secret)
 
 
 def get_plane_review_publisher():
@@ -861,7 +871,7 @@ async def github_webhook_receive(
 def github_webhook_reconcile(
     publication_id: str | None = None,
     session: Session = Depends(get_session),
-    gateway: GitHubWebhookGateway = Depends(get_github_webhook_gateway),
+    gateway: GitHubWebhookGateway = Depends(get_github_authoritative_gateway),
 ):
     try:
         if publication_id is not None:
@@ -942,7 +952,7 @@ def review_record(
     publication_id: str,
     request: ReviewRequest,
     session: Session = Depends(get_session),
-    gateway: GitHubWebhookGateway = Depends(get_github_webhook_gateway),
+    gateway: GitHubWebhookGateway = Depends(get_github_authoritative_gateway),
 ):
     try:
         gateway.assert_review_write_current(session, publication_id)
@@ -972,7 +982,7 @@ def mergeability_record(
     publication_id: str,
     request: MergeabilityRequest,
     session: Session = Depends(get_session),
-    gateway: GitHubWebhookGateway = Depends(get_github_webhook_gateway),
+    gateway: GitHubWebhookGateway = Depends(get_github_authoritative_gateway),
 ):
     try:
         pull = gateway.assert_mergeability_write_current(

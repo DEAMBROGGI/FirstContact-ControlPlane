@@ -520,7 +520,7 @@ class GitHubWebhookGateway:
         codex_review_mode: str,
         codex_actors: tuple[str, ...],
         human_review_actors: tuple[str, ...],
-        webhook_secret: str,
+        webhook_secret: str | None,
         maximum_payload_bytes: int,
     ) -> None:
         self.token_provider = token_provider
@@ -548,6 +548,10 @@ class GitHubWebhookGateway:
         signature: str | None,
         body: bytes,
     ) -> WebhookDeliveryView:
+        if not self.webhook_secret:
+            raise GitHubWebhookAuthError(
+                "GitHub webhook secret is not configured"
+            )
         return persist_webhook_delivery(
             session,
             delivery_id=delivery_id,

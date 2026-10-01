@@ -2,19 +2,38 @@ import asyncio
 import hashlib
 import hmac
 import json
+from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
+from pydantic import SecretStr
 
 import control_plane.main as main_module
 from control_plane.config import settings
 from control_plane.db import get_session
-from control_plane.github_webhook import GitHubWebhookGateway
-from control_plane.main import app, get_github_webhook_gateway
-from control_plane.models import GitHubWebhookDeliveryRow
+from control_plane.domain import ValidationStatus
+from control_plane.github_api import PullRequestSnapshot
+from control_plane.github_webhook import GitHubWebhookGateway, sync_review_watch
+from control_plane.main import (
+    app,
+    get_github_authoritative_gateway,
+    get_github_webhook_gateway,
+)
+from control_plane.models import GitHubWebhookDeliveryRow, ReviewWatchRow
+from control_plane.profile_registry import profile_for_repository
+from control_plane.quarantine import VerifiedCandidateSource
+from control_plane.service import (
+    create_publication,
+    mark_remote_published,
+    record_validation,
+    submit_verified_candidate,
+)
 
 
 REPOSITORY = "DEAMBROGGI/FirstContact-ControlPlane"
 SECRET = "api-webhook-secret"
+BASE = "1" * 40
+HEAD = "2" * 40
+TREE = "3" * 40
 
 
 class NoRemoteTokenProvider:
@@ -42,7 +61,108 @@ def client_for(session):
 
     app.dependency_overrides[get_session] = override_session
     app.dependency_overrides[get_github_webhook_gateway] = lambda: gateway
+    app.dependency_overrides[get_github_authoritative_gateway] = lambda: gateway
     return TestClient(app)
+
+
+def client_for_session(session):
+    def override_session():
+        yield session
+
+    app.dependency_overrides[get_session] = override_session
+    return TestClient(app)
+
+
+def configure_github_app_without_webhook_secret(monkeypatch):
+    monkeypatch.setattr(settings, "publisher_mode", "github-app")
+    monkeypatch.setattr(settings, "github_webhook_secret", SecretStr(""))
+    monkeypatch.setattr(settings, "codex_review_mode", "disabled")
+    monkeypatch.setattr(settings, "codex_review_actors", "")
+    monkeypatch.setattr(settings, "human_review_actors", "DEAMBROGGI")
+    monkeypatch.setattr(
+        main_module,
+        "GitHubAppTokenProvider",
+        FakeApiTokenProvider,
+    )
+    monkeypatch.setattr(
+        main_module,
+        "GitHubRepositoryGateway",
+        lambda **_kwargs: FakeApiGitHub(),
+    )
+
+
+def published_publication(session):
+    view = create_publication(session, REPOSITORY, 2602)
+    view = submit_verified_candidate(
+        session,
+        view.publication_id,
+        VerifiedCandidateSource(
+            bundle_sha256="a" * 64,
+            byte_length=1234,
+            quarantine_id="a" * 64,
+            base_sha=BASE,
+            head_sha=HEAD,
+            tree_sha=TREE,
+        ),
+    )
+    profile = profile_for_repository(REPOSITORY)
+    for index, job_id in enumerate(profile.required_jobs, 1):
+        view = record_validation(
+            session,
+            view.publication_id,
+            job_id=job_id,
+            status=ValidationStatus.PASS,
+            evidence_sha256=f"{index:064x}",
+        )
+    return mark_remote_published(
+        session,
+        view.publication_id,
+        HEAD,
+        branch="control-plane/issue-2602-api",
+        base_branch="master",
+        pull_request_number=44,
+    )
+
+
+class FakeApiTokenProvider:
+    def __init__(self, **_kwargs):
+        pass
+
+    def installation_access(self, *_args, **_kwargs):
+        return SimpleNamespace(token="installation-token")
+
+    def close(self):
+        pass
+
+
+class FakeApiGitHub:
+    def pull_request(self, repository, number, token):
+        assert repository == REPOSITORY
+        assert number == 44
+        assert token == "installation-token"
+        return PullRequestSnapshot(
+            number=44,
+            state="open",
+            base_ref="master",
+            head_ref="control-plane/issue-2602-api",
+            head_sha=HEAD,
+            mergeable=True,
+        )
+
+    def ref_sha(self, repository, branch, token):
+        assert repository == REPOSITORY
+        assert branch == "master"
+        assert token == "installation-token"
+        return BASE
+
+    def list_pull_reviews(self, repository, number, token):
+        assert repository == REPOSITORY
+        assert number == 44
+        assert token == "installation-token"
+        return []
+
+    def close(self):
+        pass
 
 
 def signed_body():
@@ -111,6 +231,107 @@ def test_public_webhook_endpoint_rejects_bad_signature_without_persistence(sessi
             GitHubWebhookDeliveryRow,
             "api-delivery-invalid",
         ) is None
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_public_webhook_endpoint_requires_configured_secret(session, monkeypatch):
+    configure_github_app_without_webhook_secret(monkeypatch)
+    client = client_for_session(session)
+    try:
+        rejected = client.post(
+            "/api/v1/github/webhooks",
+            content=b"{}",
+            headers={
+                "Content-Type": "application/json",
+                "X-Hub-Signature-256": "sha256=" + ("0" * 64),
+                "X-GitHub-Delivery": "api-delivery-no-secret",
+                "X-GitHub-Event": "ping",
+            },
+        )
+        assert rejected.status_code == 503
+        assert rejected.json()["detail"] == "GitHub webhook secret is not configured"
+        assert session.get(
+            GitHubWebhookDeliveryRow,
+            "api-delivery-no-secret",
+        ) is None
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_internal_publication_reconcile_does_not_require_webhook_secret(
+    session,
+    monkeypatch,
+):
+    configure_github_app_without_webhook_secret(monkeypatch)
+    view = published_publication(session)
+    sync_review_watch(
+        session,
+        view.publication_id,
+        expected_actors=("DEAMBROGGI",),
+    )
+    client = client_for_session(session)
+    try:
+        reconciled = client.post(
+            "/api/v1/internal/github/webhooks/reconcile",
+            params={"publication_id": view.publication_id},
+            headers={"X-Control-Plane-Token": settings.internal_token},
+        )
+        assert reconciled.status_code == 200, reconciled.text
+        assert reconciled.json()["outcome"] == "RECONCILED"
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_direct_human_review_readback_does_not_require_webhook_secret(
+    session,
+    monkeypatch,
+):
+    configure_github_app_without_webhook_secret(monkeypatch)
+    view = published_publication(session)
+    client = client_for_session(session)
+    try:
+        reviewed = client.post(
+            f"/api/v1/publications/{view.publication_id}/reviews",
+            headers={"X-Control-Plane-Token": settings.internal_token},
+            json={
+                "reviewed_head_sha": HEAD,
+                "decision": "CHANGES_REQUIRED",
+            },
+        )
+        assert reviewed.status_code == 200, reviewed.text
+        assert reviewed.json()["review_decision"] == "CHANGES_REQUIRED"
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_internal_reconcile_reconstructs_missing_legacy_review_watch(
+    session,
+    monkeypatch,
+):
+    configure_github_app_without_webhook_secret(monkeypatch)
+    view = published_publication(session)
+    assert session.get(ReviewWatchRow, view.publication_id) is None
+    client = client_for_session(session)
+    headers = {"X-Control-Plane-Token": settings.internal_token}
+    watch_url = f"/api/v1/internal/github/review-watches/{view.publication_id}"
+    try:
+        missing = client.get(watch_url, headers=headers)
+        assert missing.status_code == 404
+
+        reconciled = client.post(
+            "/api/v1/internal/github/webhooks/reconcile",
+            params={"publication_id": view.publication_id},
+            headers=headers,
+        )
+        assert reconciled.status_code == 200, reconciled.text
+        assert reconciled.json()["outcome"] == "RECONCILED"
+        assert session.get(ReviewWatchRow, view.publication_id) is not None
+
+        reconstructed = client.get(watch_url, headers=headers)
+        assert reconstructed.status_code == 200, reconstructed.text
+        assert reconstructed.json()["publication_id"] == view.publication_id
+        assert reconstructed.json()["watched_head_sha"] == HEAD
     finally:
         app.dependency_overrides.clear()
 
