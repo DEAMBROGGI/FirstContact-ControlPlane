@@ -12,12 +12,15 @@ from pydantic import SecretStr
 
 import control_plane.main as main_module
 from control_plane.config import settings
+from control_plane.codex_review import CodexReviewError
 from control_plane.db import get_session
 from control_plane.domain import ValidationStatus
-from control_plane.github_api import PullRequestSnapshot
+from control_plane.github_api import GitHubApiError, PullRequestSnapshot
+from control_plane.github_app import GitHubAuthError
 from control_plane.github_webhook import (
     GitHubWebhookGateway,
     WebhookProcessResult,
+    mark_delivery_retry,
     sync_review_watch,
 )
 from control_plane.main import (
@@ -328,6 +331,49 @@ def test_public_webhook_runs_sync_delivery_processing_in_threadpool(
         app.dependency_overrides.clear()
 
 
+@pytest.mark.parametrize(
+    "error_type",
+    [GitHubAuthError, GitHubApiError, CodexReviewError],
+)
+def test_public_webhook_sanitizes_retryable_processing_errors(
+    session,
+    monkeypatch,
+    error_type,
+):
+    internal_detail = "provider response includes private diagnostic detail"
+
+    def fail_processing(_gateway, current_session, delivery_id):
+        mark_delivery_retry(current_session, delivery_id, internal_detail)
+        raise error_type(internal_detail)
+
+    monkeypatch.setattr(GitHubWebhookGateway, "process_delivery", fail_processing)
+    client = client_for(session)
+    body, signature = signed_body()
+    delivery_id = f"api-retry-{error_type.__name__}"
+    try:
+        response = client.post(
+            "/api/v1/github/webhooks",
+            content=body,
+            headers={
+                "Content-Type": "application/json",
+                "X-Hub-Signature-256": signature,
+                "X-GitHub-Delivery": delivery_id,
+                "X-GitHub-Event": "ping",
+            },
+        )
+
+        assert response.status_code == 502
+        assert response.json() == {
+            "detail": "GitHub webhook processing failed closed"
+        }
+        assert internal_detail not in response.text
+        row = session.get(GitHubWebhookDeliveryRow, delivery_id)
+        assert row is not None
+        assert row.state == "PENDING"
+    finally:
+        app.dependency_overrides.clear()
+
+
 def test_public_webhook_endpoint_requires_configured_secret(session, monkeypatch):
     configure_github_app_without_webhook_secret(monkeypatch)
     client = client_for_session(session)
@@ -466,6 +512,8 @@ def test_successful_publication_materializes_watch_without_codex_request(
     assert watch is not None
     assert watch.watched_head_sha == HEAD
     assert watch.state == "ACTIVE"
+    assert watch.next_role == "HUMAN_REVIEWER"
+    assert watch.next_action == "WAIT_HUMAN_REVIEW"
 
 
 

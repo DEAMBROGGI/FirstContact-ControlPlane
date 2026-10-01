@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from fastapi import HTTPException
 
+from control_plane.codex_review import CodexReviewError
 from control_plane.domain import (
     AutomatedReviewStatus,
     DomainError,
@@ -17,6 +18,7 @@ from control_plane.domain import (
     ValidationStatus,
 )
 from control_plane.github_api import (
+    GitHubApiError,
     IssueCommentSnapshot,
     PullMergeEventSnapshot,
     PullRequestSnapshot,
@@ -200,6 +202,7 @@ def raw_delivery(
     event_name: str,
     action: str = "created",
     comment_id: int | None = None,
+    comment_body: str | None = None,
     review_id: int | None = None,
     review_actor: str | None = None,
 ):
@@ -218,10 +221,13 @@ def raw_delivery(
             "base": {"ref": "master"},
         }
     if comment_id is not None:
-        payload["comment"] = {
+        comment = {
             "id": comment_id,
             "user": {"login": CODEX_ACTOR},
         }
+        if comment_body is not None:
+            comment["body"] = comment_body
+        payload["comment"] = comment
     if review_id is not None:
         payload["review"] = {
             "id": review_id,
@@ -517,6 +523,167 @@ def test_usage_limit_webhook_marks_matching_exact_run_unavailable(session):
     assert result.next_role == "PRINCIPAL_REVIEWER"
     assert result.next_action == "PRINCIPAL_FALLBACK"
     assert get_webhook_delivery(session, receipt.delivery_id).state == "PROCESSED"
+
+
+def test_usage_limit_with_concurrent_reserved_invocation_fails_closed(session):
+    view = start_codex(session, published(session))
+    github = FakeGitHub()
+    github.issue_comments = [
+        governed_codex_trigger(view),
+        usage_limit_response(701, "2026-09-30T12:01:00Z"),
+        IssueCommentSnapshot(
+            comment_id=702,
+            actor=HUMAN_ACTOR,
+            body="@codex review",
+            created_at="2026-09-30T12:02:00Z",
+        ),
+    ]
+    value = gateway(github)
+    body, signature = raw_delivery(
+        event_name="issue_comment",
+        comment_id=701,
+    )
+    receipt = value.ingest(
+        session,
+        delivery_id="delivery-usage-limit-ambiguous",
+        event_name="issue_comment",
+        signature=signature,
+        body=body,
+    )
+
+    with pytest.raises(CodexReviewError, match="additional Codex invocation"):
+        value.process_delivery(session, receipt.delivery_id)
+
+    assert get_view(session, view.publication_id).automated_review_status is AutomatedReviewStatus.RUNNING
+    assert get_webhook_delivery(session, receipt.delivery_id).state == "PENDING"
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_role", "expected_action"),
+    [
+        ("disabled", "HUMAN_REVIEWER", "WAIT_HUMAN_REVIEW"),
+        ("advisory", "PROVIDER", "WAIT_PROVIDER"),
+        ("required", "PROVIDER", "WAIT_PROVIDER"),
+    ],
+)
+def test_review_watch_next_role_respects_codex_mode_without_a_run(
+    session,
+    mode,
+    expected_role,
+    expected_action,
+):
+    view = published(session)
+
+    result = gateway(FakeGitHub(), mode=mode).reconcile_publication(
+        session,
+        view.publication_id,
+    )
+
+    assert result.next_role == expected_role
+    assert result.next_action == expected_action
+    watch = get_review_watch(session, view.publication_id)
+    assert watch.next_role == expected_role
+    assert watch.next_action == expected_action
+
+
+@pytest.mark.parametrize(
+    ("deleted_body", "delivery_suffix"),
+    [
+        ("an unrelated deleted comment", "unrelated"),
+        (USAGE_LIMIT, "usage-limit"),
+    ],
+)
+def test_deleted_issue_comment_uses_current_evidence_not_deleted_receipt(
+    session,
+    deleted_body,
+    delivery_suffix,
+):
+    view = start_codex(session, published(session))
+    github = FakeGitHub()
+    github.issue_comments = [governed_codex_trigger(view)]
+    value = gateway(github)
+    body, signature = raw_delivery(
+        event_name="issue_comment",
+        action="deleted",
+        comment_id=701,
+        comment_body=deleted_body,
+    )
+    receipt = value.ingest(
+        session,
+        delivery_id=f"delivery-deleted-comment-{delivery_suffix}",
+        event_name="issue_comment",
+        signature=signature,
+        body=body,
+    )
+
+    result = value.process_delivery(session, receipt.delivery_id)
+
+    assert result.outcome == "CODEX_RUNNING"
+    assert get_view(session, view.publication_id).automated_review_status is AutomatedReviewStatus.RUNNING
+    assert get_webhook_delivery(session, receipt.delivery_id).state == "PROCESSED"
+
+
+def test_out_of_policy_merged_pull_settles_delivery_and_blocks_watch(session):
+    view = published(session)
+    github = FakeGitHub()
+    github.merged = True
+    value = gateway(github)
+    body, signature = raw_delivery(
+        event_name="pull_request",
+        action="closed",
+    )
+    receipt = value.ingest(
+        session,
+        delivery_id="delivery-out-of-policy-merge",
+        event_name="pull_request",
+        signature=signature,
+        body=body,
+    )
+
+    result = value.process_delivery(session, receipt.delivery_id)
+
+    current = get_view(session, view.publication_id)
+    watch = get_review_watch(session, view.publication_id)
+    policy_events = [
+        event
+        for event in load_events(session, view.publication_id)
+        if event["event_type"] == EventType.MERGE_POLICY_VIOLATION.value
+    ]
+    assert current.merge_policy_violation is True
+    assert len(policy_events) == 1
+    assert result.outcome == "MERGE_POLICY_VIOLATION"
+    assert get_webhook_delivery(session, receipt.delivery_id).state == "PROCESSED"
+    assert watch.next_role == "CONTROL_PLANE"
+    assert watch.next_action == "BLOCKED"
+
+
+def test_merge_readback_error_keeps_delivery_retryable(session):
+    view = published(session)
+
+    class MergeReadbackFailureGitHub(FakeGitHub):
+        def pull_request_merge_event(self, repository, number, token):
+            raise GitHubApiError("simulated merge readback failure")
+
+    github = MergeReadbackFailureGitHub()
+    github.merged = True
+    value = gateway(github)
+    body, signature = raw_delivery(
+        event_name="pull_request",
+        action="closed",
+    )
+    receipt = value.ingest(
+        session,
+        delivery_id="delivery-merge-readback-failure",
+        event_name="pull_request",
+        signature=signature,
+        body=body,
+    )
+
+    with pytest.raises(GitHubWebhookError, match="closed PR reconciliation failed"):
+        value.process_delivery(session, receipt.delivery_id)
+
+    assert get_view(session, view.publication_id).merge_policy_violation is False
+    assert get_webhook_delivery(session, receipt.delivery_id).state == "PENDING"
 
 
 def test_stale_human_review_cannot_advance_exact_head(session):

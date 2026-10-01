@@ -11,7 +11,11 @@ from typing import Any, Mapping
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
-from .codex_review import CodexReviewBroker, CodexReviewError
+from .codex_review import (
+    CodexReviewBroker,
+    CodexReviewError,
+    assert_no_ambiguous_codex_invocations,
+)
 from .domain import (
     AutomatedReviewStatus,
     DomainError,
@@ -21,7 +25,7 @@ from .domain import (
 )
 from .github_api import GitHubApiError, GitHubRepositoryGateway, PullRequestSnapshot
 from .github_app import GitHubAppTokenProvider, GitHubAuthError
-from .merge import MergeCoordinator, MergeError
+from .merge import MergeCoordinator, MergeError, MergePolicyViolationRecorded
 from .models import GitHubWebhookDeliveryRow, PublicationRow, ReviewWatchRow
 from .profile_registry import ProfileError, profile_for_repository
 from .repository import load_events
@@ -319,7 +323,12 @@ def list_pending_delivery_ids(session: Session) -> tuple[str, ...]:
     )
 
 
-def _derive_next(session: Session, publication_id: str) -> tuple[str, str]:
+def _derive_next(
+    session: Session,
+    publication_id: str,
+    *,
+    codex_review_mode: str = "required",
+) -> tuple[str, str]:
     view = get_view(session, publication_id)
 
     if view.state is PublicationState.MERGED:
@@ -346,6 +355,11 @@ def _derive_next(session: Session, publication_id: str) -> tuple[str, str]:
     if view.automated_review_status is AutomatedReviewStatus.PASS:
         return "HUMAN_REVIEWER", "WAIT_HUMAN_REVIEW"
     if view.state is PublicationState.IN_REVIEW:
+        if (
+            codex_review_mode.strip().lower() == "disabled"
+            and view.automated_review_run_id is None
+        ):
+            return "HUMAN_REVIEWER", "WAIT_HUMAN_REVIEW"
         return "PROVIDER", "WAIT_PROVIDER"
     return "CONTROL_PLANE", "BLOCKED"
 
@@ -385,6 +399,7 @@ def sync_review_watch(
     expected_actors: tuple[str, ...] = (),
     last_delivery_id: str | None = None,
     state: str | None = None,
+    codex_review_mode: str = "required",
 ) -> ReviewWatchView:
     view = get_view(session, publication_id)
     if (
@@ -424,11 +439,19 @@ def sync_review_watch(
         )
     )
     if view.state is PublicationState.MERGED:
-        next_role, next_action = _derive_next(session, publication_id)
+        next_role, next_action = _derive_next(
+            session,
+            publication_id,
+            codex_review_mode=codex_review_mode,
+        )
     elif effective_state in _BLOCKED_WATCH_STATES:
         next_role, next_action = "CONTROL_PLANE", "BLOCKED"
     else:
-        next_role, next_action = _derive_next(session, publication_id)
+        next_role, next_action = _derive_next(
+            session,
+            publication_id,
+            codex_review_mode=codex_review_mode,
+        )
     provider = "CODEX" if view.automated_review_run_id is not None else None
 
     if row is None:
@@ -684,6 +707,24 @@ class GitHubWebhookGateway:
     def expected_actors(self) -> tuple[str, ...]:
         return tuple(sorted(set(self.codex_actors) | set(self.human_review_actors)))
 
+    def _sync_review_watch(
+        self,
+        session: Session,
+        publication_id: str,
+        *,
+        expected_actors: tuple[str, ...] = (),
+        last_delivery_id: str | None = None,
+        state: str | None = None,
+    ) -> ReviewWatchView:
+        return sync_review_watch(
+            session,
+            publication_id,
+            expected_actors=expected_actors,
+            last_delivery_id=last_delivery_id,
+            state=state,
+            codex_review_mode=self.codex_review_mode,
+        )
+
     def _requires_codex_adjudication(self, view) -> bool:
         return (
             self.codex_review_mode == "required"
@@ -862,7 +903,7 @@ class GitHubWebhookGateway:
             existing_watch = session.get(ReviewWatchRow, publication_id)
             if existing_watch is not None and existing_watch.state == "STALE":
                 if existing_watch.watched_head_sha != view.remote_head_sha:
-                    refreshed_watch = sync_review_watch(
+                    refreshed_watch = self._sync_review_watch(
                         session,
                         publication_id,
                         expected_actors=self.expected_actors,
@@ -873,7 +914,7 @@ class GitHubWebhookGateway:
                     existing_watch.next_role != "CONTROL_PLANE"
                     or existing_watch.next_action != "BLOCKED"
                 ):
-                    sync_review_watch(
+                    self._sync_review_watch(
                         session,
                         publication_id,
                         expected_actors=self.expected_actors,
@@ -882,7 +923,7 @@ class GitHubWebhookGateway:
                     )
                 return False
             return True
-        sync_review_watch(
+        self._sync_review_watch(
             session,
             publication_id,
             expected_actors=self.expected_actors,
@@ -936,7 +977,7 @@ class GitHubWebhookGateway:
             ) from exc
 
         if pull.state.strip().lower() == "closed" and not pull.merged:
-            sync_review_watch(
+            self._sync_review_watch(
                 session,
                 publication_id,
                 expected_actors=self.expected_actors,
@@ -947,7 +988,7 @@ class GitHubWebhookGateway:
             )
 
         if pull.head_sha != view.remote_head_sha:
-            sync_review_watch(
+            self._sync_review_watch(
                 session,
                 publication_id,
                 expected_actors=self.expected_actors,
@@ -1023,6 +1064,12 @@ class GitHubWebhookGateway:
         )
         if marker not in (trigger.body or ""):
             raise GitHubWebhookError("governed Codex trigger marker changed")
+
+        assert_no_ambiguous_codex_invocations(
+            comments,
+            trigger_comment_id=trigger.comment_id,
+            trigger_time=trigger_time,
+        )
 
         if comment_id is not None:
             evidence_matches = [
@@ -1257,7 +1304,7 @@ class GitHubWebhookGateway:
     ) -> str:
         view = get_view(session, publication_id)
         if pull.state.strip().lower() == "closed" and not pull.merged:
-            sync_review_watch(
+            self._sync_review_watch(
                 session,
                 publication_id,
                 expected_actors=self.expected_actors,
@@ -1356,7 +1403,7 @@ class GitHubWebhookGateway:
             raise GitHubWebhookError("GitHub review readback failed closed") from exc
 
         if pull.state.strip().lower() == "closed" and not pull.merged:
-            watch = sync_review_watch(
+            watch = self._sync_review_watch(
                 session,
                 publication_id,
                 expected_actors=self.expected_actors,
@@ -1381,7 +1428,7 @@ class GitHubWebhookGateway:
         view = get_view(session, publication_id)
 
         if pull.head_sha != view.remote_head_sha:
-            watch = sync_review_watch(
+            watch = self._sync_review_watch(
                 session,
                 publication_id,
                 expected_actors=self.expected_actors,
@@ -1429,7 +1476,7 @@ class GitHubWebhookGateway:
         view = get_view(session, publication_id)
         pull = self._read_pull(view, access.token)
 
-        if view.state is PublicationState.APPROVED:
+        if view.state is PublicationState.APPROVED and not pull.merged:
             self._mergeability_if_ready(
                 session,
                 publication_id,
@@ -1439,16 +1486,19 @@ class GitHubWebhookGateway:
             )
 
         view = get_view(session, publication_id)
+        merge_outcome = "RECONCILED"
         if pull.merged or view.state is PublicationState.MERGED:
             try:
                 MergeCoordinator(
                     token_provider=self.token_provider,
                     github=self.github,
                 ).reconcile(session, publication_id)
+            except MergePolicyViolationRecorded:
+                merge_outcome = "MERGE_POLICY_VIOLATION"
             except (MergeError, DomainError) as exc:
                 raise GitHubWebhookError("merge reconciliation failed closed") from exc
 
-        watch = sync_review_watch(
+        watch = self._sync_review_watch(
             session,
             publication_id,
             expected_actors=self.expected_actors,
@@ -1457,7 +1507,7 @@ class GitHubWebhookGateway:
         return WebhookProcessResult(
             delivery_id=last_delivery_id,
             publication_id=publication_id,
-            outcome="RECONCILED",
+            outcome=merge_outcome,
             next_role=watch.next_role,
             next_action=watch.next_action,
             watch_state=watch.state,
@@ -1473,9 +1523,14 @@ class GitHubWebhookGateway:
     ) -> str:
         view = get_view(session, publication_id)
         pull = self._read_pull(view, token)
+        comment_id = (
+            _issue_comment_id(row)
+            if row.event_name == "issue_comment" and row.action != "deleted"
+            else None
+        )
 
         if pull.state.strip().lower() == "closed" and not pull.merged:
-            sync_review_watch(
+            self._sync_review_watch(
                 session,
                 publication_id,
                 expected_actors=self.expected_actors,
@@ -1486,11 +1541,6 @@ class GitHubWebhookGateway:
 
         codex_unavailable = False
         if view.automated_review_status is AutomatedReviewStatus.RUNNING:
-            comment_id = (
-                _issue_comment_id(row)
-                if row.event_name == "issue_comment"
-                else None
-            )
             codex_unavailable = self._reconcile_codex_unavailability_only(
                 session,
                 publication_id,
@@ -1505,13 +1555,15 @@ class GitHubWebhookGateway:
                     token_provider=self.token_provider,
                     github=self.github,
                 ).reconcile(session, publication_id)
+            except MergePolicyViolationRecorded:
+                return "MERGE_POLICY_VIOLATION"
             except (MergeError, DomainError) as exc:
                 raise GitHubWebhookError("closed PR reconciliation failed closed") from exc
             return "PULL_CLOSED_RECONCILED"
 
         if row.event_name == "pull_request" and row.action == "synchronize":
             if pull.head_sha != view.remote_head_sha:
-                sync_review_watch(
+                self._sync_review_watch(
                     session,
                     publication_id,
                     expected_actors=self.expected_actors,
@@ -1521,7 +1573,7 @@ class GitHubWebhookGateway:
                 return "STALE_HEAD"
 
         if pull.head_sha != view.remote_head_sha:
-            sync_review_watch(
+            self._sync_review_watch(
                 session,
                 publication_id,
                 expected_actors=self.expected_actors,
@@ -1542,7 +1594,6 @@ class GitHubWebhookGateway:
             return "SYNCHRONIZE_MATCHED"
 
         if row.event_name == "issue_comment":
-            comment_id = _issue_comment_id(row)
             if codex_unavailable:
                 return "CODEX_UNAVAILABLE"
             return self._reconcile_codex(
@@ -1645,6 +1696,7 @@ class GitHubWebhookGateway:
                 watch_row.next_role, watch_row.next_action = _derive_next(
                     session,
                     watch_row.publication_id,
+                    codex_review_mode=self.codex_review_mode,
                 )
                 watch_row.last_delivery_id = row.delivery_id
                 watch_row.last_reconciled_at = _utcnow()
@@ -1777,7 +1829,10 @@ class GitHubWebhookGateway:
             latest = get_view(session, publication_id)
             if (
                 latest.state is PublicationState.APPROVED
-                and outcome != "PULL_CLOSED_UNMERGED"
+                and outcome not in {
+                    "PULL_CLOSED_UNMERGED",
+                    "MERGE_POLICY_VIOLATION",
+                }
             ):
                 latest_pull = self._read_pull(latest, access.token)
                 mergeability_outcome = self._mergeability_if_ready(
@@ -1790,7 +1845,7 @@ class GitHubWebhookGateway:
                 if mergeability_outcome != "MERGEABILITY_NOT_ELIGIBLE":
                     outcome = outcome + "+" + mergeability_outcome
             stale_outcome = outcome in {"STALE_HEAD", "STALE_BASE"} or outcome.endswith("+STALE_BASE")
-            watch = sync_review_watch(
+            watch = self._sync_review_watch(
                 session,
                 publication_id,
                 expected_actors=self.expected_actors,
@@ -1808,7 +1863,7 @@ class GitHubWebhookGateway:
             )
         except GitHubWebhookDeferred as exc:
             mark_delivery_retry(session, delivery_id, str(exc))
-            watch = sync_review_watch(
+            watch = self._sync_review_watch(
                 session,
                 publication_id,
                 expected_actors=self.expected_actors,

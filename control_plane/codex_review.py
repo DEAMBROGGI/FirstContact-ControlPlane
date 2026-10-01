@@ -11,6 +11,7 @@ from .domain import AutomatedReviewStatus, DomainError, EventType, PublicationSt
 from .github_api import (
     GitHubApiError,
     GitHubRepositoryGateway,
+    IssueCommentSnapshot,
     PullReviewCommentSnapshot,
 )
 from .github_app import GitHubAppTokenProvider, GitHubAuthError
@@ -55,6 +56,25 @@ def _parse_time(value: str | None) -> datetime | None:
         )
     except ValueError as exc:
         raise CodexReviewError("GitHub review timestamp is invalid") from exc
+
+
+def assert_no_ambiguous_codex_invocations(
+    comments: list[IssueCommentSnapshot],
+    *,
+    trigger_comment_id: int,
+    trigger_time: datetime,
+) -> None:
+    ambiguous_invocations = [
+        item
+        for item in comments
+        if item.comment_id != trigger_comment_id
+        and _RESERVED_CODEX_MENTION.search(item.body or "")
+        and (_parse_time(item.created_at) or trigger_time) >= trigger_time
+    ]
+    if ambiguous_invocations:
+        raise CodexReviewError(
+            "additional Codex invocation detected during governed review"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -470,17 +490,11 @@ class CodexReviewBroker:
         if _parse_time(trigger.created_at) != trigger_time:
             raise CodexReviewError("governed Codex trigger timestamp changed")
 
-        ambiguous_invocations = [
-            item
-            for item in issue_comments
-            if item.comment_id != trigger.comment_id
-            and _RESERVED_CODEX_MENTION.search(item.body or "")
-            and (_parse_time(item.created_at) or trigger_time) >= trigger_time
-        ]
-        if ambiguous_invocations:
-            raise CodexReviewError(
-                "additional Codex invocation detected during governed review"
-            )
+        assert_no_ambiguous_codex_invocations(
+            issue_comments,
+            trigger_comment_id=trigger.comment_id,
+            trigger_time=trigger_time,
+        )
 
         matching_reviews = []
         for item in reviews:

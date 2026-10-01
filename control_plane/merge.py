@@ -16,6 +16,10 @@ class MergeError(RuntimeError):
     pass
 
 
+class MergePolicyViolationRecorded(MergeError):
+    pass
+
+
 class MergeCoordinator:
     def __init__(
         self,
@@ -110,7 +114,7 @@ class MergeCoordinator:
             return view
 
         if view.merge_policy_violation:
-            raise MergeError(
+            raise MergePolicyViolationRecorded(
                 "merge policy violation permanently blocks governed merge"
             )
 
@@ -131,7 +135,7 @@ class MergeCoordinator:
             pull_request_number=view.pull_request_number,
             merge_commit_sha=merge_commit_sha,
         )
-        raise MergeError(
+        raise MergePolicyViolationRecorded(
             "GitHub reports a merge before Control Plane READY_TO_MERGE"
         )
 

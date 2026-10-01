@@ -12,8 +12,8 @@ from .codex_review import CodexReviewBroker, CodexReviewError
 from .config import settings
 from .db import SessionLocal, get_session, init_db
 from .domain import DomainError
-from .github_api import GitHubRepositoryGateway
-from .github_app import GitHubAppTokenProvider
+from .github_api import GitHubApiError, GitHubRepositoryGateway
+from .github_app import GitHubAppTokenProvider, GitHubAuthError
 from .github_review_auth import GitHubReviewTokenProvider
 from .github_webhook import (
     GitHubWebhookAuthError,
@@ -358,6 +358,7 @@ def _sync_publication_watch(session: Session, publication_id: str):
             *_configured_actors(settings.codex_review_actors),
             *_configured_actors(settings.human_review_actors),
         ),
+        codex_review_mode=settings.codex_review_mode,
     )
 
 
@@ -898,7 +899,12 @@ async def github_webhook_receive(
         }
     except DomainError as exc:
         raise _conflict(exc) from exc
-    except GitHubWebhookError as exc:
+    except (
+        GitHubAuthError,
+        GitHubApiError,
+        CodexReviewError,
+        GitHubWebhookError,
+    ) as exc:
         raise HTTPException(status_code=502, detail="GitHub webhook processing failed closed") from exc
 
 
