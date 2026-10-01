@@ -202,6 +202,7 @@ class FakeGitHub:
         self.merged = False
         self.issue_comments = []
         self.reviews = []
+        self.pull_review_list_calls = 0
         self.review_comments = []
         self.reactions = []
         self.ref_shas = {"master": BASE}
@@ -231,6 +232,7 @@ class FakeGitHub:
         assert repository == REPOSITORY
         assert number == 44
         assert token == "installation-token"
+        self.pull_review_list_calls += 1
         return list(self.reviews)
 
     def list_pull_review_comments(self, repository, number, token):
@@ -270,6 +272,54 @@ def gateway(github=None):
         webhook_secret=SECRET,
         maximum_payload_bytes=1024 * 1024,
     )
+
+
+def governed_codex_trigger(view):
+    return IssueCommentSnapshot(
+        comment_id=view.automated_review_trigger_comment_id,
+        actor=view.automated_review_trigger_actor,
+        body=(
+            "@codex review\n\n"
+            f"<!-- firstcontact-control-plane:codex-review "
+            f"run={view.automated_review_run_id} "
+            f"head={view.automated_review_head_sha} -->"
+        ),
+        created_at=view.automated_review_triggered_at,
+    )
+
+
+def usage_limit_response(comment_id, created_at, body=USAGE_LIMIT):
+    return IssueCommentSnapshot(
+        comment_id=comment_id,
+        actor=CODEX_ACTOR,
+        body=body,
+        created_at=created_at,
+    )
+
+
+def assert_stale_review_blocked(session, view, result, expected_outcome):
+    current = get_view(session, view.publication_id)
+    watch = get_review_watch(session, view.publication_id)
+    assert result.outcome == expected_outcome
+    assert result.next_role == "CONTROL_PLANE"
+    assert result.next_action == "BLOCKED"
+    assert result.watch_state == "STALE"
+    assert current.state is PublicationState.IN_REVIEW
+    assert current.review_decision is None
+    assert current.mergeable is None
+    assert watch.watched_head_sha == HEAD
+    assert watch.state == "STALE"
+    assert watch.next_role == "CONTROL_PLANE"
+    assert watch.next_action == "BLOCKED"
+
+    event_types = {
+        event["event_type"]
+        for event in load_events(session, view.publication_id)
+    }
+    assert EventType.REVIEW_RECORDED.value not in event_types
+    assert EventType.MERGEABILITY_RECORDED.value not in event_types
+    assert EventType.MERGED.value not in event_types
+    assert EventType.CODEX_REVIEW_COMPLETED.value not in event_types
 
 
 def test_signed_delivery_persists_once_and_conflicting_reuse_fails(session):
@@ -880,6 +930,176 @@ def test_lost_usage_limit_webhook_converges_through_reconciliation(session):
     assert current.automated_review_status is AutomatedReviewStatus.UNAVAILABLE
     assert result.outcome == "RECONCILED"
     assert result.next_action == "PRINCIPAL_FALLBACK"
+
+
+@pytest.mark.parametrize("codex_state", ["APPROVED", "CHANGES_REQUESTED"])
+def test_stale_head_reconciliation_marks_first_correlated_usage_limit_only(
+    session,
+    codex_state,
+):
+    view = start_codex(session, published(session))
+    github = FakeGitHub()
+    github.head_sha = "4" * 40
+    github.mergeable = True
+    github.issue_comments = [
+        usage_limit_response(712, "2026-09-30T12:30:00Z"),
+        usage_limit_response(710, "2026-09-30T12:09:00Z"),
+        governed_codex_trigger(view),
+        usage_limit_response(
+            711,
+            "2026-09-30T12:10:00Z",
+            body="A later unrelated Codex comment.",
+        ),
+    ]
+    github.reviews = [
+        PullReviewSnapshot(
+            review_id=813,
+            actor=CODEX_ACTOR,
+            body="stale automated review",
+            state=codex_state,
+            commit_id=HEAD,
+            submitted_at="2026-09-30T12:11:00Z",
+        ),
+        PullReviewSnapshot(
+            review_id=814,
+            actor=HUMAN_ACTOR,
+            body="stale human approval",
+            state="APPROVED",
+            commit_id=HEAD,
+            submitted_at="2026-09-30T12:12:00Z",
+        ),
+    ]
+    value = gateway(github)
+
+    result = value.reconcile_publication(session, view.publication_id)
+
+    current = get_view(session, view.publication_id)
+    assert current.automated_review_status is AutomatedReviewStatus.UNAVAILABLE
+    assert github.pull_review_list_calls == 0
+    assert_stale_review_blocked(session, view, result, "STALE_HEAD")
+
+
+def test_stale_base_reconciliation_marks_correlated_usage_limit_and_blocks_watch(
+    session,
+):
+    view = start_codex(session, published(session))
+    github = FakeGitHub()
+    github.ref_shas["master"] = "8" * 40
+    github.issue_comments = [
+        governed_codex_trigger(view),
+        usage_limit_response(715, "2026-09-30T12:09:00Z"),
+    ]
+    github.reviews = [
+        PullReviewSnapshot(
+            review_id=815,
+            actor=HUMAN_ACTOR,
+            body="approval after base drift",
+            state="APPROVED",
+            commit_id=HEAD,
+            submitted_at="2026-09-30T12:12:00Z",
+        )
+    ]
+    value = gateway(github)
+
+    result = value.reconcile_publication(session, view.publication_id)
+
+    assert get_view(session, view.publication_id).automated_review_status is AutomatedReviewStatus.UNAVAILABLE
+    assert github.pull_review_list_calls == 0
+    assert_stale_review_blocked(session, view, result, "STALE_BASE")
+
+
+@pytest.mark.parametrize(
+    ("drift", "expected_outcome"),
+    [("head", "STALE_HEAD"), ("base", "STALE_BASE")],
+)
+def test_usage_limit_issue_comment_delivery_closes_run_before_stale_fence(
+    session,
+    drift,
+    expected_outcome,
+):
+    view = start_codex(session, published(session))
+    github = FakeGitHub()
+    if drift == "head":
+        github.head_sha = "4" * 40
+    else:
+        github.ref_shas["master"] = "8" * 40
+    github.issue_comments = [
+        usage_limit_response(701, "2026-09-30T12:09:00Z"),
+        governed_codex_trigger(view),
+    ]
+    value = gateway(github)
+    body, signature = raw_delivery(
+        event_name="issue_comment",
+        comment_id=701,
+    )
+    receipt = value.ingest(
+        session,
+        delivery_id=f"delivery-stale-usage-{drift}",
+        event_name="issue_comment",
+        signature=signature,
+        body=body,
+    )
+
+    result = value.process_delivery(session, receipt.delivery_id)
+
+    current = get_view(session, view.publication_id)
+    assert current.automated_review_status is AutomatedReviewStatus.UNAVAILABLE
+    assert get_webhook_delivery(session, receipt.delivery_id).state == "PROCESSED"
+    assert_stale_review_blocked(session, view, result, expected_outcome)
+
+
+def test_later_usage_limit_is_ignored_when_first_provider_response_is_unrelated(
+    session,
+):
+    view = start_codex(session, published(session))
+    github = FakeGitHub()
+    github.head_sha = "4" * 40
+    github.issue_comments = [
+        usage_limit_response(722, "2026-09-30T12:30:00Z"),
+        governed_codex_trigger(view),
+        usage_limit_response(
+            720,
+            "2026-09-30T12:09:00Z",
+            body="A regular Codex review comment without a provider limit.",
+        ),
+    ]
+    value = gateway(github)
+
+    result = value.reconcile_publication(session, view.publication_id)
+
+    assert get_view(session, view.publication_id).automated_review_status is AutomatedReviewStatus.RUNNING
+    assert github.pull_review_list_calls == 0
+    assert_stale_review_blocked(session, view, result, "STALE_HEAD")
+
+
+def test_unavailable_stale_run_allows_successor_candidate_submission(session):
+    view = start_codex(session, published(session))
+    github = FakeGitHub()
+    github.head_sha = "4" * 40
+    github.issue_comments = [
+        governed_codex_trigger(view),
+        usage_limit_response(723, "2026-09-30T12:09:00Z"),
+    ]
+
+    result = gateway(github).reconcile_publication(session, view.publication_id)
+
+    assert_stale_review_blocked(session, view, result, "STALE_HEAD")
+    successor = submit_verified_candidate(
+        session,
+        view.publication_id,
+        VerifiedCandidateSource(
+            bundle_sha256="b" * 64,
+            byte_length=2345,
+            quarantine_id="b" * 64,
+            base_sha=BASE,
+            head_sha="5" * 40,
+            tree_sha="6" * 40,
+        ),
+    )
+
+    assert successor.state is PublicationState.VALIDATING
+    assert successor.current_candidate.head_sha == "5" * 40
+    assert successor.automated_review_status is None
 
 
 def test_usage_limit_with_mutated_trigger_marker_fails_closed(session):

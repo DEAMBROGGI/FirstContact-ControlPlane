@@ -509,6 +509,17 @@ def _parse_time(value: str | None) -> datetime | None:
         raise GitHubWebhookError("GitHub evidence timestamp is invalid") from exc
 
 
+def _issue_comment_id(row: GitHubWebhookDeliveryRow) -> int | None:
+    raw_comment = row.payload.get("comment")
+    if not isinstance(raw_comment, Mapping):
+        return None
+    try:
+        comment_id = int(raw_comment.get("id"))
+    except (TypeError, ValueError):
+        return None
+    return comment_id if comment_id > 0 else None
+
+
 class GitHubWebhookGateway:
     """Durable wake-up gateway that always re-reads GitHub before domain mutation."""
 
@@ -729,6 +740,8 @@ class GitHubWebhookGateway:
             return False
 
         trigger_time = _parse_time(view.automated_review_triggered_at)
+        if trigger_time is None:
+            raise GitHubWebhookError("governed Codex trigger timestamp is missing")
         comments = self.github.list_issue_comments(
             view.repository,
             view.pull_request_number,
@@ -756,28 +769,59 @@ class GitHubWebhookGateway:
         if marker not in (trigger.body or ""):
             raise GitHubWebhookError("governed Codex trigger marker changed")
 
-        matches = []
-        for item in comments:
-            if comment_id is not None and item.comment_id != comment_id:
-                continue
-            created = _parse_time(item.created_at)
+        if comment_id is not None:
+            evidence_matches = [
+                item for item in comments if item.comment_id == comment_id
+            ]
+            if len(evidence_matches) != 1:
+                raise GitHubWebhookError(
+                    "Codex webhook comment receipt is missing or ambiguous"
+                )
+            evidence = evidence_matches[0]
+            if evidence.comment_id == view.automated_review_trigger_comment_id:
+                raise GitHubWebhookError(
+                    "Codex usage-limit evidence collides with trigger"
+                )
+            evidence_time = _parse_time(evidence.created_at)
             if (
-                _normalize_actor(item.actor) in self.codex_actors
-                and created is not None
-                and trigger_time is not None
-                and created >= trigger_time
-                and _CODEX_USAGE_LIMIT_RE.search(item.body or "")
+                _normalize_actor(evidence.actor) not in self.codex_actors
+                or evidence_time is None
+                or evidence_time <= trigger_time
+                or not _CODEX_USAGE_LIMIT_RE.search(evidence.body or "")
             ):
-                matches.append(item)
+                return False
+        else:
+            provider_responses: list[tuple[datetime, int, Any]] = []
+            for item in comments:
+                if item.comment_id == view.automated_review_trigger_comment_id:
+                    continue
+                if _normalize_actor(item.actor) not in self.codex_actors:
+                    continue
+                created = _parse_time(item.created_at)
+                if created is None:
+                    raise GitHubWebhookError(
+                        "Codex provider response timestamp is missing"
+                    )
+                if created > trigger_time:
+                    provider_responses.append((created, item.comment_id, item))
 
-        if len(matches) > 1:
-            raise GitHubWebhookError("Codex usage-limit evidence is ambiguous")
-        if not matches:
-            return False
+            provider_responses.sort(key=lambda item: (item[0], item[1]))
+            if any(
+                earlier[1] == later[1]
+                for earlier, later in zip(
+                    provider_responses,
+                    provider_responses[1:],
+                )
+            ):
+                raise GitHubWebhookError(
+                    "Codex provider response receipt is ambiguous"
+                )
+            if not provider_responses:
+                return False
 
-        evidence = matches[0]
-        if evidence.comment_id == view.automated_review_trigger_comment_id:
-            raise GitHubWebhookError("Codex usage-limit evidence collides with trigger")
+            evidence = provider_responses[0][2]
+            if not _CODEX_USAGE_LIMIT_RE.search(evidence.body or ""):
+                return False
 
         mark_codex_review_unavailable(
             session,
@@ -787,6 +831,36 @@ class GitHubWebhookGateway:
             reason=f"CODEX_PROVIDER_USAGE_LIMIT:{evidence.comment_id}",
         )
         return True
+
+    def _reconcile_codex_unavailability_only(
+        self,
+        session: Session,
+        publication_id: str,
+        *,
+        token: str,
+        comment_id: int | None = None,
+    ) -> bool:
+        """Close only a correlated provider usage-limit run; never run the broker."""
+        view = get_view(session, publication_id)
+        if view.automated_review_status is not AutomatedReviewStatus.RUNNING:
+            return False
+        try:
+            return self._maybe_mark_codex_unavailable_from_comment(
+                session,
+                publication_id,
+                comment_id=comment_id,
+                token=token,
+            )
+        except (
+            CodexReviewError,
+            DomainError,
+            GitHubApiError,
+            GitHubAuthError,
+            GitHubWebhookError,
+        ):
+            # Stale evidence cannot safely complete the run. The caller still
+            # applies the authoritative stale-head/base fence and blocks review.
+            return False
 
     def _reconcile_codex(
         self,
@@ -1005,6 +1079,14 @@ class GitHubWebhookGateway:
         except (GitHubAuthError, GitHubApiError) as exc:
             raise GitHubWebhookError("GitHub review readback failed closed") from exc
 
+        if view.automated_review_status is AutomatedReviewStatus.RUNNING:
+            self._reconcile_codex_unavailability_only(
+                session,
+                publication_id,
+                token=access.token,
+            )
+        view = get_view(session, publication_id)
+
         if pull.head_sha != view.remote_head_sha:
             watch = sync_review_watch(
                 session,
@@ -1099,6 +1181,21 @@ class GitHubWebhookGateway:
         view = get_view(session, publication_id)
         pull = self._read_pull(view, token)
 
+        codex_unavailable = False
+        if view.automated_review_status is AutomatedReviewStatus.RUNNING:
+            comment_id = (
+                _issue_comment_id(row)
+                if row.event_name == "issue_comment"
+                else None
+            )
+            codex_unavailable = self._reconcile_codex_unavailability_only(
+                session,
+                publication_id,
+                token=token,
+                comment_id=comment_id,
+            )
+            view = get_view(session, publication_id)
+
         if row.event_name == "pull_request" and row.action == "closed":
             try:
                 MergeCoordinator(
@@ -1142,13 +1239,9 @@ class GitHubWebhookGateway:
             return "SYNCHRONIZE_MATCHED"
 
         if row.event_name == "issue_comment":
-            raw_comment = row.payload.get("comment")
-            comment_id = None
-            if isinstance(raw_comment, Mapping):
-                try:
-                    comment_id = int(raw_comment.get("id"))
-                except (TypeError, ValueError):
-                    comment_id = None
+            comment_id = _issue_comment_id(row)
+            if codex_unavailable:
+                return "CODEX_UNAVAILABLE"
             return self._reconcile_codex(
                 session,
                 publication_id,
