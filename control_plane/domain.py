@@ -492,9 +492,19 @@ def validate_transition(
             raise DomainError("remediation clearance head is stale")
         return
     if event_type is EventType.REVIEW_RECORDED:
-        if state is not PublicationState.IN_REVIEW:
+        revokes_approval = (
+            payload.get("decision") == ReviewDecision.CHANGES_REQUIRED.value
+            and state in {
+                PublicationState.APPROVED,
+                PublicationState.READY_TO_MERGE,
+            }
+        )
+        if state is not PublicationState.IN_REVIEW and not revokes_approval:
             raise DomainError("review requires IN_REVIEW state")
-        if view.automated_review_status is AutomatedReviewStatus.RUNNING:
+        if (
+            view.automated_review_status is AutomatedReviewStatus.RUNNING
+            and payload.get("decision") != ReviewDecision.CHANGES_REQUIRED.value
+        ):
             raise DomainError("human review is locked by automated reviewer")
         if (
             payload.get("decision") == ReviewDecision.APPROVED.value

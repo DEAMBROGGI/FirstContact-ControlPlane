@@ -400,7 +400,14 @@ def sync_review_watch(
     last_delivery_id: str | None = None,
     state: str | None = None,
     codex_review_mode: str = "required",
+    reactivate_closed_unmerged: bool = False,
 ) -> ReviewWatchView:
+    if reactivate_closed_unmerged:
+        session.scalar(
+            select(PublicationRow)
+            .where(PublicationRow.id == publication_id)
+            .with_for_update()
+        )
     view = get_view(session, publication_id)
     if (
         view.pull_request_number is None
@@ -418,7 +425,15 @@ def sync_review_watch(
             }
         )
     )
-    row = session.get(ReviewWatchRow, publication_id)
+    if reactivate_closed_unmerged:
+        row = session.scalar(
+            select(ReviewWatchRow)
+            .where(ReviewWatchRow.publication_id == publication_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    else:
+        row = session.get(ReviewWatchRow, publication_id)
     generation_advanced = bool(
         row is not None
         and row.watched_head_sha != view.remote_head_sha
@@ -429,15 +444,22 @@ def sync_review_watch(
             remote_head_sha=view.remote_head_sha,
         )
     )
-    effective_state = (
-        state
-        if state is not None
-        else (
+    if state is not None:
+        effective_state = state
+    elif (
+        reactivate_closed_unmerged
+        and row is not None
+        and row.state == "CLOSED_UNMERGED"
+        and row.watched_head_sha == view.remote_head_sha
+        and not view.merge_policy_violation
+    ):
+        effective_state = "ACTIVE"
+    else:
+        effective_state = (
             None
             if generation_advanced
             else (row.state if row is not None else None)
         )
-    )
     if view.state is PublicationState.MERGED:
         next_role, next_action = _derive_next(
             session,
@@ -483,6 +505,12 @@ def sync_review_watch(
             row.expected_actors = list(actors)
         if state is not None:
             row.state = state
+        elif (
+            reactivate_closed_unmerged
+            and effective_state == "ACTIVE"
+            and row.state == "CLOSED_UNMERGED"
+        ):
+            row.state = "ACTIVE"
         elif head_changed:
             # A prior generation stays stale unless the append-only publication
             # history proves that Plane governed and published this new head.
@@ -715,6 +743,7 @@ class GitHubWebhookGateway:
         expected_actors: tuple[str, ...] = (),
         last_delivery_id: str | None = None,
         state: str | None = None,
+        reactivate_closed_unmerged: bool = False,
     ) -> ReviewWatchView:
         return sync_review_watch(
             session,
@@ -723,6 +752,7 @@ class GitHubWebhookGateway:
             last_delivery_id=last_delivery_id,
             state=state,
             codex_review_mode=self.codex_review_mode,
+            reactivate_closed_unmerged=reactivate_closed_unmerged,
         )
 
     def _requires_codex_adjudication(self, view) -> bool:
@@ -1303,6 +1333,8 @@ class GitHubWebhookGateway:
         last_delivery_id: str | None = None,
     ) -> str:
         view = get_view(session, publication_id)
+        if pull.merged:
+            return "PULL_MERGED"
         if pull.state.strip().lower() == "closed" and not pull.merged:
             self._sync_review_watch(
                 session,
@@ -1350,6 +1382,21 @@ class GitHubWebhookGateway:
         selected, decision = latest
 
         if view.state is not PublicationState.IN_REVIEW:
+            if (
+                decision is ReviewDecision.CHANGES_REQUIRED
+                and view.state in {
+                    PublicationState.APPROVED,
+                    PublicationState.READY_TO_MERGE,
+                }
+            ):
+                record_review(
+                    session,
+                    publication_id,
+                    reviewed_head_sha=selected.commit_id,
+                    decision=decision,
+                    require_codex_review=self._requires_codex_adjudication(view),
+                )
+                return "HUMAN_CHANGES_REQUIRED"
             if (
                 view.review_decision is decision
                 and view.remote_head_sha == selected.commit_id
@@ -1538,6 +1585,29 @@ class GitHubWebhookGateway:
                 state="CLOSED_UNMERGED",
             )
             return "PULL_CLOSED_UNMERGED"
+
+        if pull.merged:
+            try:
+                MergeCoordinator(
+                    token_provider=self.token_provider,
+                    github=self.github,
+                ).reconcile(session, publication_id)
+            except MergePolicyViolationRecorded:
+                return "MERGE_POLICY_VIOLATION"
+            except (MergeError, DomainError) as exc:
+                error = (
+                    "closed PR reconciliation failed closed"
+                    if row.event_name == "pull_request" and row.action == "closed"
+                    else "merged PR reconciliation failed closed"
+                )
+                raise GitHubWebhookError(
+                    error
+                ) from exc
+            return (
+                "PULL_CLOSED_RECONCILED"
+                if row.event_name == "pull_request" and row.action == "closed"
+                else "PULL_MERGED_RECONCILED"
+            )
 
         codex_unavailable = False
         if view.automated_review_status is AutomatedReviewStatus.RUNNING:
@@ -1845,12 +1915,19 @@ class GitHubWebhookGateway:
                 if mergeability_outcome != "MERGEABILITY_NOT_ELIGIBLE":
                     outcome = outcome + "+" + mergeability_outcome
             stale_outcome = outcome in {"STALE_HEAD", "STALE_BASE"} or outcome.endswith("+STALE_BASE")
+            reactivate_closed_unmerged = (
+                row.event_name == "pull_request"
+                and row.action == "reopened"
+                and not stale_outcome
+                and outcome != "PULL_CLOSED_UNMERGED"
+            )
             watch = self._sync_review_watch(
                 session,
                 publication_id,
                 expected_actors=self.expected_actors,
                 last_delivery_id=delivery_id,
                 state=("STALE" if stale_outcome else None),
+                reactivate_closed_unmerged=reactivate_closed_unmerged,
             )
             mark_delivery_processed(session, delivery_id)
             return WebhookProcessResult(

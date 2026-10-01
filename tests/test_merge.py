@@ -368,6 +368,31 @@ def test_merge_command_rejects_non_ready_unmerged_publication(session):
     assert get_view(session, approved.publication_id).state is PublicationState.APPROVED
 
 
+def test_merge_command_rejects_publication_after_changes_request(session):
+    ready = ready_publication(session)
+    demoted = record_review(
+        session,
+        ready.publication_id,
+        reviewed_head_sha=HEAD,
+        decision=ReviewDecision.CHANGES_REQUIRED,
+    )
+    assert demoted.state is PublicationState.CHANGES_REQUIRED
+    github = GitHub(
+        [pull(merged=False)],
+        merged_statuses=[False],
+    )
+    coordinator = MergeCoordinator(
+        token_provider=TokenProvider(),
+        github=github,
+    )
+
+    with pytest.raises(DomainError, match="READY_TO_MERGE"):
+        coordinator.merge(session, ready.publication_id)
+
+    assert get_view(session, ready.publication_id).state is PublicationState.CHANGES_REQUIRED
+    assert github.merge_calls == []
+
+
 def test_reconcile_rejects_stale_github_head(session):
     ready = ready_publication(session, issue_number=226)
     coordinator = MergeCoordinator(

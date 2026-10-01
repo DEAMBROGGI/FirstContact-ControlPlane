@@ -55,6 +55,7 @@ from control_plane.service import (
     mark_codex_review_unavailable,
     mark_remote_published,
     record_mergeability,
+    record_merge_policy_violation,
     record_review,
     record_validation,
     request_codex_review,
@@ -657,6 +658,50 @@ def test_out_of_policy_merged_pull_settles_delivery_and_blocks_watch(session):
     assert watch.next_action == "BLOCKED"
 
 
+def test_merged_approved_pull_cannot_record_mergeability(session):
+    view = complete_codex_pass(session, start_codex(session, published(session)))
+    record_review(
+        session,
+        view.publication_id,
+        reviewed_head_sha=HEAD,
+        decision=ReviewDecision.APPROVED,
+        require_codex_review=True,
+    )
+    github = FakeGitHub()
+    github.merged = True
+    github.mergeable = True
+    value = gateway(github)
+    body, signature = raw_delivery(
+        event_name="pull_request",
+        action="synchronize",
+    )
+    receipt = value.ingest(
+        session,
+        delivery_id="delivery-merged-approved-synchronize",
+        event_name="pull_request",
+        signature=signature,
+        body=body,
+    )
+
+    result = value.process_delivery(session, receipt.delivery_id)
+
+    current = get_view(session, view.publication_id)
+    mergeability_events = [
+        event
+        for event in load_events(session, view.publication_id)
+        if event["event_type"] == EventType.MERGEABILITY_RECORDED.value
+    ]
+    assert current.state is PublicationState.APPROVED
+    assert current.mergeable is None
+    assert current.merge_policy_violation is True
+    assert mergeability_events == []
+    assert result.outcome == "MERGE_POLICY_VIOLATION"
+    assert get_webhook_delivery(session, receipt.delivery_id).state == "PROCESSED"
+    watch = get_review_watch(session, view.publication_id)
+    assert watch.next_role == "CONTROL_PLANE"
+    assert watch.next_action == "BLOCKED"
+
+
 def test_merge_readback_error_keeps_delivery_retryable(session):
     view = published(session)
 
@@ -782,6 +827,148 @@ def test_closed_unmerged_pr_blocks_watch_and_later_human_approval(session):
         for event in load_events(session, view.publication_id)
         if event["event_type"] == EventType.REVIEW_RECORDED.value
     ]
+
+
+def test_closed_unmerged_pr_reopens_same_governed_watch(session):
+    view = published(session)
+    github = FakeGitHub()
+    github.closed = True
+    value = gateway(github)
+    closed_body, closed_signature = raw_delivery(
+        event_name="pull_request",
+        action="closed",
+    )
+    closed = value.ingest(
+        session,
+        delivery_id="delivery-reopen-close",
+        event_name="pull_request",
+        signature=closed_signature,
+        body=closed_body,
+    )
+    closed_result = value.process_delivery(session, closed.delivery_id)
+    assert closed_result.outcome == "PULL_CLOSED_UNMERGED"
+    assert get_review_watch(session, view.publication_id).state == "CLOSED_UNMERGED"
+
+    github.closed = False
+    reopened_body, reopened_signature = raw_delivery(
+        event_name="pull_request",
+        action="reopened",
+    )
+    reopened = value.ingest(
+        session,
+        delivery_id="delivery-reopen-open",
+        event_name="pull_request",
+        signature=reopened_signature,
+        body=reopened_body,
+    )
+
+    result = value.process_delivery(session, reopened.delivery_id)
+
+    watch = get_review_watch(session, view.publication_id)
+    assert result.outcome == "PULL_OBSERVED"
+    assert watch.state == "ACTIVE"
+    assert watch.next_role == "PROVIDER"
+    assert watch.next_action == "WAIT_PROVIDER"
+
+
+@pytest.mark.parametrize(
+    ("drift", "expected_outcome"),
+    [("head", "STALE_HEAD"), ("base", "STALE_BASE")],
+)
+def test_reopened_pr_with_stale_head_or_base_remains_blocked(
+    session,
+    drift,
+    expected_outcome,
+):
+    view = published(session)
+    github = FakeGitHub()
+    github.closed = True
+    value = gateway(github)
+    closed_body, closed_signature = raw_delivery(
+        event_name="pull_request",
+        action="closed",
+    )
+    closed = value.ingest(
+        session,
+        delivery_id=f"delivery-reopen-stale-close-{drift}",
+        event_name="pull_request",
+        signature=closed_signature,
+        body=closed_body,
+    )
+    value.process_delivery(session, closed.delivery_id)
+
+    github.closed = False
+    if drift == "head":
+        github.head_sha = "4" * 40
+    else:
+        github.ref_shas["master"] = "8" * 40
+    reopened_body, reopened_signature = raw_delivery(
+        event_name="pull_request",
+        action="reopened",
+    )
+    reopened = value.ingest(
+        session,
+        delivery_id=f"delivery-reopen-stale-open-{drift}",
+        event_name="pull_request",
+        signature=reopened_signature,
+        body=reopened_body,
+    )
+
+    result = value.process_delivery(session, reopened.delivery_id)
+
+    watch = get_review_watch(session, view.publication_id)
+    assert result.outcome == expected_outcome
+    assert watch.state == "STALE"
+    assert watch.next_role == "CONTROL_PLANE"
+    assert watch.next_action == "BLOCKED"
+
+
+def test_reopened_pr_does_not_clear_merge_policy_violation(session):
+    view = published(session)
+    github = FakeGitHub()
+    github.closed = True
+    value = gateway(github)
+    closed_body, closed_signature = raw_delivery(
+        event_name="pull_request",
+        action="closed",
+    )
+    closed = value.ingest(
+        session,
+        delivery_id="delivery-reopen-violation-close",
+        event_name="pull_request",
+        signature=closed_signature,
+        body=closed_body,
+    )
+    value.process_delivery(session, closed.delivery_id)
+    record_merge_policy_violation(
+        session,
+        view.publication_id,
+        head_sha=HEAD,
+        pull_request_number=44,
+        merge_commit_sha="9" * 40,
+    )
+
+    github.closed = False
+    reopened_body, reopened_signature = raw_delivery(
+        event_name="pull_request",
+        action="reopened",
+    )
+    reopened = value.ingest(
+        session,
+        delivery_id="delivery-reopen-violation-open",
+        event_name="pull_request",
+        signature=reopened_signature,
+        body=reopened_body,
+    )
+
+    value.process_delivery(session, reopened.delivery_id)
+
+    current = get_view(session, view.publication_id)
+    watch = get_review_watch(session, view.publication_id)
+    assert current.merge_policy_violation is True
+    assert watch.state == "CLOSED_UNMERGED"
+    assert watch.next_role == "CONTROL_PLANE"
+    assert watch.next_action == "BLOCKED"
 
 
 def test_verified_merge_completes_watch_after_unmerged_close(session):
@@ -1568,6 +1755,201 @@ def test_duplicate_human_review_delivery_does_not_duplicate_review_event(session
     assert len(review_events) == 1
     assert replay.outcome.startswith("HUMAN_APPROVED_ALREADY_RECORDED")
     assert get_webhook_delivery(session, second.delivery_id).state == "PROCESSED"
+
+
+@pytest.mark.parametrize("was_ready", [False, True])
+def test_later_exact_head_changes_request_revokes_approval_idempotently(
+    session,
+    was_ready,
+):
+    view = complete_codex_pass(session, start_codex(session, published(session)))
+    record_review(
+        session,
+        view.publication_id,
+        reviewed_head_sha=HEAD,
+        decision=ReviewDecision.APPROVED,
+        require_codex_review=True,
+    )
+    if was_ready:
+        record_mergeability(
+            session,
+            view.publication_id,
+            head_sha=HEAD,
+            mergeable=True,
+        )
+    gate_time = codex_gate_time(session, view)
+    github = FakeGitHub()
+    github.mergeable = True
+    github.reviews = [
+        PullReviewSnapshot(
+            review_id=901,
+            actor=HUMAN_ACTOR,
+            body="approved exact head",
+            state="APPROVED",
+            commit_id=HEAD,
+            submitted_at=(gate_time + timedelta(seconds=1)).isoformat(),
+        ),
+        PullReviewSnapshot(
+            review_id=902,
+            actor=HUMAN_ACTOR,
+            body="changes requested on exact head",
+            state="CHANGES_REQUESTED",
+            commit_id=HEAD,
+            submitted_at=(gate_time + timedelta(seconds=2)).isoformat(),
+        ),
+    ]
+    value = gateway(github)
+
+    def process_review(delivery_id):
+        body, signature = raw_delivery(
+            event_name="pull_request_review",
+            review_id=902,
+            review_actor=HUMAN_ACTOR,
+        )
+        receipt = value.ingest(
+            session,
+            delivery_id=delivery_id,
+            event_name="pull_request_review",
+            signature=signature,
+            body=body,
+        )
+        return value.process_delivery(session, receipt.delivery_id)
+
+    result = process_review(
+        f"delivery-changes-after-approval-{was_ready}-first"
+    )
+    replay = process_review(
+        f"delivery-changes-after-approval-{was_ready}-replay"
+    )
+
+    current = get_view(session, view.publication_id)
+    events = load_events(session, view.publication_id)
+    review_events = [
+        event
+        for event in events
+        if event["event_type"] == EventType.REVIEW_RECORDED.value
+    ]
+    assert current.state is PublicationState.CHANGES_REQUIRED
+    assert current.review_decision is ReviewDecision.CHANGES_REQUIRED
+    assert result.outcome == "HUMAN_CHANGES_REQUIRED"
+    assert replay.outcome == "HUMAN_CHANGES_REQUIRED_ALREADY_RECORDED"
+    assert [event["payload"]["decision"] for event in review_events] == [
+        ReviewDecision.APPROVED.value,
+        ReviewDecision.CHANGES_REQUIRED.value,
+    ]
+    assert sum(
+        event["event_type"] == EventType.MERGEABILITY_RECORDED.value
+        for event in events
+    ) == int(was_ready)
+    assert current.mergeable is (True if was_ready else None)
+    assert get_webhook_delivery(
+        session,
+        f"delivery-changes-after-approval-{was_ready}-first",
+    ).state == "PROCESSED"
+    assert get_webhook_delivery(
+        session,
+        f"delivery-changes-after-approval-{was_ready}-replay",
+    ).state == "PROCESSED"
+
+
+def test_stale_head_changes_request_does_not_revoke_approval(session):
+    view = complete_codex_pass(session, start_codex(session, published(session)))
+    record_review(
+        session,
+        view.publication_id,
+        reviewed_head_sha=HEAD,
+        decision=ReviewDecision.APPROVED,
+        require_codex_review=True,
+    )
+    github = FakeGitHub()
+    github.reviews = [
+        PullReviewSnapshot(
+            review_id=903,
+            actor=HUMAN_ACTOR,
+            body="stale changes request",
+            state="CHANGES_REQUESTED",
+            commit_id="4" * 40,
+            submitted_at="2026-09-30T12:10:00Z",
+        )
+    ]
+    value = gateway(github)
+    body, signature = raw_delivery(
+        event_name="pull_request_review",
+        review_id=903,
+        review_actor=HUMAN_ACTOR,
+    )
+    receipt = value.ingest(
+        session,
+        delivery_id="delivery-stale-changes-request",
+        event_name="pull_request_review",
+        signature=signature,
+        body=body,
+    )
+
+    result = value.process_delivery(session, receipt.delivery_id)
+
+    current = get_view(session, view.publication_id)
+    review_events = [
+        event
+        for event in load_events(session, view.publication_id)
+        if event["event_type"] == EventType.REVIEW_RECORDED.value
+    ]
+    assert result.outcome.startswith("STALE_HUMAN_REVIEW")
+    assert current.state is PublicationState.APPROVED
+    assert current.review_decision is ReviewDecision.APPROVED
+    assert len(review_events) == 1
+
+
+def test_stale_base_changes_request_does_not_revoke_approval(session):
+    view = complete_codex_pass(session, start_codex(session, published(session)))
+    record_review(
+        session,
+        view.publication_id,
+        reviewed_head_sha=HEAD,
+        decision=ReviewDecision.APPROVED,
+        require_codex_review=True,
+    )
+    github = FakeGitHub()
+    github.ref_shas["master"] = "8" * 40
+    github.reviews = [
+        PullReviewSnapshot(
+            review_id=904,
+            actor=HUMAN_ACTOR,
+            body="changes requested while base is stale",
+            state="CHANGES_REQUESTED",
+            commit_id=HEAD,
+            submitted_at="2026-09-30T12:10:00Z",
+        )
+    ]
+    value = gateway(github)
+    body, signature = raw_delivery(
+        event_name="pull_request_review",
+        review_id=904,
+        review_actor=HUMAN_ACTOR,
+    )
+    receipt = value.ingest(
+        session,
+        delivery_id="delivery-stale-base-changes-request",
+        event_name="pull_request_review",
+        signature=signature,
+        body=body,
+    )
+
+    result = value.process_delivery(session, receipt.delivery_id)
+
+    current = get_view(session, view.publication_id)
+    review_events = [
+        event
+        for event in load_events(session, view.publication_id)
+        if event["event_type"] == EventType.REVIEW_RECORDED.value
+    ]
+    watch = get_review_watch(session, view.publication_id)
+    assert result.outcome.startswith("STALE_BASE")
+    assert current.state is PublicationState.APPROVED
+    assert current.review_decision is ReviewDecision.APPROVED
+    assert len(review_events) == 1
+    assert watch.state == "STALE"
+    assert watch.next_action == "BLOCKED"
 
 
 def test_pull_request_synchronize_with_unrecorded_head_marks_watch_stale(session):
