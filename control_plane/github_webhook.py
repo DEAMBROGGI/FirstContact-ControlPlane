@@ -324,6 +324,25 @@ def list_pending_delivery_ids(session: Session) -> tuple[str, ...]:
     )
 
 
+def list_pending_delivery_ids_for_startup(
+    session: Session,
+    *,
+    limit: int,
+) -> tuple[str, ...]:
+    return tuple(
+        session.scalars(
+            select(GitHubWebhookDeliveryRow.delivery_id)
+            .where(GitHubWebhookDeliveryRow.state == "PENDING")
+            .order_by(
+                GitHubWebhookDeliveryRow.attempt_count,
+                GitHubWebhookDeliveryRow.received_at,
+                GitHubWebhookDeliveryRow.delivery_id,
+            )
+            .limit(limit)
+        )
+    )
+
+
 def _derive_next(
     session: Session,
     publication_id: str,
@@ -504,8 +523,7 @@ def sync_review_watch(
         row.review_run_id = view.automated_review_run_id
         row.provider = provider
         row.trigger_comment_id = view.automated_review_trigger_comment_id
-        if actors:
-            row.expected_actors = list(actors)
+        row.expected_actors = list(actors)
         if state is not None:
             row.state = state
         elif (
@@ -971,7 +989,15 @@ class GitHubWebhookGateway:
         publication_id: str,
     ) -> None:
         """Fail closed before accepting a direct Human Review write."""
-        self._assert_live_head_and_base(session, publication_id, action="human review")
+        pull = self._assert_live_head_and_base(
+            session,
+            publication_id,
+            action="human review",
+        )
+        if pull.merged:
+            raise DomainError(
+                "human review is blocked because the canonical PR is already merged"
+            )
 
     def assert_mergeability_write_current(
         self,
@@ -1751,6 +1777,28 @@ class GitHubWebhookGateway:
 
         return "HUMAN_NOT_ELIGIBLE"
 
+    def authorize_merge(
+        self,
+        session: Session,
+        publication_id: str,
+    ) -> None:
+        """Refresh authoritative review state and fence blocked generations."""
+        self.reconcile_publication(session, publication_id)
+        view = get_view(session, publication_id)
+        watch = get_review_watch(session, publication_id)
+        if (
+            watch.state in _BLOCKED_WATCH_STATES
+            or (
+                watch.next_role == "CONTROL_PLANE"
+                and watch.next_action == "BLOCKED"
+            )
+        ):
+            raise DomainError("governed merge is blocked by the current ReviewWatch")
+        if view.state is not PublicationState.READY_TO_MERGE:
+            raise DomainError(
+                "merge requires READY_TO_MERGE after authoritative review reconciliation"
+            )
+
     def reconcile_publication(
         self,
         session: Session,
@@ -2418,7 +2466,10 @@ class GitHubWebhookGateway:
         if limit <= 0:
             raise GitHubWebhookError("pending reconciliation limit must be positive")
         results = []
-        for delivery_id in list_pending_delivery_ids(session)[:limit]:
+        for delivery_id in list_pending_delivery_ids_for_startup(
+            session,
+            limit=limit,
+        ):
             try:
                 results.append(self.process_delivery(session, delivery_id))
             except (

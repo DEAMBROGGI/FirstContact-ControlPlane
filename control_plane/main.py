@@ -23,7 +23,7 @@ from .github_webhook import (
     get_review_watch,
     sync_review_watch,
 )
-from .merge import MergeCoordinator, MergeError
+from .merge import MergeCoordinator, MergeError, MergePolicyViolationRecorded
 from .profile_registry import all_profiles
 from .publisher import GitHubPublisher, PublicationError
 from .plane_review import (
@@ -838,6 +838,7 @@ def codex_review_reconcile(
                 *_configured_actors(settings.codex_review_actors),
                 *_configured_actors(settings.human_review_actors),
             ),
+            codex_review_mode=settings.codex_review_mode,
         )
         return {
             "observation": asdict(observation),
@@ -935,7 +936,12 @@ def github_webhook_reconcile(
         raise HTTPException(status_code=404, detail="webhook/publication not found") from exc
     except DomainError as exc:
         raise _conflict(exc) from exc
-    except GitHubWebhookError as exc:
+    except (
+        GitHubAuthError,
+        GitHubApiError,
+        CodexReviewError,
+        GitHubWebhookError,
+    ) as exc:
         raise HTTPException(status_code=502, detail="GitHub reconciliation failed closed") from exc
 
 
@@ -1069,8 +1075,10 @@ def merge_execute(
     publication_id: str,
     session: Session = Depends(get_session),
     coordinator: MergeCoordinator = Depends(get_merge_coordinator),
+    gateway: GitHubWebhookGateway = Depends(get_github_authoritative_gateway),
 ):
     try:
+        gateway.authorize_merge(session, publication_id)
         view = coordinator.merge(session, publication_id)
         _sync_publication_watch(session, publication_id)
         return _payload(view)
@@ -1078,6 +1086,16 @@ def merge_execute(
         raise HTTPException(status_code=404, detail="publication not found") from exc
     except DomainError as exc:
         raise _conflict(exc) from exc
+    except (
+        GitHubAuthError,
+        GitHubApiError,
+        CodexReviewError,
+        GitHubWebhookError,
+    ) as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="governed merge failed closed",
+        ) from exc
     except MergeError as exc:
         raise HTTPException(
             status_code=502,
@@ -1102,6 +1120,12 @@ def merge_reconcile(
         raise HTTPException(status_code=404, detail="publication not found") from exc
     except DomainError as exc:
         raise _conflict(exc) from exc
+    except MergePolicyViolationRecorded as exc:
+        _sync_publication_watch(session, publication_id)
+        raise HTTPException(
+            status_code=502,
+            detail="merge reconciliation failed closed",
+        ) from exc
     except MergeError as exc:
         raise HTTPException(
             status_code=502,

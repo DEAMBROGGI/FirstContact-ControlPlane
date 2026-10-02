@@ -3,6 +3,7 @@ import hashlib
 import hmac
 import json
 import threading
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 import pytest
@@ -14,7 +15,7 @@ import control_plane.main as main_module
 from control_plane.config import settings
 from control_plane.codex_review import CodexReviewError
 from control_plane.db import get_session
-from control_plane.domain import ValidationStatus
+from control_plane.domain import AutomatedReviewStatus, EventType, ValidationStatus
 from control_plane.github_api import GitHubApiError, PullRequestSnapshot
 from control_plane.github_app import GitHubAuthError
 from control_plane.github_webhook import (
@@ -32,9 +33,12 @@ from control_plane.models import GitHubWebhookDeliveryRow, ReviewWatchRow
 from control_plane.profile_registry import profile_for_repository
 from control_plane.publisher import PublicationError
 from control_plane.quarantine import VerifiedCandidateSource
+from control_plane.repository import load_events
 from control_plane.service import (
+    complete_codex_review,
     create_publication,
     mark_remote_published,
+    request_codex_review,
     record_validation,
     submit_verified_candidate,
 )
@@ -507,6 +511,37 @@ def test_internal_publication_reconcile_does_not_require_webhook_secret(
         app.dependency_overrides.clear()
 
 
+@pytest.mark.parametrize("error_type", [GitHubApiError, CodexReviewError])
+def test_internal_webhook_reconcile_sanitizes_provider_errors(
+    session,
+    error_type,
+):
+    internal_detail = "provider response includes private diagnostic detail"
+
+    class FailingGateway:
+        def reconcile_publication(self, *_args, **_kwargs):
+            raise error_type(internal_detail)
+
+    client = client_for_session(session)
+    app.dependency_overrides[get_github_authoritative_gateway] = (
+        lambda: FailingGateway()
+    )
+    try:
+        response = client.post(
+            "/api/v1/internal/github/webhooks/reconcile",
+            params={"publication_id": "provider-error-publication"},
+            headers={"X-Control-Plane-Token": settings.internal_token},
+        )
+
+        assert response.status_code == 502
+        assert response.json() == {
+            "detail": "GitHub reconciliation failed closed"
+        }
+        assert internal_detail not in response.text
+    finally:
+        app.dependency_overrides.clear()
+
+
 def test_direct_human_review_readback_does_not_require_webhook_secret(
     session,
     monkeypatch,
@@ -525,6 +560,112 @@ def test_direct_human_review_readback_does_not_require_webhook_secret(
         )
         assert reviewed.status_code == 200, reviewed.text
         assert reviewed.json()["review_decision"] == "CHANGES_REQUIRED"
+    finally:
+        app.dependency_overrides.clear()
+
+
+@pytest.mark.parametrize("decision", ["APPROVED", "CHANGES_REQUIRED"])
+def test_direct_human_review_rejects_merged_pull_without_recording_event(
+    session,
+    monkeypatch,
+    decision,
+):
+    configure_github_app_without_webhook_secret(monkeypatch)
+
+    class MergedApiGitHub(FakeApiGitHub):
+        def pull_request(self, repository, number, token):
+            pull = super().pull_request(repository, number, token)
+            return PullRequestSnapshot(
+                number=pull.number,
+                state="closed",
+                base_ref=pull.base_ref,
+                head_ref=pull.head_ref,
+                head_sha=pull.head_sha,
+                merged=True,
+                merge_commit_sha="4" * 40,
+            )
+
+    monkeypatch.setattr(
+        main_module,
+        "GitHubRepositoryGateway",
+        lambda **_kwargs: MergedApiGitHub(),
+    )
+    view = published_publication(session)
+    client = client_for_session(session)
+    try:
+        response = client.post(
+            f"/api/v1/publications/{view.publication_id}/reviews",
+            headers={"X-Control-Plane-Token": settings.internal_token},
+            json={"reviewed_head_sha": HEAD, "decision": decision},
+        )
+
+        assert response.status_code == 409
+        assert "already merged" in response.json()["detail"]
+        assert not any(
+            event["event_type"] == EventType.REVIEW_RECORDED.value
+            for event in load_events(session, view.publication_id)
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_role", "expected_action"),
+    [
+        ("advisory", "HUMAN_REVIEWER", "WAIT_HUMAN_REVIEW"),
+        ("required", "IMPLEMENTER", "REMEDIATE_FINDINGS"),
+    ],
+)
+def test_codex_review_reconcile_syncs_watch_using_configured_mode(
+    session,
+    monkeypatch,
+    mode,
+    expected_role,
+    expected_action,
+):
+    @dataclass(frozen=True)
+    class Observation:
+        outcome: str = "RECONCILED"
+
+    class Broker:
+        def reconcile(self, _session, _publication_id):
+            return Observation()
+
+    monkeypatch.setattr(settings, "codex_review_mode", mode)
+    monkeypatch.setattr(settings, "codex_review_actors", "CODEX")
+    monkeypatch.setattr(settings, "human_review_actors", "DEAMBROGGI")
+    view = published_publication(session)
+    requested = request_codex_review(
+        session,
+        view.publication_id,
+        mode=mode,
+        expected_head_sha=HEAD,
+    )
+    complete_codex_review(
+        session,
+        view.publication_id,
+        run_id=requested.automated_review_run_id,
+        reviewed_head_sha=HEAD,
+        result=AutomatedReviewStatus.CHANGES_REQUIRED,
+        findings=[{"path": "src/example.py", "line": 1, "body": "finding"}],
+        provider_review_ids=[1],
+        provider_comment_ids=[2],
+    )
+    client = client_for_session(session)
+    app.dependency_overrides[main_module.get_codex_review_broker] = lambda: Broker()
+    try:
+        response = client.post(
+            f"/api/v1/internal/publications/{view.publication_id}/codex-review/reconcile",
+            headers={"X-Control-Plane-Token": settings.internal_token},
+        )
+
+        assert response.status_code == 200, response.text
+        expected_state = "IN_REVIEW" if mode == "advisory" else "CHANGES_REQUIRED"
+        assert response.json()["publication"]["state"] == expected_state
+        watch = session.get(ReviewWatchRow, view.publication_id)
+        assert watch is not None
+        assert watch.next_role == expected_role
+        assert watch.next_action == expected_action
     finally:
         app.dependency_overrides.clear()
 

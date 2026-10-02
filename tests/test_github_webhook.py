@@ -33,6 +33,7 @@ from control_plane.github_webhook import (
     GitHubWebhookAuthError,
     GitHubWebhookError,
     GitHubWebhookGateway,
+    WebhookProcessResult,
     _lock_delivery_scope,
     get_review_watch,
     get_webhook_delivery,
@@ -1848,6 +1849,26 @@ def test_review_watch_reconstructs_provider_next_action_from_publication(session
         CODEX_ACTOR.lower(),
         HUMAN_ACTOR.lower(),
     }
+
+
+def test_review_watch_clears_actors_removed_from_configuration(session):
+    view = published(session)
+    sync_review_watch(
+        session,
+        view.publication_id,
+        expected_actors=(CODEX_ACTOR, HUMAN_ACTOR),
+    )
+
+    updated = sync_review_watch(
+        session,
+        view.publication_id,
+        expected_actors=(),
+    )
+
+    row = session.get(ReviewWatchRow, view.publication_id)
+    assert row is not None
+    assert updated.expected_actors == ()
+    assert row.expected_actors == []
 
 
 def test_stale_review_watch_is_fail_closed_even_when_publication_is_in_review(session):
@@ -4405,6 +4426,69 @@ def test_best_effort_pending_recovery_isolates_one_failed_delivery(session):
         == "simulated startup recovery failure"
     )
     assert get_webhook_delivery(session, "delivery-startup-good").state == "PROCESSED"
+
+
+def test_startup_pending_recovery_rotates_past_persistent_failures(session):
+    published(session)
+    value = gateway(FakeGitHub())
+    delivery_ids = (
+        "delivery-startup-starve-0",
+        "delivery-startup-starve-1",
+        "delivery-startup-starve-2",
+    )
+    first_received_at = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    for index, delivery_id in enumerate(delivery_ids):
+        body, signature = raw_delivery(
+            event_name="issue_comment",
+            comment_id=730 + index,
+        )
+        value.ingest(
+            session,
+            delivery_id=delivery_id,
+            event_name="issue_comment",
+            signature=signature,
+            body=body,
+        )
+        row = session.get(GitHubWebhookDeliveryRow, delivery_id)
+        assert row is not None
+        row.received_at = first_received_at + timedelta(seconds=index)
+    session.commit()
+
+    attempted = []
+
+    def flaky_process(supplied_session, delivery_id):
+        attempted.append(delivery_id)
+        if delivery_id in delivery_ids[:2]:
+            mark_delivery_retry(
+                supplied_session,
+                delivery_id,
+                "persistent startup recovery failure",
+            )
+            raise GitHubWebhookError("persistent startup recovery failure")
+        return WebhookProcessResult(
+            delivery_id=delivery_id,
+            publication_id=None,
+            outcome="RECOVERED",
+            next_role="NONE",
+            next_action="DONE",
+            watch_state=None,
+        )
+
+    value.process_delivery = flaky_process
+    value.reconcile_pending_best_effort(session, limit=2)
+    assert attempted == list(delivery_ids[:2])
+
+    attempted.clear()
+    recovered = value.reconcile_pending_best_effort(session, limit=2)
+
+    assert attempted[0] == delivery_ids[2]
+    assert recovered[0].delivery_id == delivery_ids[2]
+    assert get_webhook_delivery(session, delivery_ids[0]).attempt_count == 2
+    assert get_webhook_delivery(session, delivery_ids[0]).state == "PENDING"
+    assert (
+        get_webhook_delivery(session, delivery_ids[0]).last_error
+        == "persistent startup recovery failure"
+    )
 
 
 def test_pending_reconciliation_reports_failure_and_continues(session):
