@@ -56,16 +56,17 @@ class NoRemoteGitHub:
     pass
 
 
-def client_for(session):
-    gateway = GitHubWebhookGateway(
-        token_provider=NoRemoteTokenProvider(),
-        github=NoRemoteGitHub(),
-        codex_review_mode="required",
-        codex_actors=("chatgpt-codex-connector[bot]",),
-        human_review_actors=("DEAMBROGGI",),
-        webhook_secret=SECRET,
-        maximum_payload_bytes=1024 * 1024,
-    )
+def client_for(session, gateway=None):
+    if gateway is None:
+        gateway = GitHubWebhookGateway(
+            token_provider=NoRemoteTokenProvider(),
+            github=NoRemoteGitHub(),
+            codex_review_mode="required",
+            codex_actors=("chatgpt-codex-connector[bot]",),
+            human_review_actors=("DEAMBROGGI",),
+            webhook_secret=SECRET,
+            maximum_payload_bytes=1024 * 1024,
+        )
 
     def override_session():
         yield session
@@ -193,32 +194,114 @@ def signed_body():
     return body, signature
 
 
+def signed_push_body():
+    body = json.dumps(
+        {
+            "ref": "refs/heads/master",
+            "after": BASE,
+            "repository": {"full_name": REPOSITORY},
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    signature = "sha256=" + hmac.new(
+        SECRET.encode("utf-8"),
+        body,
+        hashlib.sha256,
+    ).hexdigest()
+    return body, signature
+
+
 def test_public_webhook_endpoint_requires_signature_not_internal_token(session):
     client = client_for(session)
     body, signature = signed_body()
+    headers = {
+        "Content-Type": "application/json",
+        "X-Hub-Signature-256": signature,
+        "X-GitHub-Delivery": "api-delivery-1",
+        "X-GitHub-Event": "ping",
+    }
     try:
         accepted = client.post(
             "/api/v1/github/webhooks",
             content=body,
-            headers={
-                "Content-Type": "application/json",
-                "X-Hub-Signature-256": signature,
-                "X-GitHub-Delivery": "api-delivery-1",
-                "X-GitHub-Event": "ping",
-            },
+            headers=headers,
         )
         assert accepted.status_code == 200, accepted.text
-        assert accepted.json()["delivery"]["state"] == "IGNORED"
+        delivery = accepted.json()["delivery"]
+        assert delivery["state"] == "IGNORED"
+        assert delivery["attempt_count"] == 0
+        assert delivery["processed_at"] is None
         assert accepted.json()["processing"]["outcome"] == "IGNORED"
 
         row = session.get(GitHubWebhookDeliveryRow, "api-delivery-1")
         assert row is not None
         assert row.state == "IGNORED"
 
+        replay = client.post(
+            "/api/v1/github/webhooks",
+            content=body,
+            headers=headers,
+        )
+        assert replay.status_code == 200, replay.text
+        assert replay.json()["delivery"] == delivery
+        assert replay.json()["processing"]["outcome"] == "IGNORED"
+
         unauthorized_reconcile = client.post(
             "/api/v1/internal/github/webhooks/reconcile",
         )
         assert unauthorized_reconcile.status_code == 401
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_public_webhook_returns_post_processing_state_and_idempotent_replay(session):
+    gateway = GitHubWebhookGateway(
+        token_provider=FakeApiTokenProvider(),
+        github=FakeApiGitHub(),
+        codex_review_mode="required",
+        codex_actors=("chatgpt-codex-connector[bot]",),
+        human_review_actors=("DEAMBROGGI",),
+        webhook_secret=SECRET,
+        maximum_payload_bytes=1024 * 1024,
+    )
+    client = client_for(session, gateway)
+    body, signature = signed_push_body()
+    headers = {
+        "Content-Type": "application/json",
+        "X-Hub-Signature-256": signature,
+        "X-GitHub-Delivery": "api-processed-push-1",
+        "X-GitHub-Event": "push",
+    }
+    try:
+        accepted = client.post(
+            "/api/v1/github/webhooks",
+            content=body,
+            headers=headers,
+        )
+        assert accepted.status_code == 200, accepted.text
+        delivery = accepted.json()["delivery"]
+        assert delivery["state"] == "PROCESSED"
+        assert delivery["attempt_count"] == 1
+        assert delivery["processed_at"] is not None
+        assert accepted.json()["processing"]["outcome"] == (
+            "BASE_PUSH_STALE:0:RECOVERED:0"
+        )
+
+        replay = client.post(
+            "/api/v1/github/webhooks",
+            content=body,
+            headers=headers,
+        )
+        assert replay.status_code == 200, replay.text
+        assert replay.json()["delivery"] == delivery
+        assert replay.json()["processing"]["outcome"] == "PROCESSED"
+
+        row = session.get(GitHubWebhookDeliveryRow, "api-processed-push-1")
+        assert row is not None
+        assert row.state == "PROCESSED"
+        assert row.attempt_count == 1
+        assert row.processed_at is not None
     finally:
         app.dependency_overrides.clear()
 
@@ -370,6 +453,8 @@ def test_public_webhook_sanitizes_retryable_processing_errors(
         row = session.get(GitHubWebhookDeliveryRow, delivery_id)
         assert row is not None
         assert row.state == "PENDING"
+        assert row.attempt_count == 1
+        assert row.processed_at is None
     finally:
         app.dependency_overrides.clear()
 

@@ -19,6 +19,7 @@ from .github_webhook import (
     GitHubWebhookAuthError,
     GitHubWebhookError,
     GitHubWebhookGateway,
+    get_webhook_delivery,
     get_review_watch,
     sync_review_watch,
 )
@@ -893,8 +894,9 @@ async def github_webhook_receive(
             session,
             receipt.delivery_id,
         )
+        delivery = get_webhook_delivery(session, receipt.delivery_id)
         return {
-            "delivery": asdict(receipt),
+            "delivery": asdict(delivery),
             "processing": asdict(processing),
         }
     except DomainError as exc:

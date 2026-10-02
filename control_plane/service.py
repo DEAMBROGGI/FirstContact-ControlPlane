@@ -615,6 +615,7 @@ def record_review(
     reviewed_head_sha: str,
     decision: ReviewDecision,
     require_codex_review: bool = False,
+    github_review_id: int | None = None,
 ) -> PublicationView:
     view = _locked_publication_view(session, publication_id)
     if decision is ReviewDecision.APPROVED:
@@ -642,6 +643,8 @@ def record_review(
         "reviewed_head_sha": _sha(reviewed_head_sha, "reviewed_head_sha"),
         "decision": decision.value,
     }
+    if github_review_id is not None:
+        payload["github_review_id"] = github_review_id
     if required_adjudication is not None:
         payload["required_review_adjudication"] = required_adjudication
     validate_transition(view, EventType.REVIEW_RECORDED, payload)

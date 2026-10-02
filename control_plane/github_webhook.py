@@ -1263,6 +1263,43 @@ class GitHubWebhookGateway:
         )
         return selected, decision
 
+    def _effective_active_human_approvals(
+        self,
+        reviews,
+        *,
+        head_sha: str,
+        submitted_after: datetime | None = None,
+    ):
+        latest_by_actor = {}
+        ambiguous_actors = set()
+        submitted_reviews = []
+        for item in reviews:
+            actor = _normalize_actor(item.actor)
+            if actor not in self.human_review_actors:
+                continue
+            review_state = item.state.strip().upper()
+            if review_state == "PENDING" and item.submitted_at is None:
+                continue
+            submitted_at = _parse_time(item.submitted_at)
+            if submitted_at is None:
+                ambiguous_actors.add(actor)
+                continue
+            submitted_reviews.append((submitted_at, item.review_id, actor, item))
+
+        submitted_reviews.sort(key=lambda item: (item[0], item[1]))
+        for submitted_at, _review_id, actor, item in submitted_reviews:
+            if actor not in ambiguous_actors:
+                latest_by_actor[actor] = (submitted_at, item)
+
+        return tuple(
+            item
+            for actor, (submitted_at, item) in latest_by_actor.items()
+            if actor not in ambiguous_actors
+            and item.commit_id == head_sha
+            and item.state.strip().upper() == "APPROVED"
+            and (submitted_after is None or submitted_at > submitted_after)
+        )
+
     def _human_review_from_payload(
         self,
         session: Session,
@@ -1300,7 +1337,56 @@ class GitHubWebhookGateway:
             return "NON_HUMAN_REVIEW_ACTOR"
         if receipt.commit_id != view.remote_head_sha:
             return "STALE_HUMAN_REVIEW"
-        if receipt.state.strip().upper() not in {
+        review_state = receipt.state.strip().upper()
+        if review_state == "DISMISSED":
+            if (
+                view.state in {
+                    PublicationState.APPROVED,
+                    PublicationState.READY_TO_MERGE,
+                }
+                and view.review_decision is ReviewDecision.APPROVED
+            ):
+                submitted_after = None
+                has_required_adjudication = True
+                if self._requires_codex_adjudication(view):
+                    adjudication = required_review_adjudication(
+                        session,
+                        publication_id,
+                    )
+                    has_required_adjudication = adjudication is not None
+                    if adjudication is not None:
+                        submitted_after = _required_adjudication_time(
+                            session,
+                            publication_id,
+                            adjudication,
+                        )
+                active_approvals = (
+                    self._effective_active_human_approvals(
+                        reviews,
+                        head_sha=view.remote_head_sha,
+                        submitted_after=submitted_after,
+                    )
+                    if has_required_adjudication
+                    else ()
+                )
+                if active_approvals:
+                    return "HUMAN_APPROVAL_REMAINS"
+                record_review(
+                    session,
+                    publication_id,
+                    reviewed_head_sha=receipt.commit_id,
+                    decision=ReviewDecision.CHANGES_REQUIRED,
+                    require_codex_review=self._requires_codex_adjudication(view),
+                    github_review_id=receipt.review_id,
+                )
+                return "HUMAN_CHANGES_REQUIRED"
+            if (
+                view.state is PublicationState.CHANGES_REQUIRED
+                and view.review_decision is ReviewDecision.CHANGES_REQUIRED
+            ):
+                return "HUMAN_CHANGES_REQUIRED_ALREADY_RECORDED"
+            return "NON_DECISION_HUMAN_REVIEW"
+        if review_state not in {
             "APPROVED",
             "CHANGES_REQUESTED",
             "REQUEST_CHANGES",
@@ -1395,6 +1481,7 @@ class GitHubWebhookGateway:
                     reviewed_head_sha=selected.commit_id,
                     decision=decision,
                     require_codex_review=self._requires_codex_adjudication(view),
+                    github_review_id=selected.review_id,
                 )
                 return "HUMAN_CHANGES_REQUIRED"
             if (
@@ -1429,6 +1516,7 @@ class GitHubWebhookGateway:
             reviewed_head_sha=selected.commit_id,
             decision=decision,
             require_codex_review=self._requires_codex_adjudication(view),
+            github_review_id=selected.review_id,
         )
         return "HUMAN_" + decision.value
 
@@ -1758,10 +1846,30 @@ class GitHubWebhookGateway:
                 stale += 1
                 continue
 
+            if watch_row.state != "STALE":
+                continue
+            if watch_row.watched_head_sha != view.remote_head_sha:
+                stale += 1
+                continue
+            if view.merge_policy_violation:
+                stale += 1
+                continue
+
+            pull = self._read_pull(view, access.token)
             if (
-                watch_row.state == "STALE"
-                and watch_row.watched_head_sha == view.remote_head_sha
+                pull.head_sha != view.remote_head_sha
+                or pull.state.strip().lower() != "open"
+                or pull.merged
             ):
+                watch_row.state = "STALE"
+                watch_row.next_role = "CONTROL_PLANE"
+                watch_row.next_action = "BLOCKED"
+                watch_row.last_delivery_id = row.delivery_id
+                watch_row.last_reconciled_at = _utcnow()
+                stale += 1
+                continue
+
+            if watch_row.state == "STALE":
                 watch_row.state = "ACTIVE"
                 watch_row.next_role, watch_row.next_action = _derive_next(
                     session,
@@ -1827,7 +1935,17 @@ class GitHubWebhookGateway:
             )
 
         if row.event_name == "push":
-            outcome = self._process_push(session, row)
+            try:
+                outcome = self._process_push(session, row)
+            except (
+                DomainError,
+                GitHubAuthError,
+                GitHubApiError,
+                GitHubWebhookError,
+            ) as exc:
+                session.rollback()
+                mark_delivery_retry(session, delivery_id, str(exc))
+                raise
             mark_delivery_processed(session, delivery_id)
             stale_count = 0
             if outcome.startswith("BASE_PUSH_STALE:"):
