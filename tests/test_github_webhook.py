@@ -285,6 +285,21 @@ def process_human_review_delivery(
     return value.process_delivery(session, receipt.delivery_id)
 
 
+def process_closed_unmerged_pr_delivery(session, value, *, delivery_id):
+    body, signature = raw_delivery(
+        event_name="pull_request",
+        action="closed",
+    )
+    receipt = value.ingest(
+        session,
+        delivery_id=delivery_id,
+        event_name="pull_request",
+        signature=signature,
+        body=body,
+    )
+    return value.process_delivery(session, receipt.delivery_id)
+
+
 def process_base_push_delivery(
     session,
     value,
@@ -988,6 +1003,96 @@ def test_reopened_pr_with_stale_head_or_base_remains_blocked(
     assert watch.next_action == "BLOCKED"
 
 
+def test_reconciliation_recovers_missed_reopen_for_same_governed_watch(session):
+    view = published(session)
+    github = FakeGitHub()
+    value = gateway(github)
+    github.closed = True
+
+    closed_result = process_closed_unmerged_pr_delivery(
+        session,
+        value,
+        delivery_id="delivery-reconcile-reopen-close",
+    )
+    assert closed_result.watch_state == "CLOSED_UNMERGED"
+    assert get_review_watch(session, view.publication_id).state == "CLOSED_UNMERGED"
+
+    github.closed = False
+    result = value.reconcile_publication(session, view.publication_id)
+
+    watch = get_review_watch(session, view.publication_id)
+    assert result.outcome == "RECONCILED"
+    assert result.watch_state == "ACTIVE"
+    assert watch.state == "ACTIVE"
+    assert watch.next_role == "PROVIDER"
+    assert watch.next_action == "WAIT_PROVIDER"
+
+
+@pytest.mark.parametrize(
+    ("drift", "expected_outcome"),
+    [("head", "STALE_HEAD"), ("base", "STALE_BASE")],
+)
+def test_reconciliation_does_not_reopen_closed_watch_with_head_or_base_drift(
+    session,
+    drift,
+    expected_outcome,
+):
+    view = published(session)
+    github = FakeGitHub()
+    value = gateway(github)
+    github.closed = True
+    process_closed_unmerged_pr_delivery(
+        session,
+        value,
+        delivery_id=f"delivery-reconcile-reopen-close-{drift}",
+    )
+
+    github.closed = False
+    if drift == "head":
+        github.head_sha = "4" * 40
+    else:
+        github.ref_shas["master"] = "8" * 40
+    result = value.reconcile_publication(session, view.publication_id)
+
+    watch = get_review_watch(session, view.publication_id)
+    assert result.outcome == expected_outcome
+    assert watch.state == "STALE"
+    assert watch.next_role == "CONTROL_PLANE"
+    assert watch.next_action == "BLOCKED"
+
+
+def test_reconciliation_does_not_reopen_closed_watch_with_merge_policy_violation(
+    session,
+):
+    view = published(session)
+    github = FakeGitHub()
+    value = gateway(github)
+    github.closed = True
+    process_closed_unmerged_pr_delivery(
+        session,
+        value,
+        delivery_id="delivery-reconcile-reopen-violation-close",
+    )
+    record_merge_policy_violation(
+        session,
+        view.publication_id,
+        head_sha=HEAD,
+        pull_request_number=44,
+        merge_commit_sha="9" * 40,
+    )
+
+    github.closed = False
+    result = value.reconcile_publication(session, view.publication_id)
+
+    current = get_view(session, view.publication_id)
+    watch = get_review_watch(session, view.publication_id)
+    assert result.watch_state == "CLOSED_UNMERGED"
+    assert current.merge_policy_violation is True
+    assert watch.state == "CLOSED_UNMERGED"
+    assert watch.next_role == "CONTROL_PLANE"
+    assert watch.next_action == "BLOCKED"
+
+
 def test_reopened_pr_does_not_clear_merge_policy_violation(session):
     view = published(session)
     github = FakeGitHub()
@@ -1089,6 +1194,51 @@ def test_verified_merge_completes_watch_after_unmerged_close(session):
     watch = get_review_watch(session, view.publication_id)
     assert watch.state == "DONE"
     assert watch.next_role == "NONE"
+    assert watch.next_action == "DONE"
+
+
+def test_full_reconciliation_does_not_reopen_a_merged_closed_watch(session):
+    view = complete_codex_pass(session, start_codex(session, published(session)))
+    gate_time = codex_gate_time(session, view)
+    github = FakeGitHub()
+    github.reviews = [
+        PullReviewSnapshot(
+            review_id=995,
+            actor=HUMAN_ACTOR,
+            body="exact-head approval",
+            state="APPROVED",
+            commit_id=HEAD,
+            submitted_at=(gate_time + timedelta(seconds=1)).isoformat(),
+        )
+    ]
+    value = gateway(github)
+    process_human_review_delivery(
+        session,
+        value,
+        delivery_id="delivery-reconcile-merged-watch-approval",
+        review_id=995,
+    )
+    record_mergeability(
+        session,
+        view.publication_id,
+        head_sha=HEAD,
+        mergeable=True,
+    )
+    github.closed = True
+    process_closed_unmerged_pr_delivery(
+        session,
+        value,
+        delivery_id="delivery-reconcile-merged-watch-close",
+    )
+
+    github.merged = True
+    result = value.reconcile_publication(session, view.publication_id)
+
+    current = get_view(session, view.publication_id)
+    watch = get_review_watch(session, view.publication_id)
+    assert result.outcome == "RECONCILED"
+    assert current.state is PublicationState.MERGED
+    assert watch.state == "DONE"
     assert watch.next_action == "DONE"
 
 
@@ -2329,6 +2479,322 @@ def test_later_nonapproval_supersedes_historical_exact_head_approval(
         ReviewDecision.APPROVED.value,
         ReviewDecision.CHANGES_REQUIRED.value,
     ]
+
+
+@pytest.mark.parametrize("was_ready", [False, True])
+def test_full_reconcile_revokes_approval_after_lost_dismissal(session, was_ready):
+    view = complete_codex_pass(session, start_codex(session, published(session)))
+    gate_time = codex_gate_time(session, view)
+    github = FakeGitHub()
+    github.reviews = [
+        PullReviewSnapshot(
+            review_id=960,
+            actor=HUMAN_ACTOR,
+            body="recorded exact-head approval",
+            state="APPROVED",
+            commit_id=HEAD,
+            submitted_at=(gate_time + timedelta(seconds=1)).isoformat(),
+        )
+    ]
+    value = gateway(github)
+    process_human_review_delivery(
+        session,
+        value,
+        delivery_id="delivery-reconcile-lost-dismissal-approval",
+        review_id=960,
+    )
+    if was_ready:
+        record_mergeability(
+            session,
+            view.publication_id,
+            head_sha=HEAD,
+            mergeable=True,
+        )
+
+    github.reviews = [
+        PullReviewSnapshot(
+            review_id=960,
+            actor=HUMAN_ACTOR,
+            body="dismissed exact-head approval",
+            state="DISMISSED",
+            commit_id=HEAD,
+            submitted_at=(gate_time + timedelta(seconds=1)).isoformat(),
+        )
+    ]
+    result = value.reconcile_publication(session, view.publication_id)
+
+    current = get_view(session, view.publication_id)
+    review_events = [
+        event
+        for event in load_events(session, view.publication_id)
+        if event["event_type"] == EventType.REVIEW_RECORDED.value
+    ]
+    assert result.outcome == "RECONCILED"
+    assert current.state is PublicationState.CHANGES_REQUIRED
+    assert current.review_decision is ReviewDecision.CHANGES_REQUIRED
+    assert [event["payload"]["decision"] for event in review_events] == [
+        ReviewDecision.APPROVED.value,
+        ReviewDecision.CHANGES_REQUIRED.value,
+    ]
+    assert [event["payload"]["github_review_id"] for event in review_events] == [
+        960,
+        960,
+    ]
+
+
+@pytest.mark.parametrize(
+    ("dismissed_review_present", "expected_review_id"),
+    [(True, 1001), (False, None)],
+)
+def test_full_reconcile_revocation_provenance_requires_attributable_dismissal(
+    session,
+    dismissed_review_present,
+    expected_review_id,
+):
+    view = complete_codex_pass(session, start_codex(session, published(session)))
+    gate_time = codex_gate_time(session, view)
+    github = FakeGitHub()
+    github.reviews = [
+        PullReviewSnapshot(
+            review_id=1000,
+            actor=HUMAN_ACTOR,
+            body="pre-adjudication approval",
+            state="APPROVED",
+            commit_id=HEAD,
+            submitted_at=(gate_time - timedelta(seconds=1)).isoformat(),
+        ),
+        PullReviewSnapshot(
+            review_id=1001,
+            actor=SECOND_HUMAN_ACTOR,
+            body="post-adjudication approval",
+            state="APPROVED",
+            commit_id=HEAD,
+            submitted_at=(gate_time + timedelta(seconds=1)).isoformat(),
+        ),
+    ]
+    value = gateway(
+        github,
+        human_actors=(HUMAN_ACTOR, SECOND_HUMAN_ACTOR),
+    )
+    approval_result = process_human_review_delivery(
+        session,
+        value,
+        delivery_id="delivery-reconcile-provenance-approval",
+        review_id=1001,
+        review_actor=SECOND_HUMAN_ACTOR,
+    )
+    assert approval_result.outcome.startswith("HUMAN_APPROVED")
+    assert get_view(session, view.publication_id).state is PublicationState.APPROVED
+
+    github.reviews = [
+        PullReviewSnapshot(
+            review_id=1000,
+            actor=HUMAN_ACTOR,
+            body="pre-adjudication approval",
+            state="APPROVED",
+            commit_id=HEAD,
+            submitted_at=(gate_time - timedelta(seconds=1)).isoformat(),
+        ),
+    ]
+    if dismissed_review_present:
+        github.reviews.append(
+            PullReviewSnapshot(
+                review_id=1001,
+                actor=SECOND_HUMAN_ACTOR,
+                body="dismissed post-adjudication approval",
+                state="DISMISSED",
+                commit_id=HEAD,
+                submitted_at=(gate_time + timedelta(seconds=1)).isoformat(),
+            )
+        )
+    result = value.reconcile_publication(session, view.publication_id)
+
+    current = get_view(session, view.publication_id)
+    review_events = [
+        event
+        for event in load_events(session, view.publication_id)
+        if event["event_type"] == EventType.REVIEW_RECORDED.value
+    ]
+    revocation_events = [
+        event
+        for event in review_events
+        if event["payload"]["decision"] == ReviewDecision.CHANGES_REQUIRED.value
+    ]
+    assert result.outcome == "RECONCILED"
+    assert current.state is PublicationState.CHANGES_REQUIRED
+    assert len(revocation_events) == 1
+    if expected_review_id is None:
+        assert "github_review_id" not in revocation_events[0]["payload"]
+    else:
+        assert revocation_events[0]["payload"]["github_review_id"] == expected_review_id
+        assert revocation_events[0]["payload"]["github_review_id"] != 1000
+
+
+def test_full_reconcile_keeps_approval_when_another_reviewer_remains_active(session):
+    view = complete_codex_pass(session, start_codex(session, published(session)))
+    gate_time = codex_gate_time(session, view)
+    github = FakeGitHub()
+    github.reviews = [
+        PullReviewSnapshot(
+            review_id=970,
+            actor=HUMAN_ACTOR,
+            body="recorded exact-head approval",
+            state="APPROVED",
+            commit_id=HEAD,
+            submitted_at=(gate_time + timedelta(seconds=1)).isoformat(),
+        )
+    ]
+    value = gateway(
+        github,
+        human_actors=(HUMAN_ACTOR, SECOND_HUMAN_ACTOR),
+    )
+    process_human_review_delivery(
+        session,
+        value,
+        delivery_id="delivery-reconcile-other-approval-recorded",
+        review_id=970,
+    )
+
+    github.reviews = [
+        PullReviewSnapshot(
+            review_id=970,
+            actor=HUMAN_ACTOR,
+            body="dismissed exact-head approval",
+            state="DISMISSED",
+            commit_id=HEAD,
+            submitted_at=(gate_time + timedelta(seconds=1)).isoformat(),
+        ),
+        PullReviewSnapshot(
+            review_id=971,
+            actor=SECOND_HUMAN_ACTOR,
+            body="active exact-head approval",
+            state="APPROVED",
+            commit_id=HEAD,
+            submitted_at=(gate_time + timedelta(seconds=2)).isoformat(),
+        ),
+    ]
+    result = value.reconcile_publication(session, view.publication_id)
+
+    current = get_view(session, view.publication_id)
+    review_events = [
+        event
+        for event in load_events(session, view.publication_id)
+        if event["event_type"] == EventType.REVIEW_RECORDED.value
+    ]
+    assert result.outcome == "RECONCILED"
+    assert current.state is PublicationState.APPROVED
+    assert current.review_decision is ReviewDecision.APPROVED
+    assert len(review_events) == 1
+    assert review_events[0]["payload"]["github_review_id"] == 970
+
+
+def test_comment_and_other_reviewer_dismissal_do_not_erase_active_approval(session):
+    view = complete_codex_pass(session, start_codex(session, published(session)))
+    gate_time = codex_gate_time(session, view)
+    github = FakeGitHub()
+    github.reviews = [
+        PullReviewSnapshot(
+            review_id=980,
+            actor=HUMAN_ACTOR,
+            body="recorded exact-head approval",
+            state="APPROVED",
+            commit_id=HEAD,
+            submitted_at=(gate_time + timedelta(seconds=1)).isoformat(),
+        )
+    ]
+    value = gateway(
+        github,
+        human_actors=(HUMAN_ACTOR, SECOND_HUMAN_ACTOR),
+    )
+    process_human_review_delivery(
+        session,
+        value,
+        delivery_id="delivery-reconcile-comment-approval-recorded",
+        review_id=980,
+    )
+
+    github.reviews = [
+        PullReviewSnapshot(
+            review_id=980,
+            actor=HUMAN_ACTOR,
+            body="original exact-head approval",
+            state="APPROVED",
+            commit_id=HEAD,
+            submitted_at=(gate_time + timedelta(seconds=1)).isoformat(),
+        ),
+        PullReviewSnapshot(
+            review_id=981,
+            actor=SECOND_HUMAN_ACTOR,
+            body="dismissed approval",
+            state="DISMISSED",
+            commit_id=HEAD,
+            submitted_at=(gate_time + timedelta(seconds=2)).isoformat(),
+        ),
+        PullReviewSnapshot(
+            review_id=982,
+            actor=HUMAN_ACTOR,
+            body="non-decision comment review",
+            state="COMMENTED",
+            commit_id=HEAD,
+            submitted_at=(gate_time + timedelta(seconds=3)).isoformat(),
+        ),
+    ]
+    active_approvals = value._effective_active_human_approvals(
+        github.reviews,
+        head_sha=HEAD,
+        submitted_after=gate_time,
+    )
+    result = value.reconcile_publication(session, view.publication_id)
+
+    current = get_view(session, view.publication_id)
+    review_events = [
+        event
+        for event in load_events(session, view.publication_id)
+        if event["event_type"] == EventType.REVIEW_RECORDED.value
+    ]
+    assert {item.review_id for item in active_approvals} == {980}
+    assert result.outcome == "RECONCILED"
+    assert current.state is PublicationState.APPROVED
+    assert current.review_decision is ReviewDecision.APPROVED
+    assert len(review_events) == 1
+
+
+def test_comment_does_not_supersede_changes_requested_review(session):
+    view = complete_codex_pass(session, start_codex(session, published(session)))
+    gate_time = codex_gate_time(session, view)
+    github = FakeGitHub()
+    github.reviews = [
+        PullReviewSnapshot(
+            review_id=990,
+            actor=HUMAN_ACTOR,
+            body="request changes",
+            state="CHANGES_REQUESTED",
+            commit_id=HEAD,
+            submitted_at=(gate_time + timedelta(seconds=1)).isoformat(),
+        ),
+        PullReviewSnapshot(
+            review_id=991,
+            actor=HUMAN_ACTOR,
+            body="later non-decision comment",
+            state="COMMENTED",
+            commit_id=HEAD,
+            submitted_at=(gate_time + timedelta(seconds=2)).isoformat(),
+        ),
+    ]
+
+    result = gateway(github).reconcile_publication(session, view.publication_id)
+
+    current = get_view(session, view.publication_id)
+    review_events = [
+        event
+        for event in load_events(session, view.publication_id)
+        if event["event_type"] == EventType.REVIEW_RECORDED.value
+    ]
+    assert result.outcome == "RECONCILED"
+    assert current.state is PublicationState.CHANGES_REQUIRED
+    assert current.review_decision is ReviewDecision.CHANGES_REQUIRED
+    assert len(review_events) == 1
+    assert review_events[0]["payload"]["github_review_id"] == 990
 
 
 def test_stale_head_changes_request_does_not_revoke_approval(session):

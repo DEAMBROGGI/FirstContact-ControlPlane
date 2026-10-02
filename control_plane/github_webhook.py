@@ -1222,17 +1222,19 @@ class GitHubWebhookGateway:
         view,
         *,
         token: str,
+        reviews=None,
     ):
         if not self.human_review_actors:
             return None
         if view.pull_request_number is None or view.remote_head_sha is None:
             raise GitHubWebhookError("human review publication metadata is incomplete")
 
-        reviews = self.github.list_pull_reviews(
-            view.repository,
-            view.pull_request_number,
-            token,
-        )
+        if reviews is None:
+            reviews = self.github.list_pull_reviews(
+                view.repository,
+                view.pull_request_number,
+                token,
+            )
         candidates = [
             item
             for item in reviews
@@ -1263,6 +1265,44 @@ class GitHubWebhookGateway:
         )
         return selected, decision
 
+    def _dismissed_recorded_approval_id(
+        self,
+        session: Session,
+        publication_id: str,
+        reviews,
+        *,
+        head_sha: str,
+    ) -> int | None:
+        approval_payload = next(
+            (
+                event["payload"]
+                for event in reversed(load_events(session, publication_id))
+                if event["event_type"] == EventType.REVIEW_RECORDED.value
+                and event["payload"].get("decision")
+                == ReviewDecision.APPROVED.value
+                and event["payload"].get("reviewed_head_sha") == head_sha
+            ),
+            None,
+        )
+        if approval_payload is None:
+            return None
+
+        review_id = approval_payload.get("github_review_id")
+        if isinstance(review_id, bool) or not isinstance(review_id, int) or review_id <= 0:
+            return None
+        matches = [item for item in reviews if item.review_id == review_id]
+        if len(matches) != 1:
+            return None
+
+        receipt = matches[0]
+        if (
+            _normalize_actor(receipt.actor) not in self.human_review_actors
+            or receipt.commit_id != head_sha
+            or receipt.state.strip().upper() != "DISMISSED"
+        ):
+            return None
+        return review_id
+
     def _effective_active_human_approvals(
         self,
         reviews,
@@ -1278,7 +1318,12 @@ class GitHubWebhookGateway:
             if actor not in self.human_review_actors:
                 continue
             review_state = item.state.strip().upper()
-            if review_state == "PENDING" and item.submitted_at is None:
+            if review_state not in {
+                "APPROVED",
+                "CHANGES_REQUESTED",
+                "REQUEST_CHANGES",
+                "DISMISSED",
+            }:
                 continue
             submitted_at = _parse_time(item.submitted_at)
             if submitted_at is None:
@@ -1298,6 +1343,29 @@ class GitHubWebhookGateway:
             and item.commit_id == head_sha
             and item.state.strip().upper() == "APPROVED"
             and (submitted_after is None or submitted_at > submitted_after)
+        )
+
+    def _effective_active_human_approvals_after_adjudication(
+        self,
+        session: Session,
+        publication_id: str,
+        view,
+        reviews,
+    ):
+        submitted_after = None
+        if self._requires_codex_adjudication(view):
+            adjudication = required_review_adjudication(session, publication_id)
+            if adjudication is None:
+                return ()
+            submitted_after = _required_adjudication_time(
+                session,
+                publication_id,
+                adjudication,
+            )
+        return self._effective_active_human_approvals(
+            reviews,
+            head_sha=view.remote_head_sha,
+            submitted_after=submitted_after,
         )
 
     def _human_review_from_payload(
@@ -1346,28 +1414,11 @@ class GitHubWebhookGateway:
                 }
                 and view.review_decision is ReviewDecision.APPROVED
             ):
-                submitted_after = None
-                has_required_adjudication = True
-                if self._requires_codex_adjudication(view):
-                    adjudication = required_review_adjudication(
-                        session,
-                        publication_id,
-                    )
-                    has_required_adjudication = adjudication is not None
-                    if adjudication is not None:
-                        submitted_after = _required_adjudication_time(
-                            session,
-                            publication_id,
-                            adjudication,
-                        )
-                active_approvals = (
-                    self._effective_active_human_approvals(
-                        reviews,
-                        head_sha=view.remote_head_sha,
-                        submitted_after=submitted_after,
-                    )
-                    if has_required_adjudication
-                    else ()
+                active_approvals = self._effective_active_human_approvals_after_adjudication(
+                    session,
+                    publication_id,
+                    view,
+                    reviews,
                 )
                 if active_approvals:
                     return "HUMAN_APPROVAL_REMAINS"
@@ -1461,7 +1512,52 @@ class GitHubWebhookGateway:
         view = get_view(session, publication_id)
         if not self.human_review_actors:
             return "HUMAN_ACTOR_ALLOWLIST_EMPTY"
-        latest = self._latest_human_review(view, token=token)
+        if view.pull_request_number is None or view.remote_head_sha is None:
+            raise GitHubWebhookError("human review publication metadata is incomplete")
+        reviews = self.github.list_pull_reviews(
+            view.repository,
+            view.pull_request_number,
+            token,
+        )
+        latest = self._latest_human_review(
+            view,
+            token=token,
+            reviews=reviews,
+        )
+
+        if (
+            view.state in {
+                PublicationState.APPROVED,
+                PublicationState.READY_TO_MERGE,
+            }
+            and view.review_decision is ReviewDecision.APPROVED
+            and (latest is None or latest[1] is ReviewDecision.APPROVED)
+        ):
+            active_approvals = self._effective_active_human_approvals_after_adjudication(
+                session,
+                publication_id,
+                view,
+                reviews,
+            )
+            if not active_approvals:
+                dismissed_recorded_approval_id = self._dismissed_recorded_approval_id(
+                    session,
+                    publication_id,
+                    reviews,
+                    head_sha=view.remote_head_sha,
+                )
+                record_review(
+                    session,
+                    publication_id,
+                    reviewed_head_sha=view.remote_head_sha,
+                    decision=ReviewDecision.CHANGES_REQUIRED,
+                    require_codex_review=self._requires_codex_adjudication(view),
+                    github_review_id=dismissed_recorded_approval_id,
+                )
+                return "HUMAN_CHANGES_REQUIRED"
+            if latest is None:
+                return "HUMAN_APPROVAL_REMAINS"
+
         if latest is None:
             return "HUMAN_REVIEW_NOT_FOUND"
 
@@ -1633,11 +1729,24 @@ class GitHubWebhookGateway:
             except (MergeError, DomainError) as exc:
                 raise GitHubWebhookError("merge reconciliation failed closed") from exc
 
+        view = get_view(session, publication_id)
+        watch_row = session.get(ReviewWatchRow, publication_id)
+        reactivate_closed_unmerged = (
+            pull.state.strip().lower() == "open"
+            and not pull.merged
+            and pull.head_sha == view.remote_head_sha
+            and watch_row is not None
+            and watch_row.state == "CLOSED_UNMERGED"
+            and watch_row.watched_head_sha == view.remote_head_sha
+            and view.state is not PublicationState.MERGED
+            and not view.merge_policy_violation
+        )
         watch = self._sync_review_watch(
             session,
             publication_id,
             expected_actors=self.expected_actors,
             last_delivery_id=last_delivery_id,
+            reactivate_closed_unmerged=reactivate_closed_unmerged,
         )
         return WebhookProcessResult(
             delivery_id=last_delivery_id,
