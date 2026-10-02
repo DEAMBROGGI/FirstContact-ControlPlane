@@ -929,6 +929,7 @@ def complete_codex_review(
     provider_comment_ids: list[int],
     provider_reaction_ids: list[int] | None = None,
     provider_completed_at: str | None = None,
+    provider_evidence_sha256: str | None = None,
 ) -> PublicationView:
     if result not in {
         AutomatedReviewStatus.PASS,
@@ -958,6 +959,13 @@ def complete_codex_review(
             set(int(value) for value in (provider_reaction_ids or []))
         ),
     }
+    if provider_evidence_sha256 is not None:
+        if len(provider_evidence_sha256) != 64 or any(
+            char not in "0123456789abcdef"
+            for char in provider_evidence_sha256
+        ):
+            raise DomainError("Codex provider evidence digest is invalid")
+        payload["provider_evidence_sha256"] = provider_evidence_sha256
     if normalized_provider_time is not None:
         payload["provider_completed_at"] = normalized_provider_time
     view = _locked_publication_view(session, publication_id)

@@ -876,3 +876,53 @@ def test_pull_request_merge_event_recovers_commit_sha():
     assert event.commit_id == merge_sha
     assert event.actor == "DEAMBROGGI"
     assert event.created_at == "2026-09-29T20:48:12Z"
+
+
+def test_commit_and_comparison_readbacks_return_exact_graph_metadata():
+    base_sha = "1" * 40
+    head_sha = "2" * 40
+    merge_sha = "4" * 40
+    tree_sha = "3" * 40
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith(f"/commits/{merge_sha}"):
+            return httpx.Response(
+                200,
+                json={
+                    "sha": merge_sha,
+                    "commit": {"tree": {"sha": tree_sha}},
+                    "parents": [{"sha": base_sha}, {"sha": head_sha}],
+                },
+            )
+        if request.url.path.endswith(f"/compare/{base_sha}...{head_sha}"):
+            return httpx.Response(
+                200,
+                json={
+                    "base_commit": {"sha": base_sha},
+                    "head_commit": {"sha": head_sha},
+                    "merge_base_commit": {"sha": base_sha},
+                    "ahead_by": 3,
+                    "behind_by": 0,
+                },
+            )
+        raise AssertionError(f"unexpected request {request.url}")
+
+    github = GitHubRepositoryGateway(
+        api_url="https://api.github.test",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    commit = github.commit("DEAMBROGGI/FirstContact", merge_sha, "token")
+    comparison = github.compare_commits(
+        "DEAMBROGGI/FirstContact",
+        base_sha,
+        head_sha,
+        "token",
+    )
+
+    assert commit.sha == merge_sha
+    assert commit.tree_sha == tree_sha
+    assert commit.parents == (base_sha, head_sha)
+    assert comparison.merge_base_sha == base_sha
+    assert comparison.ahead_by == 3
+    assert comparison.behind_by == 0

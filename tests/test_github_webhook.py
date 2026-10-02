@@ -7,8 +7,9 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi import HTTPException
+from sqlalchemy.orm import Session
 
-from control_plane.codex_review import CodexReviewError
+from control_plane.codex_review import CodexReviewBroker, CodexReviewError
 from control_plane.domain import (
     AutomatedReviewStatus,
     DomainError,
@@ -19,6 +20,7 @@ from control_plane.domain import (
 )
 from control_plane.github_api import (
     GitHubApiError,
+    GitHubCommitSnapshot,
     IssueCommentSnapshot,
     PullMergeEventSnapshot,
     PullRequestSnapshot,
@@ -32,17 +34,23 @@ from control_plane.plane_review import (
 )
 from control_plane.github_webhook import (
     GitHubWebhookAuthError,
+    GitHubWebhookDeliveryClaimLost,
     GitHubWebhookError,
     GitHubWebhookGateway,
     WebhookProcessResult,
     _lock_delivery_scope,
     get_review_watch,
     get_webhook_delivery,
+    mark_delivery_processed,
     mark_delivery_retry,
     persist_webhook_delivery,
     sync_review_watch,
 )
-from control_plane.models import GitHubWebhookDeliveryRow, ReviewWatchRow
+from control_plane.models import (
+    GitHubWebhookDeliveryClaimRow,
+    GitHubWebhookDeliveryRow,
+    ReviewWatchRow,
+)
 from control_plane.main import mergeability_record, review_record
 from control_plane.schemas import MergeabilityRequest, ReviewRequest
 from control_plane.profile_registry import profile_for_repository
@@ -175,6 +183,7 @@ def start_codex(session, view, *, expected_head_sha=HEAD, mode="required"):
 
 def complete_codex_pass(session, view):
     assert view.automated_review_run_id is not None
+    provider_review = codex_provider_review()
     return complete_codex_review(
         session,
         view.publication_id,
@@ -186,6 +195,22 @@ def complete_codex_pass(session, view):
         provider_comment_ids=[],
         provider_reaction_ids=[],
         provider_completed_at=CODEX_RESULT_AT,
+        provider_evidence_sha256=CodexReviewBroker._provider_evidence_digest(
+            [provider_review],
+            [],
+            [],
+        ),
+    )
+
+
+def codex_provider_review():
+    return PullReviewSnapshot(
+        review_id=501,
+        actor=CODEX_ACTOR,
+        body="Codex review passed",
+        state="COMMENTED",
+        commit_id=HEAD,
+        submitted_at=CODEX_RESULT_AT,
     )
 
 
@@ -203,6 +228,64 @@ def codex_gate_time(session, view):
         if timestamp.tzinfo is None
         else timestamp.astimezone(timezone.utc)
     )
+
+
+def test_terminal_codex_reconciliation_uses_full_provider_readback(
+    session,
+    monkeypatch,
+):
+    view = published(session)
+    running = start_codex(session, view)
+    complete_codex_pass(session, running)
+
+    class Observation:
+        state = "PASS"
+
+    class BrokerSpy:
+        calls = 0
+
+        def reconcile(self, *_args, **_kwargs):
+            self.calls += 1
+            return Observation()
+
+        def audit_terminal_deletion_evidence(self, *_args, **_kwargs):
+            raise AssertionError("merge gate must reread provider evidence")
+
+    broker_spy = BrokerSpy()
+    gateway = object.__new__(GitHubWebhookGateway)
+    monkeypatch.setattr(gateway, "_codex_broker", lambda: broker_spy)
+
+    outcome = gateway._reconcile_codex(
+        session,
+        view.publication_id,
+        token="unused-test-token",
+        include_provider_evidence=True,
+    )
+
+    assert outcome == "CODEX_PASS"
+    assert broker_spy.calls == 1
+
+
+def test_authorize_merge_requests_full_codex_provider_readback(
+    session,
+    monkeypatch,
+):
+    class StopAfterProbe(Exception):
+        pass
+
+    captured = {}
+    gateway = object.__new__(GitHubWebhookGateway)
+
+    def reconcile_publication(_session, _publication_id, **kwargs):
+        captured.update(kwargs)
+        raise StopAfterProbe
+
+    monkeypatch.setattr(gateway, "reconcile_publication", reconcile_publication)
+
+    with pytest.raises(StopAfterProbe):
+        gateway.authorize_merge(session, "publication-for-test")
+
+    assert captured["require_authoritative_codex_evidence"] is True
 
 
 def raw_delivery(
@@ -473,6 +556,16 @@ class FakeGitHub:
             commit_id="9" * 40,
             actor="firstcontact-control-plane[bot]",
             created_at="2026-09-30T13:00:00Z",
+        )
+
+    def commit(self, repository, sha, token):
+        assert repository == REPOSITORY
+        assert token == "installation-token"
+        assert self.merged and sha == "9" * 40
+        return GitHubCommitSnapshot(
+            sha=sha,
+            tree_sha=TREE,
+            parents=(BASE, HEAD),
         )
 
 
@@ -864,6 +957,7 @@ def test_deleted_codex_finding_comment_blocks_active_run_from_passing(session):
     github = FakeGitHub()
     github.issue_comments = [governed_codex_trigger(view)]
     github.reviews = [
+        codex_provider_review(),
         PullReviewSnapshot(
             review_id=520,
             actor=CODEX_ACTOR,
@@ -1392,6 +1486,7 @@ def test_external_merge_refreshes_human_review_before_classification(
     view = complete_codex_pass(session, start_codex(session, published(session)))
     gate_time = codex_gate_time(session, view)
     github = FakeGitHub()
+    github.issue_comments = [governed_codex_trigger(view)]
     github.reviews = [
         PullReviewSnapshot(
             review_id=990,
@@ -1462,6 +1557,7 @@ def test_external_merge_checks_validated_base_before_classification(
     view = complete_codex_pass(session, start_codex(session, published(session)))
     gate_time = codex_gate_time(session, view)
     github = FakeGitHub()
+    github.issue_comments = [governed_codex_trigger(view)]
     github.reviews = [
         PullReviewSnapshot(
             review_id=991,
@@ -1525,6 +1621,8 @@ def test_merged_approved_pull_cannot_record_mergeability(session):
         require_codex_review=True,
     )
     github = FakeGitHub()
+    github.issue_comments = [governed_codex_trigger(view)]
+    github.reviews = [codex_provider_review()]
     github.merged = True
     github.mergeable = True
     value = gateway(github)
@@ -1592,6 +1690,7 @@ def test_stale_human_review_cannot_advance_exact_head(session):
     view = complete_codex_pass(session, start_codex(session, published(session)))
     github = FakeGitHub()
     github.reviews = [
+        codex_provider_review(),
         PullReviewSnapshot(
             review_id=801,
             actor=HUMAN_ACTOR,
@@ -1629,6 +1728,7 @@ def test_closed_unmerged_pr_blocks_watch_and_later_human_approval(session):
     github = FakeGitHub()
     github.closed = True
     github.reviews = [
+        codex_provider_review(),
         PullReviewSnapshot(
             review_id=806,
             actor=HUMAN_ACTOR,
@@ -1935,7 +2035,9 @@ def test_verified_merge_completes_watch_after_unmerged_close(session):
     )
     gate_time = codex_gate_time(session, view)
     github = FakeGitHub()
+    github.issue_comments = [governed_codex_trigger(view)]
     github.reviews = [
+        codex_provider_review(),
         PullReviewSnapshot(
             review_id=804,
             actor=HUMAN_ACTOR,
@@ -1989,7 +2091,9 @@ def test_full_reconciliation_does_not_reopen_a_merged_closed_watch(session):
     view = complete_codex_pass(session, start_codex(session, published(session)))
     gate_time = codex_gate_time(session, view)
     github = FakeGitHub()
+    github.issue_comments = [governed_codex_trigger(view)]
     github.reviews = [
+        codex_provider_review(),
         PullReviewSnapshot(
             review_id=995,
             actor=HUMAN_ACTOR,
@@ -2913,6 +3017,168 @@ def test_duplicate_human_review_delivery_does_not_duplicate_review_event(session
     assert len(review_events) == 1
     assert replay.outcome.startswith("HUMAN_APPROVED_ALREADY_RECORDED")
     assert get_webhook_delivery(session, second.delivery_id).state == "PROCESSED"
+
+
+def test_delivery_claim_blocks_reentrant_processing_and_releases_retry(session, monkeypatch):
+    published(session)
+    first_gateway = gateway(FakeGitHub())
+    second_gateway = gateway(FakeGitHub())
+    body, signature = raw_delivery(
+        event_name="issue_comment",
+        comment_id=794,
+    )
+    receipt = first_gateway.ingest(
+        session,
+        delivery_id="delivery-reentrant-claim",
+        event_name="issue_comment",
+        signature=signature,
+        body=body,
+    )
+    second_entries = []
+
+    def unexpected_second_entry(*_args, **_kwargs):
+        second_entries.append(True)
+        return "SECOND_ENTRY"
+
+    monkeypatch.setattr(
+        second_gateway,
+        "_process_pull_delivery",
+        unexpected_second_entry,
+    )
+
+    def fail_after_reentry(current_session, *_args, **_kwargs):
+        with Session(bind=current_session.get_bind()) as competing_session:
+            reentrant = second_gateway.process_delivery(
+                competing_session,
+                receipt.delivery_id,
+            )
+        assert reentrant.outcome == "PROCESSING"
+        raise GitHubWebhookError("simulated processing failure")
+
+    monkeypatch.setattr(first_gateway, "_process_pull_delivery", fail_after_reentry)
+
+    with pytest.raises(GitHubWebhookError, match="simulated processing failure"):
+        first_gateway.process_delivery(session, receipt.delivery_id)
+
+    claim = session.get(GitHubWebhookDeliveryClaimRow, receipt.delivery_id)
+    assert second_entries == []
+    assert get_webhook_delivery(session, receipt.delivery_id).state == "PENDING"
+    assert claim is not None
+    assert claim.owner_id is None
+    assert claim.lease_expires_at is None
+
+
+def test_expired_delivery_claim_is_recovered_by_new_owner(session, monkeypatch):
+    published(session)
+    first_gateway = gateway(FakeGitHub())
+    recovery_gateway = gateway(FakeGitHub())
+    body, signature = raw_delivery(
+        event_name="issue_comment",
+        comment_id=795,
+    )
+    receipt = first_gateway.ingest(
+        session,
+        delivery_id="delivery-abandoned-claim",
+        event_name="issue_comment",
+        signature=signature,
+        body=body,
+    )
+
+    def crash_worker(*_args, **_kwargs):
+        raise RuntimeError("simulated worker termination")
+
+    monkeypatch.setattr(first_gateway, "_process_pull_delivery", crash_worker)
+    with pytest.raises(RuntimeError, match="simulated worker termination"):
+        first_gateway.process_delivery(session, receipt.delivery_id)
+
+    claim = session.get(GitHubWebhookDeliveryClaimRow, receipt.delivery_id)
+    assert claim is not None
+    first_owner = claim.owner_id
+    assert first_owner is not None
+    assert claim.generation == 1
+    claim.lease_expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+    session.commit()
+
+    monkeypatch.setattr(
+        recovery_gateway,
+        "_process_pull_delivery",
+        lambda *_args, **_kwargs: "RECOVERED",
+    )
+    recovered = recovery_gateway.process_delivery(session, receipt.delivery_id)
+
+    claim = session.get(GitHubWebhookDeliveryClaimRow, receipt.delivery_id)
+    assert recovered.outcome == "RECOVERED"
+    assert get_webhook_delivery(session, receipt.delivery_id).state == "PROCESSED"
+    assert claim is not None
+    assert claim.owner_id != first_owner
+    assert claim.generation == 2
+
+
+def test_ownerless_worker_cannot_finalize_or_release_active_claim(session):
+    value = gateway(FakeGitHub())
+    body, signature = raw_delivery(
+        event_name="issue_comment",
+        comment_id=796,
+    )
+    receipt = value.ingest(
+        session,
+        delivery_id="delivery-ownerless-claim-update",
+        event_name="issue_comment",
+        signature=signature,
+        body=body,
+    )
+    claim = session.get(GitHubWebhookDeliveryClaimRow, receipt.delivery_id)
+    assert claim is not None
+    claim.owner_id = "active-webhook-owner"
+    claim.generation = 7
+    claim.lease_expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
+    session.commit()
+
+    with pytest.raises(GitHubWebhookDeliveryClaimLost, match="active webhook delivery owner"):
+        mark_delivery_processed(session, receipt.delivery_id)
+    with pytest.raises(GitHubWebhookDeliveryClaimLost, match="another worker"):
+        mark_delivery_retry(session, receipt.delivery_id, "ownerless retry")
+
+    session.expire_all()
+    claim = session.get(GitHubWebhookDeliveryClaimRow, receipt.delivery_id)
+    assert get_webhook_delivery(session, receipt.delivery_id).state == "PENDING"
+    assert claim is not None
+    assert claim.owner_id == "active-webhook-owner"
+    assert claim.generation == 7
+
+
+def test_corrupt_delivery_claim_is_not_recovered_or_released(session):
+    value = gateway(FakeGitHub())
+    body, signature = raw_delivery(
+        event_name="issue_comment",
+        comment_id=797,
+    )
+    receipt = value.ingest(
+        session,
+        delivery_id="delivery-corrupt-claim",
+        event_name="issue_comment",
+        signature=signature,
+        body=body,
+    )
+    claim = session.get(GitHubWebhookDeliveryClaimRow, receipt.delivery_id)
+    assert claim is not None
+    claim.owner_id = "inconsistent-webhook-owner"
+    claim.generation = 9
+    claim.lease_expires_at = None
+    session.commit()
+
+    result = value.process_delivery(session, receipt.delivery_id)
+
+    with pytest.raises(GitHubWebhookDeliveryClaimLost, match="another worker"):
+        mark_delivery_retry(session, receipt.delivery_id, "corrupt claim")
+    session.expire_all()
+    claim = session.get(GitHubWebhookDeliveryClaimRow, receipt.delivery_id)
+    assert result.outcome == "PROCESSING"
+    assert get_webhook_delivery(session, receipt.delivery_id).state == "PENDING"
+    assert claim is not None
+    assert claim.owner_id == "inconsistent-webhook-owner"
+    assert claim.generation == 9
+    assert claim.lease_expires_at is None
 
 
 @pytest.mark.parametrize("was_ready", [False, True])

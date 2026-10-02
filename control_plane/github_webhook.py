@@ -4,11 +4,13 @@ import hashlib
 import hmac
 import json
 import re
+import uuid
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from functools import wraps
 from typing import Any, Mapping
 
-from sqlalchemy import select, text
+from sqlalchemy import and_, event, or_, select, text, update
 from sqlalchemy.orm import Session
 
 from .codex_review import (
@@ -26,7 +28,12 @@ from .domain import (
 from .github_api import GitHubApiError, GitHubRepositoryGateway, PullRequestSnapshot
 from .github_app import GitHubAppTokenProvider, GitHubAuthError
 from .merge import MergeCoordinator, MergeError, MergePolicyViolationRecorded
-from .models import GitHubWebhookDeliveryRow, PublicationRow, ReviewWatchRow
+from .models import (
+    GitHubWebhookDeliveryClaimRow,
+    GitHubWebhookDeliveryRow,
+    PublicationRow,
+    ReviewWatchRow,
+)
 from .profile_registry import ProfileError, profile_for_repository
 from .repository import load_events
 from .service import (
@@ -52,6 +59,9 @@ _DELIVERY_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,200}$")
 _EVENT_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,80}$")
 _SHA256_SIGNATURE_RE = re.compile(r"^sha256=([0-9a-f]{64})$")
 _BLOCKED_WATCH_STATES = frozenset({"STALE", "CLOSED_UNMERGED"})
+_DELIVERY_CLAIM_LEASE_SECONDS = 300
+_DELIVERY_CLAIM_SESSION_KEY = "github_webhook_delivery_claim"
+_DELIVERY_CLAIM_RELEASE_KEY = "github_webhook_delivery_claim_release"
 
 
 class GitHubWebhookError(RuntimeError):
@@ -59,6 +69,10 @@ class GitHubWebhookError(RuntimeError):
 
 
 class GitHubWebhookAuthError(GitHubWebhookError):
+    pass
+
+
+class GitHubWebhookDeliveryClaimLost(RuntimeError):
     pass
 
 
@@ -302,6 +316,14 @@ def persist_webhook_delivery(
         processed_at=None,
     )
     session.add(row)
+    session.add(
+        GitHubWebhookDeliveryClaimRow(
+            delivery_id=normalized_delivery,
+            owner_id=None,
+            generation=0,
+            lease_expires_at=None,
+        )
+    )
     session.commit()
     return _delivery_view(row)
 
@@ -596,9 +618,19 @@ def mark_delivery_processed(
     state: str = "PROCESSED",
     error: str | None = None,
 ) -> WebhookDeliveryView:
+    claim = _current_delivery_claim(session, delivery_id)
+    if claim is None:
+        raise GitHubWebhookDeliveryClaimLost(
+            "only the active webhook delivery owner may finalize a receipt"
+        )
+    if state not in {"PROCESSED", "IGNORED"}:
+        raise GitHubWebhookError("webhook delivery terminal state is invalid")
+    _renew_delivery_claim(session, claim)
     row = session.get(GitHubWebhookDeliveryRow, delivery_id)
     if row is None:
         raise KeyError(delivery_id)
+    if row.state in {"PROCESSED", "IGNORED"}:
+        return _delivery_view(row)
     row.attempt_count += 1
     row.state = state
     row.last_error = error[:1000] if error else None
@@ -615,10 +647,51 @@ def mark_delivery_retry(
     row = session.get(GitHubWebhookDeliveryRow, delivery_id)
     if row is None:
         raise KeyError(delivery_id)
+    if row.state in {"PROCESSED", "IGNORED"}:
+        raise GitHubWebhookError("a terminal webhook delivery cannot be retried")
+    claim = _current_delivery_claim(session, delivery_id)
+    now = _utcnow()
+    claim_update = update(GitHubWebhookDeliveryClaimRow).where(
+        GitHubWebhookDeliveryClaimRow.delivery_id == delivery_id
+    )
+    if claim is not None:
+        claim_update = claim_update.where(
+            GitHubWebhookDeliveryClaimRow.owner_id == claim.owner_id,
+            GitHubWebhookDeliveryClaimRow.generation == claim.generation,
+            GitHubWebhookDeliveryClaimRow.lease_expires_at > now,
+        )
+    else:
+        claim_update = claim_update.where(
+            or_(
+                and_(
+                    GitHubWebhookDeliveryClaimRow.owner_id.is_(None),
+                    GitHubWebhookDeliveryClaimRow.lease_expires_at.is_(None),
+                ),
+                and_(
+                    GitHubWebhookDeliveryClaimRow.owner_id.is_not(None),
+                    GitHubWebhookDeliveryClaimRow.lease_expires_at.is_not(None),
+                    GitHubWebhookDeliveryClaimRow.lease_expires_at <= now,
+                ),
+            )
+        )
+    result = session.execute(
+        claim_update.values(owner_id=None, lease_expires_at=None)
+    )
+    if result.rowcount != 1:
+        raise GitHubWebhookDeliveryClaimLost(
+            "retry cannot release a webhook delivery owned by another worker"
+        )
+    if claim is not None:
+        session.info[_DELIVERY_CLAIM_RELEASE_KEY] = delivery_id
     row.attempt_count += 1
     row.state = "PENDING"
     row.last_error = error[:1000]
-    session.commit()
+    row.processed_at = None
+    try:
+        session.commit()
+    finally:
+        if claim is not None:
+            session.info.pop(_DELIVERY_CLAIM_RELEASE_KEY, None)
     return _delivery_view(row)
 
 
@@ -639,6 +712,155 @@ class WebhookProcessResult:
     next_action: str
     watch_state: str | None
     error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class WebhookDeliveryClaim:
+    delivery_id: str
+    owner_id: str
+    generation: int
+
+
+def _current_delivery_claim(
+    session: Session,
+    delivery_id: str,
+) -> WebhookDeliveryClaim | None:
+    claim = session.info.get(_DELIVERY_CLAIM_SESSION_KEY)
+    if isinstance(claim, WebhookDeliveryClaim) and claim.delivery_id == delivery_id:
+        return claim
+    return None
+
+
+def _renew_delivery_claim(
+    session: Session,
+    claim: WebhookDeliveryClaim,
+) -> None:
+    now = _utcnow()
+    result = session.execute(
+        update(GitHubWebhookDeliveryClaimRow)
+        .where(
+            GitHubWebhookDeliveryClaimRow.delivery_id == claim.delivery_id,
+            GitHubWebhookDeliveryClaimRow.owner_id == claim.owner_id,
+            GitHubWebhookDeliveryClaimRow.generation == claim.generation,
+            GitHubWebhookDeliveryClaimRow.lease_expires_at > now,
+        )
+        .values(
+            lease_expires_at=now
+            + timedelta(seconds=_DELIVERY_CLAIM_LEASE_SECONDS)
+        )
+    )
+    if result.rowcount != 1:
+        raise GitHubWebhookDeliveryClaimLost(
+            "webhook delivery processing claim expired or was fenced"
+        )
+
+
+def _acquire_delivery_claim(
+    session: Session,
+    delivery_id: str,
+) -> WebhookDeliveryClaim | None:
+    owner_id = str(uuid.uuid4())
+    now = _utcnow()
+    result = session.execute(
+        update(GitHubWebhookDeliveryClaimRow)
+        .where(
+            GitHubWebhookDeliveryClaimRow.delivery_id == delivery_id,
+            or_(
+                and_(
+                    GitHubWebhookDeliveryClaimRow.owner_id.is_(None),
+                    GitHubWebhookDeliveryClaimRow.lease_expires_at.is_(None),
+                ),
+                and_(
+                    GitHubWebhookDeliveryClaimRow.owner_id.is_not(None),
+                    GitHubWebhookDeliveryClaimRow.lease_expires_at.is_not(None),
+                    GitHubWebhookDeliveryClaimRow.lease_expires_at <= now,
+                ),
+            ),
+        )
+        .values(
+            owner_id=owner_id,
+            generation=GitHubWebhookDeliveryClaimRow.generation + 1,
+            lease_expires_at=now
+            + timedelta(seconds=_DELIVERY_CLAIM_LEASE_SECONDS),
+        )
+    )
+    if result.rowcount != 1:
+        session.rollback()
+        return None
+    generation = session.scalar(
+        select(GitHubWebhookDeliveryClaimRow.generation).where(
+            GitHubWebhookDeliveryClaimRow.delivery_id == delivery_id,
+            GitHubWebhookDeliveryClaimRow.owner_id == owner_id,
+        )
+    )
+    if generation is None:
+        session.rollback()
+        raise GitHubWebhookDeliveryClaimLost(
+            "webhook delivery claim readback is incomplete"
+        )
+    session.commit()
+    return WebhookDeliveryClaim(
+        delivery_id=delivery_id,
+        owner_id=owner_id,
+        generation=int(generation),
+    )
+
+
+def _processing_delivery_result(delivery_id: str) -> WebhookProcessResult:
+    return WebhookProcessResult(
+        delivery_id=delivery_id,
+        publication_id=None,
+        outcome="PROCESSING",
+        next_role="CONTROL_PLANE",
+        next_action="RETRY",
+        watch_state=None,
+    )
+
+
+def _claim_delivery_processing(method):
+    @wraps(method)
+    def wrapped(gateway, session: Session, delivery_id: str):
+        row = session.get(GitHubWebhookDeliveryRow, delivery_id)
+        if row is None or row.state in {"PROCESSED", "IGNORED"}:
+            return method(gateway, session, delivery_id)
+
+        current_claim = session.info.get(_DELIVERY_CLAIM_SESSION_KEY)
+        if isinstance(current_claim, WebhookDeliveryClaim):
+            if current_claim.delivery_id == delivery_id:
+                return _processing_delivery_result(delivery_id)
+            raise GitHubWebhookError(
+                "one database session cannot process multiple webhook deliveries"
+            )
+
+        claim = _acquire_delivery_claim(session, delivery_id)
+        if claim is None:
+            session.expire_all()
+            latest = session.get(GitHubWebhookDeliveryRow, delivery_id)
+            if latest is not None and latest.state in {"PROCESSED", "IGNORED"}:
+                return method(gateway, session, delivery_id)
+            return _processing_delivery_result(delivery_id)
+
+        session.info[_DELIVERY_CLAIM_SESSION_KEY] = claim
+
+        def renew_before_commit(active_session: Session) -> None:
+            if active_session.info.get(_DELIVERY_CLAIM_RELEASE_KEY) == delivery_id:
+                return
+            if active_session.info.get(_DELIVERY_CLAIM_SESSION_KEY) == claim:
+                _renew_delivery_claim(active_session, claim)
+
+        event.listen(session, "before_commit", renew_before_commit)
+        try:
+            return method(gateway, session, delivery_id)
+        except GitHubWebhookDeliveryClaimLost:
+            session.rollback()
+            return _processing_delivery_result(delivery_id)
+        finally:
+            event.remove(session, "before_commit", renew_before_commit)
+            if session.info.get(_DELIVERY_CLAIM_SESSION_KEY) == claim:
+                session.info.pop(_DELIVERY_CLAIM_SESSION_KEY, None)
+            session.info.pop(_DELIVERY_CLAIM_RELEASE_KEY, None)
+
+    return wrapped
 
 
 def _parse_time(value: str | None) -> datetime | None:
@@ -1677,7 +1899,11 @@ class GitHubWebhookGateway:
         publication_id: str,
     ) -> None:
         """Refresh authoritative review state and fence blocked generations."""
-        self.reconcile_publication(session, publication_id)
+        self.reconcile_publication(
+            session,
+            publication_id,
+            require_authoritative_codex_evidence=True,
+        )
         view = get_view(session, publication_id)
         watch = get_review_watch(session, publication_id)
         if (
@@ -1709,7 +1935,7 @@ class GitHubWebhookGateway:
                 publication_id,
                 token=self._access(view.repository).token,
                 allow_merged=True,
-                include_provider_evidence=False,
+                include_provider_evidence=True,
             )
             view = get_view(session, publication_id)
         human_review_eligible = False
@@ -1739,6 +1965,7 @@ class GitHubWebhookGateway:
         publication_id: str,
         *,
         last_delivery_id: str | None = None,
+        require_authoritative_codex_evidence: bool = False,
     ) -> WebhookProcessResult:
         view = get_view(session, publication_id)
         if view.pull_request_number is None or view.remote_head_sha is None:
@@ -1865,7 +2092,7 @@ class GitHubWebhookGateway:
                 session,
                 publication_id,
                 token=access.token,
-                include_provider_evidence=False,
+                include_provider_evidence=require_authoritative_codex_evidence,
             )
 
         self._reconcile_human_from_github(
@@ -2198,6 +2425,7 @@ class GitHubWebhookGateway:
         session.commit()
         return f"BASE_PUSH_STALE:{stale}:RECOVERED:{recovered}"
 
+    @_claim_delivery_processing
     def process_delivery(
         self,
         session: Session,
@@ -2206,7 +2434,6 @@ class GitHubWebhookGateway:
         row = session.scalar(
             select(GitHubWebhookDeliveryRow)
             .where(GitHubWebhookDeliveryRow.delivery_id == delivery_id)
-            .with_for_update()
             .execution_options(populate_existing=True)
         )
         if row is None:
@@ -2374,13 +2601,13 @@ class GitHubWebhookGateway:
                 watch_state=watch.state,
             )
         except GitHubWebhookDeferred as exc:
-            mark_delivery_retry(session, delivery_id, str(exc))
             watch = self._sync_review_watch(
                 session,
                 publication_id,
                 expected_actors=self.expected_actors,
                 last_delivery_id=delivery_id,
             )
+            mark_delivery_retry(session, delivery_id, str(exc))
             return WebhookProcessResult(
                 delivery_id=delivery_id,
                 publication_id=publication_id,

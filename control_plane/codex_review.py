@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import re
 import uuid
+import hashlib
+import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -9,6 +11,11 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .domain import AutomatedReviewStatus, DomainError, EventType, PublicationState
+from .codex_findings import (
+    codex_review_body_finding_id,
+    normalize_codex_finding_text,
+    parse_codex_review_body,
+)
 from .github_api import (
     GitHubApiError,
     GitHubRepositoryGateway,
@@ -42,6 +49,12 @@ _CODEX_USAGE_LIMIT = re.compile(
 
 class CodexReviewError(RuntimeError):
     pass
+
+
+class CodexReviewInvalidInvocationError(CodexReviewError):
+    def __init__(self, message: str, *, evidence_ids: tuple[int, ...] = ()) -> None:
+        super().__init__(message)
+        self.evidence_ids = evidence_ids
 
 
 def assert_no_reserved_automation_mentions(value: str) -> None:
@@ -611,8 +624,9 @@ class CodexReviewBroker:
                 and (_parse_time(item.created_at) or published_at) >= published_at
             ]
             if foreign_invocations:
-                raise CodexReviewError(
-                    "pre-existing Codex invocation makes governed review ambiguous"
+                raise CodexReviewInvalidInvocationError(
+                    "pre-existing Codex invocation makes governed review ambiguous",
+                    evidence_ids=tuple(item.comment_id for item in foreign_invocations),
                 )
             existing = [
                 item for item in issue_comments if marker in item.body
@@ -621,11 +635,15 @@ class CodexReviewBroker:
                 _actor_key(item.actor) != _actor_key(trigger_access.login)
                 for item in existing
             ):
-                raise CodexReviewError(
-                    "Codex trigger marker was emitted by an unexpected actor"
+                raise CodexReviewInvalidInvocationError(
+                    "Codex trigger marker was emitted by an unexpected actor",
+                    evidence_ids=tuple(item.comment_id for item in existing),
                 )
             if len(existing) > 1:
-                raise CodexReviewError("multiple Codex trigger comments exist")
+                raise CodexReviewInvalidInvocationError(
+                    "multiple Codex trigger comments exist",
+                    evidence_ids=tuple(item.comment_id for item in existing),
+                )
 
             if not fence_codex_review_trigger_dispatch(
                 session,
@@ -665,20 +683,23 @@ class CodexReviewBroker:
                         _actor_key(item.actor) != _actor_key(trigger_access.login)
                         for item in recovered
                     ):
-                        raise CodexReviewError(
-                            "uncertain Codex trigger was emitted by an unexpected actor"
+                        raise CodexReviewInvalidInvocationError(
+                            "uncertain Codex trigger was emitted by an unexpected actor",
+                            evidence_ids=tuple(item.comment_id for item in recovered),
                         )
                     if len(recovered) > 1:
-                        raise CodexReviewError(
-                            "multiple Codex trigger comments exist after uncertain write"
+                        raise CodexReviewInvalidInvocationError(
+                            "multiple Codex trigger comments exist after uncertain write",
+                            evidence_ids=tuple(item.comment_id for item in recovered),
                         )
                     if not recovered:
                         raise
                     comment = recovered[0]
                     uncertain_trigger_write = False
                 if _actor_key(comment.actor) != _actor_key(trigger_access.login):
-                    raise CodexReviewError(
-                        "Codex trigger comment actor does not match authorized user"
+                    raise CodexReviewInvalidInvocationError(
+                        "Codex trigger comment actor does not match authorized user",
+                        evidence_ids=(comment.comment_id,),
                     )
 
             return complete_codex_review_trigger_dispatch(
@@ -705,7 +726,20 @@ class CodexReviewBroker:
                     lease_id=lease_id,
                 )
             latest = get_view(session, publication_id)
-            if (
+            if isinstance(exc, CodexReviewInvalidInvocationError):
+                if (
+                    latest.automated_review_status is AutomatedReviewStatus.RUNNING
+                    and latest.automated_review_run_id is not None
+                    and latest.automated_review_head_sha is not None
+                ):
+                    self._invalidate(
+                        session,
+                        latest,
+                        reason="CODEX_AMBIGUOUS_INVOCATION",
+                        evidence_ids=list(exc.evidence_ids),
+                        actors=(),
+                    )
+            elif (
                 latest.automated_review_status is AutomatedReviewStatus.RUNNING
                 and latest.automated_review_run_id is not None
                 and latest.automated_review_head_sha is not None
@@ -735,6 +769,55 @@ class CodexReviewBroker:
             "line": comment.line,
             "body": comment.body.strip()[:4000],
         }
+
+    @staticmethod
+    def _provider_evidence_digest(reviews, comments, reactions) -> str:
+        evidence = []
+        for item in reviews:
+            evidence.append(
+                {
+                    "kind": "review",
+                    "id": item.review_id,
+                    "actor": item.actor,
+                    "body": item.body,
+                    "state": item.state,
+                    "commit_id": item.commit_id,
+                    "submitted_at": item.submitted_at,
+                }
+            )
+        for item in comments:
+            evidence.append(
+                {
+                    "kind": "comment",
+                    "id": item.comment_id,
+                    "review_id": item.review_id,
+                    "actor": item.actor,
+                    "body": item.body,
+                    "commit_id": item.commit_id,
+                    "path": item.path,
+                    "line": item.line,
+                    "created_at": item.created_at,
+                    "in_reply_to_id": item.in_reply_to_id,
+                }
+            )
+        for item in reactions:
+            evidence.append(
+                {
+                    "kind": "reaction",
+                    "id": item.reaction_id,
+                    "actor": item.actor,
+                    "content": item.content,
+                    "created_at": item.created_at,
+                }
+            )
+        evidence.sort(key=lambda item: (item["kind"], item["id"]))
+        encoded = json.dumps(
+            evidence,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
 
     def _is_allowed_actor(self, actor: str) -> bool:
         return _actor_key(actor) in self.allowed_actors
@@ -1048,11 +1131,64 @@ class CodexReviewBroker:
             comment_id=comment_id,
         )
 
-        findings = [
+        inline_findings = [
             self._normalize_finding(item)
             for item in matching_comments
             if item.body.strip()
         ]
+        inline_finding_identities = set()
+        for comment in matching_comments:
+            if not comment.body.strip():
+                continue
+            parsed = parse_codex_review_body(comment.body)
+            if parsed:
+                inline_finding_identities.update(
+                    normalize_codex_finding_text(
+                        finding["priority"],
+                        finding["title"],
+                        finding["body"],
+                    )
+                    for finding in parsed
+                )
+            inline_finding_identities.add(
+                normalize_codex_finding_text(comment.body)
+            )
+        findings = list(inline_findings)
+        for review in matching_reviews:
+            for body_finding in parse_codex_review_body(review.body):
+                identity = normalize_codex_finding_text(
+                    body_finding["priority"],
+                    body_finding["title"],
+                    body_finding["body"],
+                )
+                if identity in inline_finding_identities:
+                    continue
+                finding_id = codex_review_body_finding_id(
+                    run_id=view.automated_review_run_id,
+                    head_sha=view.automated_review_head_sha,
+                    review_id=review.review_id,
+                    priority=body_finding["priority"],
+                    title=body_finding["title"],
+                    body=body_finding["body"],
+                )
+                findings.append(
+                    {
+                        "finding_id": finding_id,
+                        "normalized_identity": finding_id,
+                        "provider_finding_id": finding_id,
+                        "source_kind": "REVIEW_BODY",
+                        "provider_review_id": review.review_id,
+                        "priority": body_finding["priority"],
+                        "title": body_finding["title"],
+                        "path": None,
+                        "line": None,
+                        "body": body_finding["body"],
+                        "provider_body_sha256": body_finding["evidence_sha256"],
+                    }
+                )
+        findings.sort(
+            key=lambda item: json.dumps(item, sort_keys=True, separators=(",", ":"))
+        )
         native_result = None
         if matching_reviews or matching_reactions:
             native_result = (
@@ -1144,26 +1280,39 @@ class CodexReviewBroker:
                         evidence_ids=[usage.comment_id],
                         actors=actors,
                     )
-            if native_result is not None:
+            if terminal_event is not None:
                 result_payload = terminal_event["payload"]
                 result_review_ids = sorted(item.review_id for item in matching_reviews)
                 result_comment_ids = sorted(item.comment_id for item in matching_comments)
                 result_reaction_ids = sorted(
                     item.reaction_id for item in matching_reactions
                 )
+                expected_evidence_ids = [
+                    *result_payload.get("provider_review_ids", []),
+                    *result_payload.get("provider_comment_ids", []),
+                    *result_payload.get("provider_reaction_ids", []),
+                ]
                 if (
                     terminal_time is None
+                    or native_result is None
                     or native_time != terminal_time
                     or native_result.value != result_payload.get("result")
                     or result_review_ids != result_payload.get("provider_review_ids")
                     or result_comment_ids != result_payload.get("provider_comment_ids")
                     or result_reaction_ids != result_payload.get("provider_reaction_ids")
+                    or findings != result_payload.get("findings")
+                    or self._provider_evidence_digest(
+                        matching_reviews,
+                        matching_comments,
+                        matching_reactions,
+                    )
+                    != result_payload.get("provider_evidence_sha256")
                 ):
                     return self._invalidate(
                         session,
                         view,
                         reason="CODEX_PROVIDER_RESULT_CHANGED",
-                        evidence_ids=native_ids,
+                        evidence_ids=[*native_ids, *expected_evidence_ids],
                         actors=actors,
                     )
             return self._observation(
@@ -1188,6 +1337,11 @@ class CodexReviewBroker:
                 item.reaction_id for item in matching_reactions
             ],
             provider_completed_at=native_time.isoformat(),
+            provider_evidence_sha256=self._provider_evidence_digest(
+                matching_reviews,
+                matching_comments,
+                matching_reactions,
+            ),
         )
         return CodexReviewObservation(
             run_id=view.automated_review_run_id,

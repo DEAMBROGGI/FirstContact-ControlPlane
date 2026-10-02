@@ -129,6 +129,10 @@ class GitHub:
         base_shas=None,
         merge_result=MERGE_SHA,
         merge_error=None,
+        merge_commit_parents=(BASE, HEAD),
+        merge_commit_tree=TREE,
+        merge_commit_readback=None,
+        comparison_results=None,
     ):
         self.pulls = list(pulls)
         self.merged_statuses = list(merged_statuses)
@@ -144,6 +148,10 @@ class GitHub:
         )
         self.merge_result = merge_result
         self.merge_error = merge_error
+        self.merge_commit_parents = merge_commit_parents
+        self.merge_commit_tree = merge_commit_tree
+        self.merge_commit_readback = merge_commit_readback
+        self.comparison_results = list(comparison_results or [])
         self.merge_calls = []
 
     def pull_request(self, repository, number, token):
@@ -177,6 +185,26 @@ class GitHub:
         if not self.base_shas:
             raise AssertionError("unexpected ref_sha readback")
         return self.base_shas.pop(0)
+
+    def commit(self, repository, sha, token):
+        assert repository == REPOSITORY
+        assert token == "installation-token"
+        if isinstance(self.merge_commit_readback, Exception):
+            raise self.merge_commit_readback
+        if self.merge_commit_readback is not None:
+            return self.merge_commit_readback
+        return SimpleNamespace(
+            sha=sha,
+            tree_sha=self.merge_commit_tree,
+            parents=self.merge_commit_parents,
+        )
+
+    def compare_commits(self, repository, base_sha, head_sha, token):
+        assert repository == REPOSITORY
+        assert token == "installation-token"
+        if not self.comparison_results:
+            raise AssertionError("unexpected compare_commits readback")
+        return self.comparison_results.pop(0)
 
     def merge_pull_request(
         self,
@@ -358,13 +386,14 @@ def test_reconcile_ready_external_merge_records_violation_when_base_drifted(sess
         [pull(merged=True, merge_sha=MERGE_SHA)],
         merged_statuses=[True],
         base_shas=["9" * 40],
+        merge_commit_parents=("9" * 40, HEAD),
     )
     coordinator = MergeCoordinator(
         token_provider=TokenProvider(),
         github=github,
     )
 
-    with pytest.raises(MergeError, match="validated base moved"):
+    with pytest.raises(MergeError, match="validated candidate base and head"):
         coordinator.reconcile(session, ready.publication_id)
 
     current = get_view(session, ready.publication_id)
@@ -372,6 +401,95 @@ def test_reconcile_ready_external_merge_records_violation_when_base_drifted(sess
     assert current.merge_policy_violation is True
     assert current.merge_commit_sha == MERGE_SHA
     assert current.merge_source == "GITHUB_RECONCILE"
+
+
+def test_reconcile_accepts_exact_merge_when_live_base_has_advanced(session):
+    ready = ready_publication(session, issue_number=230)
+    advanced_base = "9" * 40
+    github = GitHub(
+        [pull(merged=True, merge_sha=MERGE_SHA)],
+        merged_statuses=[True],
+        base_shas=[advanced_base],
+        merge_commit_parents=(BASE, HEAD),
+    )
+    coordinator = MergeCoordinator(
+        token_provider=TokenProvider(),
+        github=github,
+    )
+
+    merged = coordinator.reconcile(session, ready.publication_id)
+
+    assert merged.state is PublicationState.MERGED
+    assert merged.merge_commit_sha == MERGE_SHA
+    assert github.base_shas == [advanced_base]
+
+
+def test_reconcile_accepts_rebased_commit_graph_with_exact_validated_base(session):
+    ready = ready_publication(session, issue_number=231)
+    github = GitHub(
+        [pull(merged=True, merge_sha=MERGE_SHA)],
+        merged_statuses=[True],
+        merge_commit_parents=("5" * 40,),
+        comparison_results=[
+            SimpleNamespace(
+                base_sha=BASE,
+                head_sha=HEAD,
+                merge_base_sha=BASE,
+                ahead_by=2,
+                behind_by=0,
+            ),
+            SimpleNamespace(
+                base_sha=BASE,
+                head_sha=MERGE_SHA,
+                merge_base_sha=BASE,
+                ahead_by=2,
+                behind_by=0,
+            ),
+        ],
+    )
+    coordinator = MergeCoordinator(
+        token_provider=TokenProvider(),
+        github=github,
+    )
+
+    merged = coordinator.reconcile(session, ready.publication_id)
+
+    assert merged.state is PublicationState.MERGED
+    assert not github.comparison_results
+
+
+@pytest.mark.parametrize(
+    ("merge_commit_readback", "message"),
+    [
+        (GitHubApiError("incomplete commit"), "ancestry readback failed closed"),
+        (
+            SimpleNamespace(sha="8" * 40, tree_sha=TREE, parents=(BASE, HEAD)),
+            "readback is inconsistent",
+        ),
+    ],
+)
+def test_reconcile_fails_closed_on_incomplete_or_inconsistent_commit_readback(
+    session,
+    merge_commit_readback,
+    message,
+):
+    ready = ready_publication(session, issue_number=232)
+    github = GitHub(
+        [pull(merged=True, merge_sha=MERGE_SHA)],
+        merged_statuses=[True],
+        merge_commit_readback=merge_commit_readback,
+    )
+    coordinator = MergeCoordinator(
+        token_provider=TokenProvider(),
+        github=github,
+    )
+
+    with pytest.raises(MergeError, match=message):
+        coordinator.reconcile(session, ready.publication_id)
+
+    current = get_view(session, ready.publication_id)
+    assert current.merge_policy_violation is False
+    assert current.state is PublicationState.READY_TO_MERGE
 
 
 def test_merge_command_rejects_non_ready_unmerged_publication(session):

@@ -17,6 +17,19 @@ def init_db() -> None:
     from . import models  # noqa: F401
 
     Base.metadata.create_all(bind=engine)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO github_webhook_delivery_claims "
+                "(delivery_id, owner_id, generation, lease_expires_at) "
+                "SELECT delivery.delivery_id, NULL, 0, NULL "
+                "FROM github_webhook_deliveries AS delivery "
+                "WHERE NOT EXISTS ("
+                "SELECT 1 FROM github_webhook_delivery_claims AS claim "
+                "WHERE claim.delivery_id = delivery.delivery_id"
+                ")"
+            )
+        )
     if engine.dialect.name == "postgresql":
         with engine.begin() as connection:
             connection.execute(

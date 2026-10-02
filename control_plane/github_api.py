@@ -28,6 +28,22 @@ class PullRequestSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class GitHubCommitSnapshot:
+    sha: str
+    tree_sha: str
+    parents: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class GitHubCommitComparisonSnapshot:
+    base_sha: str
+    head_sha: str
+    merge_base_sha: str
+    ahead_by: int
+    behind_by: int
+
+
+@dataclass(frozen=True, slots=True)
 class IssueSnapshot:
     number: int
     state: str
@@ -271,6 +287,110 @@ class GitHubRepositoryGateway:
         if len(value) != 40 or any(c not in "0123456789abcdef" for c in value):
             raise GitHubApiError("GitHub ref SHA is invalid")
         return value
+
+    def commit(
+        self,
+        repository: str,
+        sha: str,
+        token: str,
+    ) -> GitHubCommitSnapshot:
+        requested_sha = sha.lower()
+        if len(requested_sha) != 40 or any(
+            char not in "0123456789abcdef" for char in requested_sha
+        ):
+            raise GitHubApiError("GitHub commit SHA is invalid")
+        owner, name = self._parts(repository)
+        response = self._request(
+            "GET",
+            f"{self.api_url}/repos/{owner}/{name}/commits/{requested_sha}",
+            token=token,
+        )
+        assert response is not None
+        try:
+            payload = response.json()
+            if not isinstance(payload, dict):
+                raise ValueError("invalid commit payload")
+            result_sha = str(payload["sha"]).lower()
+            tree_sha = str(payload["commit"]["tree"]["sha"]).lower()
+            raw_parents = payload["parents"]
+            if not isinstance(raw_parents, list):
+                raise ValueError("invalid commit parents")
+            parents = tuple(str(item["sha"]).lower() for item in raw_parents)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise GitHubApiError("GitHub commit response is invalid") from exc
+        if result_sha != requested_sha:
+            raise GitHubApiError("GitHub commit response SHA is inconsistent")
+        for value in (result_sha, tree_sha, *parents):
+            if len(value) != 40 or any(
+                char not in "0123456789abcdef" for char in value
+            ):
+                raise GitHubApiError("GitHub commit response SHA is invalid")
+        if len(set(parents)) != len(parents):
+            raise GitHubApiError("GitHub commit parents are ambiguous")
+        return GitHubCommitSnapshot(
+            sha=result_sha,
+            tree_sha=tree_sha,
+            parents=parents,
+        )
+
+    def compare_commits(
+        self,
+        repository: str,
+        base_sha: str,
+        head_sha: str,
+        token: str,
+    ) -> GitHubCommitComparisonSnapshot:
+        requested_base = base_sha.lower()
+        requested_head = head_sha.lower()
+        for value in (requested_base, requested_head):
+            if len(value) != 40 or any(
+                char not in "0123456789abcdef" for char in value
+            ):
+                raise GitHubApiError("GitHub compare commit SHA is invalid")
+        owner, name = self._parts(repository)
+        response = self._request(
+            "GET",
+            f"{self.api_url}/repos/{owner}/{name}/compare/"
+            f"{requested_base}...{requested_head}",
+            token=token,
+        )
+        assert response is not None
+        try:
+            payload = response.json()
+            if not isinstance(payload, dict):
+                raise ValueError("invalid compare payload")
+            result_base = str(payload["base_commit"]["sha"]).lower()
+            result_head = str(payload["head_commit"]["sha"]).lower()
+            merge_base = str(payload["merge_base_commit"]["sha"]).lower()
+            ahead_by = payload["ahead_by"]
+            behind_by = payload["behind_by"]
+            if (
+                isinstance(ahead_by, bool)
+                or not isinstance(ahead_by, int)
+                or isinstance(behind_by, bool)
+                or not isinstance(behind_by, int)
+                or ahead_by < 0
+                or behind_by < 0
+            ):
+                raise ValueError("invalid compare counts")
+        except (KeyError, TypeError, ValueError) as exc:
+            raise GitHubApiError("GitHub commit comparison response is invalid") from exc
+        if result_base != requested_base or result_head != requested_head:
+            raise GitHubApiError("GitHub commit comparison identity is inconsistent")
+        if any(
+            len(value) != 40
+            or any(char not in "0123456789abcdef" for char in value)
+            for value in (result_base, result_head, merge_base)
+        ):
+            raise GitHubApiError("GitHub commit comparison SHA is invalid")
+        return GitHubCommitComparisonSnapshot(
+            base_sha=result_base,
+            head_sha=result_head,
+            merge_base_sha=merge_base,
+            ahead_by=ahead_by,
+            behind_by=behind_by,
+        )
+
     def _pull_snapshot(self, payload: dict) -> PullRequestSnapshot:
         try:
             merge_commit_sha = (

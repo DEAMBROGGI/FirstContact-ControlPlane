@@ -11,7 +11,11 @@ from control_plane.domain import (
     ReviewDecision,
     ValidationStatus,
 )
-from control_plane.github_api import PullRequestSnapshot, PullReviewSnapshot
+from control_plane.github_api import (
+    GitHubCommitSnapshot,
+    PullRequestSnapshot,
+    PullReviewSnapshot,
+)
 from control_plane.github_webhook import (
     GitHubWebhookGateway,
     get_review_watch,
@@ -167,6 +171,16 @@ class MergeApiGitHub:
         assert number == MERGE_PR_NUMBER
         assert token == "installation-token"
         return SimpleNamespace(commit_id=MERGE_COMMIT) if self.merged else None
+
+    def commit(self, repository, sha, token):
+        assert repository == MERGE_REPOSITORY
+        assert sha == MERGE_COMMIT
+        assert token == "installation-token"
+        return GitHubCommitSnapshot(
+            sha=MERGE_COMMIT,
+            tree_sha="5" * 40,
+            parents=(),
+        )
 
     def ref_sha(self, repository, branch, token):
         assert repository == MERGE_REPOSITORY

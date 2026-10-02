@@ -10,6 +10,7 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from control_plane.config import Settings, settings
+from control_plane.codex_findings import codex_review_body_finding_id
 from control_plane.db import get_session
 from control_plane.domain import (
     AutomatedReviewStatus,
@@ -1331,6 +1332,87 @@ def test_package_requires_exact_provider_findings_from_source_review(session):
             },
             findings=initial_findings(),
         )
+
+
+def test_package_accepts_body_only_codex_finding_without_provider_thread(session):
+    view = publish(session)
+    running = request_codex_review(
+        session,
+        view.publication_id,
+        mode="required",
+        expected_head_sha=HEAD,
+    )
+    title = "Keep ambiguous Codex invocations out of fallback"
+    body = (
+        "An unmanaged invocation can make the generic exception handler record "
+        "CODEX_TRIGGER_UNAVAILABLE and enable fallback."
+    )
+    finding_id = codex_review_body_finding_id(
+        run_id=running.automated_review_run_id,
+        head_sha=HEAD,
+        review_id=3102,
+        priority="P1",
+        title=title,
+        body=body,
+    )
+    complete_codex_review(
+        session,
+        view.publication_id,
+        run_id=running.automated_review_run_id,
+        reviewed_head_sha=HEAD,
+        result=AutomatedReviewStatus.CHANGES_REQUIRED,
+        findings=[
+            {
+                "finding_id": finding_id,
+                "normalized_identity": finding_id,
+                "provider_finding_id": finding_id,
+                "source_kind": "REVIEW_BODY",
+                "provider_review_id": 3102,
+                "priority": "P1",
+                "title": title,
+                "path": None,
+                "line": None,
+                "body": body,
+                "provider_body_sha256": "a" * 64,
+            }
+        ],
+        provider_review_ids=[3102],
+        provider_comment_ids=[],
+    )
+
+    package = create_work_package(
+        session,
+        publication_id=view.publication_id,
+        implementation_issue_number=14,
+        review_run_id=running.automated_review_run_id,
+        review_provider="CODEX_CODE_REVIEW",
+        provider_review_id=3102,
+        reviewed_head_sha=HEAD,
+        findings=[
+            {
+                "finding_id": finding_id,
+                "normalized_identity": finding_id,
+                "priority": "P1",
+                "source": {
+                    "kind": "PROVIDER_REVIEW_BODY",
+                    "provider": "CODEX_CODE_REVIEW",
+                    "provider_review_id": 3102,
+                    "provider_thread_id": None,
+                    "provider_finding_id": finding_id,
+                },
+                "principal_decision": {
+                    "decision": "ACCEPTED",
+                    "actor": "principal-reviewer",
+                    "reason": None,
+                },
+                "desired_reaction": "none",
+            }
+        ],
+        idempotency_key="body-finding-source",
+    )
+
+    assert package.findings[0]["source"]["provider_finding_id"] == finding_id
+    assert package.findings[0]["source"]["provider_thread_id"] is None
 
 
 def test_rejected_principal_decision_requires_reason(session):

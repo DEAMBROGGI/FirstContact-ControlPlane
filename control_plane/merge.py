@@ -3,7 +3,11 @@ from __future__ import annotations
 from sqlalchemy.orm import Session
 
 from .domain import DomainError, PublicationState, PublicationView
-from .github_api import GitHubApiError, GitHubRepositoryGateway, PullRequestSnapshot
+from .github_api import (
+    GitHubApiError,
+    GitHubRepositoryGateway,
+    PullRequestSnapshot,
+)
 from .github_app import GitHubAppTokenProvider, GitHubAuthError
 from .service import (
     get_view,
@@ -74,6 +78,62 @@ class MergeCoordinator:
             raise MergeError("GitHub merge commit evidence is inconsistent")
         return unique[0]
 
+    def _merge_matches_validated_candidate(
+        self,
+        *,
+        repository: str,
+        merge_commit_sha: str,
+        base_sha: str,
+        head_sha: str,
+        tree_sha: str,
+        token: str,
+    ) -> bool:
+        try:
+            merge_commit = self.github.commit(repository, merge_commit_sha, token)
+        except GitHubApiError as exc:
+            raise MergeError("GitHub merge commit ancestry readback failed closed") from exc
+        if merge_commit.sha != merge_commit_sha:
+            raise MergeError("GitHub merge commit readback is inconsistent")
+        if merge_commit.tree_sha != tree_sha:
+            return False
+        if merge_commit.parents in {
+            (base_sha, head_sha),
+            (base_sha,),
+        }:
+            return True
+        if len(merge_commit.parents) != 1:
+            return False
+
+        try:
+            candidate_comparison = self.github.compare_commits(
+                repository,
+                base_sha,
+                head_sha,
+                token,
+            )
+            merge_comparison = self.github.compare_commits(
+                repository,
+                base_sha,
+                merge_commit_sha,
+                token,
+            )
+        except GitHubApiError as exc:
+            raise MergeError("GitHub merge ancestry comparison failed closed") from exc
+        if (
+            candidate_comparison.base_sha != base_sha
+            or candidate_comparison.head_sha != head_sha
+            or merge_comparison.base_sha != base_sha
+            or merge_comparison.head_sha != merge_commit_sha
+        ):
+            raise MergeError("GitHub merge ancestry comparison is inconsistent")
+        return (
+            candidate_comparison.merge_base_sha == base_sha
+            and candidate_comparison.behind_by == 0
+            and merge_comparison.merge_base_sha == base_sha
+            and merge_comparison.behind_by == 0
+            and merge_comparison.ahead_by == candidate_comparison.ahead_by
+        )
+
     def _record_reconciled_pull(
         self,
         session: Session,
@@ -119,15 +179,16 @@ class MergeCoordinator:
             candidate = view.current_candidate
             if candidate is None or view.base_branch is None:
                 raise MergeError("publication base identity is incomplete")
-            try:
-                current_base_sha = self.github.ref_sha(
-                    view.repository,
-                    view.base_branch,
-                    token,
-                )
-            except GitHubApiError as exc:
-                raise MergeError("GitHub base readback failed closed") from exc
-            if current_base_sha != candidate.base_sha:
+            if candidate.head_sha != view.remote_head_sha:
+                raise MergeError("validated candidate head differs from governed PR head")
+            if not self._merge_matches_validated_candidate(
+                repository=view.repository,
+                merge_commit_sha=merge_commit_sha,
+                base_sha=candidate.base_sha,
+                head_sha=view.remote_head_sha,
+                tree_sha=candidate.tree_sha,
+                token=token,
+            ):
                 record_merge_policy_violation(
                     session,
                     publication_id,
@@ -136,7 +197,7 @@ class MergeCoordinator:
                     merge_commit_sha=merge_commit_sha,
                 )
                 raise MergePolicyViolationRecorded(
-                    "GitHub reports an external merge after the validated base moved"
+                    "GitHub merge commit does not match the validated candidate base and head"
                 )
             if not human_review_eligible:
                 record_merge_policy_violation(

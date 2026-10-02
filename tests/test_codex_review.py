@@ -607,6 +607,162 @@ def test_clean_native_codex_review_releases_human_review(session):
     assert approved.state is PublicationState.APPROVED
 
 
+def test_body_only_codex_finding_requires_changes_and_is_ledgered(session):
+    view = published_publication(session)
+    value, _tokens, github = broker()
+    running = value.request(session, view.publication_id)
+    body = (
+        "## Review findings\n\n"
+        "### [P1] Keep ambiguous Codex invocations out of fallback\n\n"
+        "An unmanaged invocation can make the generic exception handler record "
+        "CODEX_TRIGGER_UNAVAILABLE, making required-mode Principal Reviewer "
+        "fallback eligible.\n\n"
+        "## Summary\n\nThe remaining review notes are informational.\n"
+    )
+    github.reviews.append(
+        PullReviewSnapshot(
+            review_id=710,
+            actor=CODEX_ACTOR,
+            body=body,
+            state="COMMENTED",
+            commit_id=HEAD,
+            submitted_at="2026-09-27T20:01:00Z",
+        )
+    )
+
+    observed = value.reconcile(session, view.publication_id)
+    after = get_view(session, view.publication_id)
+    completed = next(
+        event
+        for event in load_events(session, view.publication_id)
+        if event["event_type"] == "CODEX_REVIEW_COMPLETED"
+        and event["payload"]["run_id"] == running.automated_review_run_id
+    )
+    finding = completed["payload"]["findings"][0]
+
+    assert observed.state == "CHANGES_REQUIRED"
+    assert after.automated_review_findings_count == 1
+    assert finding["source_kind"] == "REVIEW_BODY"
+    assert finding["provider_review_id"] == 710
+    assert "provider_comment_id" not in finding
+    assert finding["finding_id"].startswith(
+        f"codex-body:run-{running.automated_review_run_id}:head-{HEAD}:review-710:"
+    )
+    assert finding["provider_body_sha256"]
+
+
+def test_equivalent_inline_and_review_body_findings_are_not_duplicated(session):
+    view = published_publication(session)
+    value, _tokens, github = broker()
+    value.request(session, view.publication_id)
+    finding_body = (
+        "### [P1] Keep ambiguous Codex invocations out of fallback\n\n"
+        "An unmanaged invocation can make the generic exception handler record "
+        "CODEX_TRIGGER_UNAVAILABLE, making required-mode Principal Reviewer "
+        "fallback eligible."
+    )
+    github.reviews.append(
+        PullReviewSnapshot(
+            review_id=711,
+            actor=CODEX_ACTOR,
+            body=f"## Findings\n\n{finding_body}",
+            state="COMMENTED",
+            commit_id=HEAD,
+            submitted_at="2026-09-27T20:01:00Z",
+        )
+    )
+    github.review_comments.append(
+        PullReviewCommentSnapshot(
+            comment_id=712,
+            review_id=711,
+            actor=CODEX_ACTOR,
+            body=finding_body,
+            commit_id=HEAD,
+            path="control_plane/codex_review.py",
+            line=700,
+            created_at="2026-09-27T20:01:01Z",
+        )
+    )
+
+    value.reconcile(session, view.publication_id)
+
+    after = get_view(session, view.publication_id)
+    assert after.automated_review_findings_count == 1
+
+
+@pytest.mark.parametrize("surface", ["review", "reaction"])
+def test_terminal_codex_pass_is_invalidated_when_expected_evidence_disappears(
+    session,
+    surface,
+):
+    view = published_publication(session)
+    value, _tokens, github = broker()
+    value.request(session, view.publication_id)
+    if surface == "review":
+        github.reviews.append(
+            PullReviewSnapshot(
+                review_id=713,
+                actor=CODEX_ACTOR,
+                body="Review passed.",
+                state="COMMENTED",
+                commit_id=HEAD,
+                submitted_at="2026-09-27T20:01:00Z",
+            )
+        )
+    else:
+        github.reactions.append(
+            IssueReactionSnapshot(
+                reaction_id=714,
+                actor=CODEX_ACTOR,
+                content="+1",
+                created_at="2026-09-27T20:01:00Z",
+            )
+        )
+    assert value.reconcile(session, view.publication_id).state == "PASS"
+
+    if surface == "review":
+        github.reviews.clear()
+    else:
+        github.reactions.clear()
+
+    observed = value.reconcile(session, view.publication_id)
+
+    assert observed.state == "INVALIDATED"
+    assert get_view(
+        session,
+        view.publication_id,
+    ).automated_review_status is AutomatedReviewStatus.UNAVAILABLE
+
+
+def test_terminal_codex_pass_is_invalidated_when_review_body_changes(session):
+    view = published_publication(session)
+    value, _tokens, github = broker()
+    value.request(session, view.publication_id)
+    review = PullReviewSnapshot(
+        review_id=715,
+        actor=CODEX_ACTOR,
+        body="Review passed.",
+        state="COMMENTED",
+        commit_id=HEAD,
+        submitted_at="2026-09-27T20:01:00Z",
+    )
+    github.reviews.append(review)
+    assert value.reconcile(session, view.publication_id).state == "PASS"
+
+    github.reviews[0] = PullReviewSnapshot(
+        review_id=review.review_id,
+        actor=review.actor,
+        body="Changed provider evidence.",
+        state=review.state,
+        commit_id=review.commit_id,
+        submitted_at=review.submitted_at,
+    )
+
+    observed = value.reconcile(session, view.publication_id)
+
+    assert observed.state == "INVALIDATED"
+
+
 def test_clean_codex_thumbsup_reaction_can_complete_pass(session):
     view = published_publication(session)
     value, _tokens, github = broker()
@@ -896,8 +1052,15 @@ def test_same_second_unmanaged_codex_invocation_blocks_governed_trigger(session)
         value.request(session, view.publication_id)
 
     assert github.posted_bodies == []
-    after = get_view(session, view.publication_id)
-    assert after.automated_review_status is AutomatedReviewStatus.UNAVAILABLE
+    events = load_events(session, view.publication_id)
+    assert any(
+        event["event_type"] == "CODEX_REVIEW_INVALIDATED"
+        for event in events
+    )
+    assert not any(
+        event["event_type"] == "CODEX_REVIEW_UNAVAILABLE"
+        for event in events
+    )
 
 
 def test_stale_locked_codex_head_check_closes_external_verification_race(

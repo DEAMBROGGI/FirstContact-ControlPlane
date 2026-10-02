@@ -435,7 +435,7 @@ def test_public_webhook_sanitizes_retryable_processing_errors(
 
     monkeypatch.setattr(GitHubWebhookGateway, "process_delivery", fail_processing)
     client = client_for(session)
-    body, signature = signed_body()
+    body, signature = signed_push_body()
     delivery_id = f"api-retry-{error_type.__name__}"
     try:
         response = client.post(
@@ -445,7 +445,7 @@ def test_public_webhook_sanitizes_retryable_processing_errors(
                 "Content-Type": "application/json",
                 "X-Hub-Signature-256": signature,
                 "X-GitHub-Delivery": delivery_id,
-                "X-GitHub-Event": "ping",
+                "X-GitHub-Event": "push",
             },
         )
 

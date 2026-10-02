@@ -330,6 +330,23 @@ class GitHubWebhookDeliveryRow(Base):
     )
 
 
+class GitHubWebhookDeliveryClaimRow(Base):
+    """Expiring, fenced owner lease for one durable webhook inbox receipt."""
+
+    __tablename__ = "github_webhook_delivery_claims"
+
+    delivery_id: Mapped[str] = mapped_column(
+        ForeignKey("github_webhook_deliveries.delivery_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    owner_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    generation: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+
 class ReviewWatchRow(Base):
     """Recoverable exact-head review watch projection derived from publication authority."""
 

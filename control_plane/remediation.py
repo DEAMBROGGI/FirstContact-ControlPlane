@@ -19,6 +19,7 @@ from .domain import (
     PublicationState,
     validate_transition,
 )
+from .codex_findings import codex_review_body_finding_id
 from .models import (
     CandidateRow,
     RemediationDispatchRow,
@@ -438,9 +439,53 @@ def _find_source_review(
             raise DomainError("source review finding ledger contains duplicate ids")
 
         source_comments: dict[int, dict[str, Any]] = {}
+        source_body_findings: dict[str, dict[str, Any]] = {}
         for finding in findings:
             if not isinstance(finding, dict):
                 raise DomainError("source review finding ledger is inconsistent")
+            source_kind = finding.get("source_kind", "INLINE_COMMENT")
+            if source_kind == "REVIEW_BODY":
+                try:
+                    review_id = int(finding["provider_review_id"])
+                    priority = str(finding["priority"]).upper()
+                    title = str(finding["title"]).strip()
+                    body = str(finding["body"])
+                    provider_finding_id = str(finding["provider_finding_id"])
+                    finding_id = str(finding["finding_id"])
+                    normalized_identity = str(finding["normalized_identity"])
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise DomainError(
+                        "source review body finding ledger is inconsistent"
+                    ) from exc
+                expected_id = codex_review_body_finding_id(
+                    run_id=review_run_id,
+                    head_sha=reviewed_head_sha,
+                    review_id=review_id,
+                    priority=priority,
+                    title=title,
+                    body=body,
+                )
+                body_digest = str(finding.get("provider_body_sha256") or "")
+                if (
+                    review_id <= 0
+                    or review_id not in provider_review_ids
+                    or priority not in {"P0", "P1", "P2", "P3", "P4"}
+                    or not title
+                    or len(body) > 4000
+                    or finding.get("provider_comment_id") is not None
+                    or provider_finding_id != expected_id
+                    or finding_id != expected_id
+                    or normalized_identity != expected_id
+                    or not _EVIDENCE_RE.fullmatch(body_digest)
+                    or provider_finding_id in source_body_findings
+                ):
+                    raise DomainError(
+                        "source review body finding ledger is inconsistent"
+                    )
+                source_body_findings[provider_finding_id] = finding
+                continue
+            if source_kind != "INLINE_COMMENT":
+                raise DomainError("source review finding kind is unsupported")
             try:
                 comment_id = int(finding["provider_comment_id"])
                 review_id = int(finding["provider_review_id"])
@@ -482,8 +527,15 @@ def _validate_review_findings(
     trusted_comments = {
         int(item["provider_comment_id"]): item
         for item in source_review["findings"]
+        if item.get("source_kind", "INLINE_COMMENT") == "INLINE_COMMENT"
+    }
+    trusted_body_findings = {
+        str(item["provider_finding_id"]): item
+        for item in source_review["findings"]
+        if item.get("source_kind") == "REVIEW_BODY"
     }
     submitted_comments: list[tuple[int, int]] = []
+    submitted_body_findings: list[tuple[int, str]] = []
     for finding in findings:
         source = finding["source"]
         kind = source["kind"]
@@ -492,8 +544,49 @@ def _validate_review_findings(
                 source["provider"] != "CONTROL_PLANE"
                 or source["provider_review_id"] is not None
                 or source["provider_thread_id"] is not None
+                or source.get("provider_finding_id") is not None
             ):
                 raise DomainError("internal findings require the explicit Control Plane source")
+            continue
+        if kind == "PROVIDER_REVIEW_BODY":
+            review_id = source["provider_review_id"]
+            provider_finding_id = source.get("provider_finding_id")
+            trusted = trusted_body_findings.get(str(provider_finding_id or ""))
+            if (
+                source["provider"] != source_provider
+                or review_id is None
+                or source["provider_thread_id"] is not None
+                or trusted is None
+                or int(trusted["provider_review_id"]) != review_id
+            ):
+                raise DomainError(
+                    "provider body finding is not owned by the source review run"
+                )
+            expected_id = str(trusted["finding_id"])
+            expected_identity = str(trusted["normalized_identity"])
+            expected_priority = str(trusted["priority"]).upper()
+            if finding["priority"] != expected_priority:
+                raise DomainError(
+                    "provider body finding priority differs from the source review"
+                )
+            if (
+                finding["finding_id"] != expected_id
+                or finding["normalized_identity"] != expected_identity
+            ):
+                raise DomainError(
+                    "provider body finding identity differs from the source review"
+                )
+            finding["source"].update(
+                {
+                    "provider_finding_id": expected_id,
+                    "path": None,
+                    "line": None,
+                    "side": None,
+                    "title": str(trusted["title"]),
+                    "body": str(trusted.get("body", ""))[:4000],
+                }
+            )
+            submitted_body_findings.append((review_id, expected_id))
             continue
         if kind != "PROVIDER_THREAD":
             raise DomainError("finding source kind is unsupported")
@@ -563,8 +656,18 @@ def _validate_review_findings(
     expected_comments = {
         (int(item["provider_review_id"]), int(item["provider_comment_id"]))
         for item in source_review["findings"]
+        if item.get("source_kind", "INLINE_COMMENT") == "INLINE_COMMENT"
     }
-    if set(submitted_comments) != expected_comments:
+    expected_body_findings = {
+        (int(item["provider_review_id"]), str(item["provider_finding_id"]))
+        for item in source_review["findings"]
+        if item.get("source_kind") == "REVIEW_BODY"
+    }
+    if (
+        set(submitted_comments) != expected_comments
+        or len(submitted_body_findings) != len(set(submitted_body_findings))
+        or set(submitted_body_findings) != expected_body_findings
+    ):
         raise DomainError(
             "Principal Reviewer decision set must include every source provider finding exactly once"
         )
@@ -624,17 +727,32 @@ def _normalize_findings(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
         provider_review_id = source.get("provider_review_id")
         if provider_review_id is not None and int(provider_review_id) <= 0:
             raise DomainError("provider review id must be positive")
+        provider_finding_id = source.get("provider_finding_id")
+        if source.get("kind") == "PROVIDER_REVIEW_BODY":
+            if (
+                provider_thread_id is not None
+                or provider_review_id is None
+                or not isinstance(provider_finding_id, str)
+                or not provider_finding_id
+                or len(provider_finding_id) > 200
+            ):
+                raise DomainError("provider review body identity is invalid")
+        elif provider_finding_id is not None:
+            raise DomainError("provider finding id is only valid for review-body findings")
+        normalized_source = {
+            "kind": str(source["kind"]),
+            "provider": str(source.get("provider", "")),
+            "provider_review_id": int(provider_review_id) if provider_review_id is not None else None,
+            "provider_thread_id": int(provider_thread_id) if provider_thread_id is not None else None,
+        }
+        if provider_finding_id is not None:
+            normalized_source["provider_finding_id"] = provider_finding_id
         normalized.append(
             {
                 "finding_id": finding_id,
                 "normalized_identity": identity,
                 "priority": priority,
-                "source": {
-                    "kind": str(source["kind"]),
-                    "provider": str(source.get("provider", "")),
-                    "provider_review_id": int(provider_review_id) if provider_review_id is not None else None,
-                    "provider_thread_id": int(provider_thread_id) if provider_thread_id is not None else None,
-                },
+                "source": normalized_source,
                 "principal_decision": {
                     "decision": decision_value.value,
                     "actor": actor,
