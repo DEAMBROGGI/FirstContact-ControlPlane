@@ -5,6 +5,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .domain import AutomatedReviewStatus, DomainError, EventType, PublicationState
@@ -19,6 +20,7 @@ from .github_review_auth import (
     GitHubReviewAuthError,
     GitHubReviewTokenProvider,
 )
+from .models import GitHubWebhookDeliveryRow
 from .repository import load_events
 from .service import (
     claim_codex_review_trigger_dispatch,
@@ -183,6 +185,90 @@ class CodexReviewBroker:
             return _parse_time(view.automated_review_triggered_at) is not None
         except CodexReviewError:
             return False
+
+    def assert_no_deleted_ambiguous_invocations(self, session: Session, view) -> None:
+        if view.automated_review_status is not AutomatedReviewStatus.RUNNING:
+            return
+        if (
+            view.automated_review_trigger_comment_id is None
+            or view.automated_review_triggered_at is None
+            or view.pull_request_number is None
+        ):
+            raise CodexReviewError("active Codex review metadata is incomplete")
+
+        trigger_time = _parse_time(view.automated_review_triggered_at)
+        if trigger_time is None:
+            raise CodexReviewError("governed Codex trigger timestamp is missing")
+
+        deliveries = session.scalars(
+            select(GitHubWebhookDeliveryRow).where(
+                GitHubWebhookDeliveryRow.event_name == "issue_comment",
+                GitHubWebhookDeliveryRow.action == "deleted",
+                GitHubWebhookDeliveryRow.repository == view.repository,
+                GitHubWebhookDeliveryRow.pull_request_number
+                == view.pull_request_number,
+            )
+        )
+        for delivery in deliveries:
+            payload = delivery.payload
+            if not isinstance(payload, dict):
+                raise CodexReviewError(
+                    "deleted issue-comment evidence is incomplete"
+                )
+            repository = payload.get("repository")
+            issue = payload.get("issue")
+            if (
+                not isinstance(repository, dict)
+                or repository.get("full_name") != view.repository
+                or not isinstance(issue, dict)
+                or not isinstance(issue.get("pull_request"), dict)
+            ):
+                raise CodexReviewError(
+                    "deleted issue-comment evidence does not match its delivery"
+                )
+            pull_number = issue.get("number")
+            if isinstance(pull_number, bool) or not isinstance(pull_number, int):
+                raise CodexReviewError(
+                    "deleted issue-comment evidence is incomplete"
+                )
+            if pull_number != view.pull_request_number:
+                raise CodexReviewError(
+                    "deleted issue-comment evidence does not match its delivery"
+                )
+
+            comment = payload.get("comment")
+            if not isinstance(comment, dict):
+                raise CodexReviewError(
+                    "deleted issue-comment evidence is incomplete"
+                )
+            comment_id = comment.get("id")
+            if (
+                isinstance(comment_id, bool)
+                or not isinstance(comment_id, int)
+                or comment_id <= 0
+            ):
+                raise CodexReviewError(
+                    "deleted issue-comment evidence is incomplete"
+                )
+            if comment_id == view.automated_review_trigger_comment_id:
+                continue
+
+            body = comment.get("body")
+            if not isinstance(body, str):
+                raise CodexReviewError(
+                    "deleted issue-comment evidence is incomplete"
+                )
+            if not _RESERVED_CODEX_MENTION.search(body):
+                continue
+
+            created_at = comment.get("created_at")
+            created_time = _parse_time(
+                created_at if isinstance(created_at, str) else None
+            )
+            if created_time is None or created_time >= trigger_time:
+                raise CodexReviewError(
+                    "additional Codex invocation detected during governed review"
+                )
 
     def request(self, session: Session, publication_id: str):
         if self.mode == "disabled":
@@ -495,6 +581,7 @@ class CodexReviewBroker:
             trigger_comment_id=trigger.comment_id,
             trigger_time=trigger_time,
         )
+        self.assert_no_deleted_ambiguous_invocations(session, view)
 
         matching_reviews = []
         for item in reviews:

@@ -30,6 +30,7 @@ from .models import GitHubWebhookDeliveryRow, PublicationRow, ReviewWatchRow
 from .profile_registry import ProfileError, profile_for_repository
 from .repository import load_events
 from .service import (
+    clear_human_review_block,
     get_view,
     mark_codex_review_unavailable,
     record_mergeability,
@@ -351,6 +352,8 @@ def _derive_next(
     if view.automated_review_status is AutomatedReviewStatus.UNAVAILABLE:
         return "PRINCIPAL_REVIEWER", "PRINCIPAL_FALLBACK"
     if view.automated_review_status is AutomatedReviewStatus.CHANGES_REQUIRED:
+        if codex_review_mode.strip().lower() == "advisory":
+            return "HUMAN_REVIEWER", "WAIT_HUMAN_REVIEW"
         return "IMPLEMENTER", "REMEDIATE_FINDINGS"
     if view.automated_review_status is AutomatedReviewStatus.PASS:
         return "HUMAN_REVIEWER", "WAIT_HUMAN_REVIEW"
@@ -985,6 +988,10 @@ class GitHubWebhookGateway:
         )
         if pull.head_sha != head_sha:
             raise DomainError("mergeability evidence head is stale")
+        if pull.merged:
+            raise DomainError(
+                "mergeability is blocked because the canonical PR is already merged"
+            )
         return pull
 
     def _assert_live_head_and_base(
@@ -1099,6 +1106,10 @@ class GitHubWebhookGateway:
             comments,
             trigger_comment_id=trigger.comment_id,
             trigger_time=trigger_time,
+        )
+        self._codex_broker().assert_no_deleted_ambiguous_invocations(
+            session,
+            view,
         )
 
         if comment_id is not None:
@@ -1217,53 +1228,71 @@ class GitHubWebhookGateway:
         observation = self._codex_broker().reconcile(session, publication_id)
         return "CODEX_" + observation.state
 
-    def _latest_human_review(
+    def _effective_human_review_decisions(
         self,
-        view,
+        reviews,
         *,
-        token: str,
-        reviews=None,
+        head_sha: str,
+    ) -> dict[str, tuple[datetime, Any]]:
+        latest_by_actor = {}
+        ambiguous_actors = set()
+        candidates = []
+        decision_states = {
+            "APPROVED",
+            "CHANGES_REQUESTED",
+            "REQUEST_CHANGES",
+            "DISMISSED",
+        }
+        for item in reviews:
+            actor = _normalize_actor(item.actor)
+            if actor not in self.human_review_actors or item.commit_id != head_sha:
+                continue
+            review_state = item.state.strip().upper()
+            if review_state not in decision_states:
+                continue
+            submitted_at = _parse_time(item.submitted_at)
+            if submitted_at is None:
+                ambiguous_actors.add(actor)
+                continue
+            candidates.append((submitted_at, item.review_id, actor, item))
+
+        if ambiguous_actors:
+            raise GitHubWebhookError(
+                "human review decision timestamp is missing or ambiguous"
+            )
+
+        candidates.sort(key=lambda item: (item[0], item[1], item[2]))
+        timestamp_decisions = {}
+        for submitted_at, review_id, actor, item in candidates:
+            key = (actor, submitted_at)
+            decision = (review_id, item.state.strip().upper())
+            previous = timestamp_decisions.get(key)
+            if previous is not None and previous != decision:
+                raise GitHubWebhookError(
+                    "human review decision timestamp is ambiguous"
+                )
+            timestamp_decisions[key] = decision
+
+        for submitted_at, review_id, actor, item in candidates:
+            latest_by_actor[actor] = (submitted_at, review_id, item)
+        return {
+            actor: (submitted_at, item)
+            for actor, (submitted_at, _review_id, item) in latest_by_actor.items()
+        }
+
+    @staticmethod
+    def _active_human_approvals(
+        effective_reviews: Mapping[str, tuple[datetime, Any]],
+        *,
+        submitted_after: datetime | None = None,
     ):
-        if not self.human_review_actors:
-            return None
-        if view.pull_request_number is None or view.remote_head_sha is None:
-            raise GitHubWebhookError("human review publication metadata is incomplete")
-
-        if reviews is None:
-            reviews = self.github.list_pull_reviews(
-                view.repository,
-                view.pull_request_number,
-                token,
-            )
-        candidates = [
+        return tuple(
             item
-            for item in reviews
-            if _normalize_actor(item.actor) in self.human_review_actors
-            and item.commit_id == view.remote_head_sha
-            and item.state.strip().upper() in {
-                "APPROVED",
-                "CHANGES_REQUESTED",
-                "REQUEST_CHANGES",
-            }
-            and item.submitted_at is not None
-        ]
-        if not candidates:
-            return None
-
-        candidates.sort(
-            key=lambda item: (
-                _parse_time(item.submitted_at)
-                or datetime.min.replace(tzinfo=timezone.utc),
-                item.review_id,
-            )
+            for actor in sorted(effective_reviews)
+            for submitted_at, item in (effective_reviews[actor],)
+            if item.state.strip().upper() == "APPROVED"
+            and (submitted_after is None or submitted_at > submitted_after)
         )
-        selected = candidates[-1]
-        decision = (
-            ReviewDecision.APPROVED
-            if selected.state.strip().upper() == "APPROVED"
-            else ReviewDecision.CHANGES_REQUIRED
-        )
-        return selected, decision
 
     def _dismissed_recorded_approval_id(
         self,
@@ -1310,39 +1339,13 @@ class GitHubWebhookGateway:
         head_sha: str,
         submitted_after: datetime | None = None,
     ):
-        latest_by_actor = {}
-        ambiguous_actors = set()
-        submitted_reviews = []
-        for item in reviews:
-            actor = _normalize_actor(item.actor)
-            if actor not in self.human_review_actors:
-                continue
-            review_state = item.state.strip().upper()
-            if review_state not in {
-                "APPROVED",
-                "CHANGES_REQUESTED",
-                "REQUEST_CHANGES",
-                "DISMISSED",
-            }:
-                continue
-            submitted_at = _parse_time(item.submitted_at)
-            if submitted_at is None:
-                ambiguous_actors.add(actor)
-                continue
-            submitted_reviews.append((submitted_at, item.review_id, actor, item))
-
-        submitted_reviews.sort(key=lambda item: (item[0], item[1]))
-        for submitted_at, _review_id, actor, item in submitted_reviews:
-            if actor not in ambiguous_actors:
-                latest_by_actor[actor] = (submitted_at, item)
-
-        return tuple(
-            item
-            for actor, (submitted_at, item) in latest_by_actor.items()
-            if actor not in ambiguous_actors
-            and item.commit_id == head_sha
-            and item.state.strip().upper() == "APPROVED"
-            and (submitted_after is None or submitted_at > submitted_after)
+        effective_reviews = self._effective_human_review_decisions(
+            reviews,
+            head_sha=head_sha,
+        )
+        return self._active_human_approvals(
+            effective_reviews,
+            submitted_after=submitted_after,
         )
 
     def _effective_active_human_approvals_after_adjudication(
@@ -1351,6 +1354,7 @@ class GitHubWebhookGateway:
         publication_id: str,
         view,
         reviews,
+        effective_reviews=None,
     ):
         submitted_after = None
         if self._requires_codex_adjudication(view):
@@ -1362,11 +1366,92 @@ class GitHubWebhookGateway:
                 publication_id,
                 adjudication,
             )
-        return self._effective_active_human_approvals(
-            reviews,
-            head_sha=view.remote_head_sha,
+        if effective_reviews is None:
+            effective_reviews = self._effective_human_review_decisions(
+                reviews,
+                head_sha=view.remote_head_sha,
+            )
+        return self._active_human_approvals(
+            effective_reviews,
             submitted_after=submitted_after,
         )
+
+    @staticmethod
+    def _recorded_human_changes_event(
+        session: Session,
+        publication_id: str,
+        *,
+        head_sha: str,
+    ):
+        for event in reversed(load_events(session, publication_id)):
+            if (
+                event["event_type"] == EventType.REVIEW_RECORDED.value
+                and event["payload"].get("reviewed_head_sha") == head_sha
+            ):
+                if (
+                    event["payload"].get("decision")
+                    == ReviewDecision.CHANGES_REQUIRED.value
+                ):
+                    return event
+                return None
+        return None
+
+    def _clear_human_review_block(
+        self,
+        session: Session,
+        publication_id: str,
+        *,
+        view,
+        blocker_event,
+        reviews,
+        effective_reviews,
+    ) -> bool:
+        blocker_payload = blocker_event["payload"]
+        blocking_review_id = blocker_payload.get("github_review_id")
+        if (
+            isinstance(blocking_review_id, bool)
+            or not isinstance(blocking_review_id, int)
+            or blocking_review_id <= 0
+        ):
+            return False
+        blocking_reviews = [
+            item
+            for item in reviews
+            if item.review_id == blocking_review_id
+            and item.commit_id == view.remote_head_sha
+        ]
+        if len(blocking_reviews) != 1:
+            return False
+        blocking_review = blocking_reviews[0]
+        actor = _normalize_actor(blocking_review.actor)
+        if actor not in self.human_review_actors:
+            return False
+        effective = effective_reviews.get(actor)
+        if effective is None:
+            return False
+        blocking_time = _parse_time(blocking_review.submitted_at)
+        if blocking_time is None:
+            return False
+        clearing_time, clearing_review = effective
+        clearing_state = clearing_review.state.strip().upper()
+        if clearing_state not in {"APPROVED", "DISMISSED"}:
+            return False
+        if clearing_review.review_id == blocking_review_id:
+            if clearing_state != "DISMISSED":
+                return False
+        elif clearing_time <= blocking_time:
+            return False
+
+        clear_human_review_block(
+            session,
+            publication_id,
+            reviewed_head_sha=view.remote_head_sha,
+            cleared_review_event_sequence=blocker_event["sequence"],
+            blocking_review_id=blocking_review_id,
+            clearing_review_id=clearing_review.review_id,
+            clearing_review_state=clearing_state,
+        )
+        return True
 
     def _human_review_from_payload(
         self,
@@ -1406,41 +1491,11 @@ class GitHubWebhookGateway:
         if receipt.commit_id != view.remote_head_sha:
             return "STALE_HUMAN_REVIEW"
         review_state = receipt.state.strip().upper()
-        if review_state == "DISMISSED":
-            if (
-                view.state in {
-                    PublicationState.APPROVED,
-                    PublicationState.READY_TO_MERGE,
-                }
-                and view.review_decision is ReviewDecision.APPROVED
-            ):
-                active_approvals = self._effective_active_human_approvals_after_adjudication(
-                    session,
-                    publication_id,
-                    view,
-                    reviews,
-                )
-                if active_approvals:
-                    return "HUMAN_APPROVAL_REMAINS"
-                record_review(
-                    session,
-                    publication_id,
-                    reviewed_head_sha=receipt.commit_id,
-                    decision=ReviewDecision.CHANGES_REQUIRED,
-                    require_codex_review=self._requires_codex_adjudication(view),
-                    github_review_id=receipt.review_id,
-                )
-                return "HUMAN_CHANGES_REQUIRED"
-            if (
-                view.state is PublicationState.CHANGES_REQUIRED
-                and view.review_decision is ReviewDecision.CHANGES_REQUIRED
-            ):
-                return "HUMAN_CHANGES_REQUIRED_ALREADY_RECORDED"
-            return "NON_DECISION_HUMAN_REVIEW"
         if review_state not in {
             "APPROVED",
             "CHANGES_REQUESTED",
             "REQUEST_CHANGES",
+            "DISMISSED",
         }:
             return "NON_DECISION_HUMAN_REVIEW"
 
@@ -1454,11 +1509,38 @@ class GitHubWebhookGateway:
                 "human review is waiting for required automated/fallback adjudication"
             )
 
-        return self._reconcile_human_from_github(
+        outcome = self._reconcile_human_from_github(
             session,
             publication_id,
             token=token,
         )
+        if (
+            review_state == ReviewDecision.APPROVED.value
+            and view.state in {
+                PublicationState.APPROVED,
+                PublicationState.READY_TO_MERGE,
+            }
+            and outcome == "HUMAN_APPROVAL_REMAINS"
+        ):
+            recorded_approval = next(
+                (
+                    event
+                    for event in reversed(load_events(session, publication_id))
+                    if event["event_type"] == EventType.REVIEW_RECORDED.value
+                    and event["payload"].get("reviewed_head_sha")
+                    == view.remote_head_sha
+                    and event["payload"].get("decision")
+                    == ReviewDecision.APPROVED.value
+                ),
+                None,
+            )
+            if (
+                recorded_approval is not None
+                and recorded_approval["payload"].get("github_review_id")
+                == receipt.review_id
+            ):
+                return "HUMAN_APPROVED_ALREADY_RECORDED"
+        return outcome
 
     def _mergeability_if_ready(
         self,
@@ -1519,102 +1601,155 @@ class GitHubWebhookGateway:
             view.pull_request_number,
             token,
         )
-        latest = self._latest_human_review(
-            view,
-            token=token,
-            reviews=reviews,
+        effective_reviews = self._effective_human_review_decisions(
+            reviews,
+            head_sha=view.remote_head_sha,
         )
-
-        if (
-            view.state in {
-                PublicationState.APPROVED,
-                PublicationState.READY_TO_MERGE,
+        active_changes = [
+            (submitted_at, item)
+            for submitted_at, item in effective_reviews.values()
+            if item.state.strip().upper() in {
+                "CHANGES_REQUESTED",
+                "REQUEST_CHANGES",
             }
-            and view.review_decision is ReviewDecision.APPROVED
-            and (latest is None or latest[1] is ReviewDecision.APPROVED)
-        ):
-            active_approvals = self._effective_active_human_approvals_after_adjudication(
+        ]
+        active_changes.sort(
+            key=lambda entry: (
+                entry[0],
+                entry[1].review_id,
+                _normalize_actor(entry[1].actor),
+            )
+        )
+        active_approvals = self._effective_active_human_approvals_after_adjudication(
+            session,
+            publication_id,
+            view,
+            reviews,
+            effective_reviews=effective_reviews,
+        )
+        required_codex_findings = (
+            view.automated_review_status is AutomatedReviewStatus.CHANGES_REQUIRED
+            and self._requires_codex_adjudication(view)
+        )
+        cleared_human_block = False
+
+        if view.state is PublicationState.CHANGES_REQUIRED:
+            if (
+                required_codex_findings
+                or view.review_decision is not ReviewDecision.CHANGES_REQUIRED
+            ):
+                return "HUMAN_NOT_ELIGIBLE"
+            if active_changes:
+                return "HUMAN_CHANGES_REQUIRED_ALREADY_RECORDED"
+            blocker_event = self._recorded_human_changes_event(
                 session,
                 publication_id,
-                view,
-                reviews,
+                head_sha=view.remote_head_sha,
             )
-            if not active_approvals:
-                dismissed_recorded_approval_id = self._dismissed_recorded_approval_id(
-                    session,
-                    publication_id,
-                    reviews,
-                    head_sha=view.remote_head_sha,
-                )
-                record_review(
-                    session,
-                    publication_id,
-                    reviewed_head_sha=view.remote_head_sha,
-                    decision=ReviewDecision.CHANGES_REQUIRED,
-                    require_codex_review=self._requires_codex_adjudication(view),
-                    github_review_id=dismissed_recorded_approval_id,
-                )
-                return "HUMAN_CHANGES_REQUIRED"
-            if latest is None:
-                return "HUMAN_APPROVAL_REMAINS"
-
-        if latest is None:
-            return "HUMAN_REVIEW_NOT_FOUND"
-
-        selected, decision = latest
-
-        if view.state is not PublicationState.IN_REVIEW:
-            if (
-                decision is ReviewDecision.CHANGES_REQUIRED
-                and view.state in {
-                    PublicationState.APPROVED,
-                    PublicationState.READY_TO_MERGE,
-                }
+            if blocker_event is None or not self._clear_human_review_block(
+                session,
+                publication_id,
+                view=view,
+                blocker_event=blocker_event,
+                reviews=reviews,
+                effective_reviews=effective_reviews,
             ):
+                return "HUMAN_CHANGES_REQUIRED_ALREADY_RECORDED"
+            view = get_view(session, publication_id)
+            cleared_human_block = True
+
+        if active_changes:
+            if view.state not in {
+                PublicationState.IN_REVIEW,
+                PublicationState.APPROVED,
+                PublicationState.READY_TO_MERGE,
+            }:
+                return "HUMAN_NOT_ELIGIBLE"
+            selected = active_changes[-1][1]
+            record_review(
+                session,
+                publication_id,
+                reviewed_head_sha=selected.commit_id,
+                decision=ReviewDecision.CHANGES_REQUIRED,
+                require_codex_review=self._requires_codex_adjudication(view),
+                github_review_id=selected.review_id,
+            )
+            return "HUMAN_CHANGES_REQUIRED"
+
+        if view.state is PublicationState.IN_REVIEW:
+            if active_approvals:
+                selected = max(
+                    active_approvals,
+                    key=lambda item: (
+                        _parse_time(item.submitted_at),
+                        item.review_id,
+                        _normalize_actor(item.actor),
+                    ),
+                )
                 record_review(
                     session,
                     publication_id,
                     reviewed_head_sha=selected.commit_id,
-                    decision=decision,
+                    decision=ReviewDecision.APPROVED,
                     require_codex_review=self._requires_codex_adjudication(view),
                     github_review_id=selected.review_id,
                 )
-                return "HUMAN_CHANGES_REQUIRED"
-            if (
-                view.review_decision is decision
-                and view.remote_head_sha == selected.commit_id
-                and view.state in {
-                    PublicationState.APPROVED,
-                    PublicationState.READY_TO_MERGE,
-                    PublicationState.MERGED,
-                    PublicationState.CHANGES_REQUIRED,
-                }
-            ):
-                return "HUMAN_" + decision.value + "_ALREADY_RECORDED"
-            return "HUMAN_NOT_ELIGIBLE"
+                return "HUMAN_APPROVED"
+            if self._requires_codex_adjudication(view):
+                adjudication = required_review_adjudication(
+                    session,
+                    publication_id,
+                )
+                if adjudication is None:
+                    return "HUMAN_NOT_ELIGIBLE"
+                if self._active_human_approvals(effective_reviews):
+                    return "STALE_HUMAN_REVIEW"
+            return (
+                "HUMAN_REVIEW_CLEARED"
+                if cleared_human_block
+                else "HUMAN_REVIEW_NOT_FOUND"
+            )
 
-        if decision is ReviewDecision.APPROVED and self._requires_codex_adjudication(view):
-            adjudication = required_review_adjudication(session, publication_id)
-            if adjudication is None:
-                return "HUMAN_NOT_ELIGIBLE"
-            submitted_at = _parse_time(selected.submitted_at)
-            adjudicated_at = _required_adjudication_time(
+        if view.state in {
+            PublicationState.APPROVED,
+            PublicationState.READY_TO_MERGE,
+        }:
+            if active_approvals:
+                return "HUMAN_APPROVAL_REMAINS"
+
+            dismissed_recorded_approval_id = self._dismissed_recorded_approval_id(
                 session,
                 publication_id,
-                adjudication,
+                reviews,
+                head_sha=view.remote_head_sha,
             )
-            if submitted_at is None or submitted_at <= adjudicated_at:
-                return "STALE_HUMAN_REVIEW"
+            record_review(
+                session,
+                publication_id,
+                reviewed_head_sha=view.remote_head_sha,
+                decision=ReviewDecision.CHANGES_REQUIRED,
+                require_codex_review=self._requires_codex_adjudication(view),
+                github_review_id=dismissed_recorded_approval_id,
+            )
+            if dismissed_recorded_approval_id is not None:
+                view = get_view(session, publication_id)
+                blocker_event = self._recorded_human_changes_event(
+                    session,
+                    publication_id,
+                    head_sha=view.remote_head_sha,
+                )
+                if blocker_event is not None and self._clear_human_review_block(
+                    session,
+                    publication_id,
+                    view=view,
+                    blocker_event=blocker_event,
+                    reviews=reviews,
+                    effective_reviews=effective_reviews,
+                ):
+                    return "HUMAN_REVIEW_CLEARED"
+            return "HUMAN_CHANGES_REQUIRED"
 
-        record_review(
-            session,
-            publication_id,
-            reviewed_head_sha=selected.commit_id,
-            decision=decision,
-            require_codex_review=self._requires_codex_adjudication(view),
-            github_review_id=selected.review_id,
-        )
-        return "HUMAN_" + decision.value
+        return "HUMAN_NOT_ELIGIBLE"
 
     def reconcile_publication(
         self,
@@ -1647,6 +1782,51 @@ class GitHubWebhookGateway:
                 outcome="PULL_CLOSED_UNMERGED",
                 next_role="CONTROL_PLANE",
                 next_action="BLOCKED",
+                watch_state=watch.state,
+            )
+
+        if pull.merged and pull.head_sha != view.remote_head_sha:
+            watch = self._sync_review_watch(
+                session,
+                publication_id,
+                expected_actors=self.expected_actors,
+                last_delivery_id=last_delivery_id,
+                state="STALE",
+            )
+            return WebhookProcessResult(
+                delivery_id=last_delivery_id,
+                publication_id=publication_id,
+                outcome="STALE_HEAD",
+                next_role="CONTROL_PLANE",
+                next_action="BLOCKED",
+                watch_state=watch.state,
+            )
+
+        if pull.merged:
+            merge_outcome = "RECONCILED"
+            try:
+                MergeCoordinator(
+                    token_provider=self.token_provider,
+                    github=self.github,
+                ).reconcile(session, publication_id)
+            except MergePolicyViolationRecorded:
+                merge_outcome = "MERGE_POLICY_VIOLATION"
+            except (MergeError, DomainError) as exc:
+                raise GitHubWebhookError(
+                    "merge reconciliation failed closed"
+                ) from exc
+            watch = self._sync_review_watch(
+                session,
+                publication_id,
+                expected_actors=self.expected_actors,
+                last_delivery_id=last_delivery_id,
+            )
+            return WebhookProcessResult(
+                delivery_id=last_delivery_id,
+                publication_id=publication_id,
+                outcome=merge_outcome,
+                next_role=watch.next_role,
+                next_action=watch.next_action,
                 watch_state=watch.state,
             )
 
@@ -1782,6 +1962,16 @@ class GitHubWebhookGateway:
                 state="CLOSED_UNMERGED",
             )
             return "PULL_CLOSED_UNMERGED"
+
+        if pull.merged and pull.head_sha != view.remote_head_sha:
+            self._sync_review_watch(
+                session,
+                publication_id,
+                expected_actors=self.expected_actors,
+                last_delivery_id=row.delivery_id,
+                state="STALE",
+            )
+            return "STALE_HEAD"
 
         if pull.merged:
             try:
@@ -2129,6 +2319,8 @@ class GitHubWebhookGateway:
                 and outcome not in {
                     "PULL_CLOSED_UNMERGED",
                     "MERGE_POLICY_VIOLATION",
+                    "STALE_HEAD",
+                    "STALE_BASE",
                 }
             ):
                 latest_pull = self._read_pull(latest, access.token)

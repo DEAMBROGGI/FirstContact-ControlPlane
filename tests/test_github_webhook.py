@@ -50,6 +50,7 @@ from control_plane.service import (
     claim_codex_review_trigger_dispatch,
     complete_codex_review,
     complete_codex_review_trigger_dispatch,
+    clear_human_review_block,
     create_publication,
     get_view,
     mark_codex_review_unavailable,
@@ -206,6 +207,7 @@ def raw_delivery(
     action: str = "created",
     comment_id: int | None = None,
     comment_body: str | None = None,
+    comment_created_at: str | None = None,
     review_id: int | None = None,
     review_actor: str | None = None,
 ):
@@ -230,6 +232,8 @@ def raw_delivery(
         }
         if comment_body is not None:
             comment["body"] = comment_body
+        if comment_created_at is not None:
+            comment["created_at"] = comment_created_at
         payload["comment"] = comment
     if review_id is not None:
         payload["review"] = {
@@ -668,6 +672,63 @@ def test_review_watch_next_role_respects_codex_mode_without_a_run(
 
 
 @pytest.mark.parametrize(
+    ("mode", "expected_state", "expected_role", "expected_action"),
+    [
+        (
+            "advisory",
+            PublicationState.IN_REVIEW,
+            "HUMAN_REVIEWER",
+            "WAIT_HUMAN_REVIEW",
+        ),
+        (
+            "required",
+            PublicationState.CHANGES_REQUIRED,
+            "IMPLEMENTER",
+            "REMEDIATE_FINDINGS",
+        ),
+    ],
+)
+def test_codex_findings_watch_projection_respects_review_mode(
+    session,
+    mode,
+    expected_state,
+    expected_role,
+    expected_action,
+):
+    view = start_codex(session, published(session), mode=mode)
+    complete_codex_review(
+        session,
+        view.publication_id,
+        run_id=view.automated_review_run_id,
+        reviewed_head_sha=HEAD,
+        result=AutomatedReviewStatus.CHANGES_REQUIRED,
+        findings=[
+            {
+                "provider_comment_id": 601,
+                "provider_review_id": 501,
+                "path": "control_plane/domain.py",
+                "line": 10,
+                "body": "Finding requires review.",
+            }
+        ],
+        provider_review_ids=[501],
+        provider_comment_ids=[601],
+    )
+    value = gateway(FakeGitHub(), mode=mode)
+
+    result = value.reconcile_publication(session, view.publication_id)
+
+    current = get_view(session, view.publication_id)
+    watch = get_review_watch(session, view.publication_id)
+    assert current.state is expected_state
+    assert current.automated_review_status is AutomatedReviewStatus.CHANGES_REQUIRED
+    assert result.next_role == expected_role
+    assert result.next_action == expected_action
+    assert watch.next_role == expected_role
+    assert watch.next_action == expected_action
+
+
+@pytest.mark.parametrize(
     ("deleted_body", "delivery_suffix"),
     [
         ("an unrelated deleted comment", "unrelated"),
@@ -704,6 +765,86 @@ def test_deleted_issue_comment_uses_current_evidence_not_deleted_receipt(
     assert get_webhook_delivery(session, receipt.delivery_id).state == "PROCESSED"
 
 
+def test_deleted_post_trigger_invocation_blocks_codex_terminalization(session):
+    view = start_codex(session, published(session))
+    github = FakeGitHub()
+    github.issue_comments = [
+        governed_codex_trigger(view),
+        usage_limit_response(702, "2026-09-30T12:03:00Z"),
+    ]
+    value = gateway(github)
+    deleted_body, deleted_signature = raw_delivery(
+        event_name="issue_comment",
+        action="deleted",
+        comment_id=701,
+        comment_body="@codex review from an unmanaged actor",
+        comment_created_at="2026-09-30T12:02:00Z",
+    )
+    deleted_receipt = value.ingest(
+        session,
+        delivery_id="delivery-deleted-concurrent-codex-invocation",
+        event_name="issue_comment",
+        signature=deleted_signature,
+        body=deleted_body,
+    )
+    usage_body, usage_signature = raw_delivery(
+        event_name="issue_comment",
+        comment_id=702,
+        comment_body=USAGE_LIMIT,
+        comment_created_at="2026-09-30T12:03:00Z",
+    )
+    usage_receipt = value.ingest(
+        session,
+        delivery_id="delivery-usage-limit-after-deleted-invocation",
+        event_name="issue_comment",
+        signature=usage_signature,
+        body=usage_body,
+    )
+
+    with pytest.raises(CodexReviewError, match="additional Codex invocation"):
+        value.process_delivery(session, usage_receipt.delivery_id)
+    with pytest.raises(CodexReviewError, match="additional Codex invocation"):
+        value.reconcile_publication(session, view.publication_id)
+
+    current = get_view(session, view.publication_id)
+    event_types = {
+        event["event_type"]
+        for event in load_events(session, view.publication_id)
+    }
+    assert current.automated_review_status is AutomatedReviewStatus.RUNNING
+    assert EventType.CODEX_REVIEW_COMPLETED.value not in event_types
+    assert EventType.CODEX_REVIEW_UNAVAILABLE.value not in event_types
+    assert get_webhook_delivery(session, deleted_receipt.delivery_id).state == "PENDING"
+    assert get_webhook_delivery(session, usage_receipt.delivery_id).state == "PENDING"
+
+
+def test_pre_trigger_deleted_codex_invocation_does_not_block_reconciliation(session):
+    view = start_codex(session, published(session))
+    github = FakeGitHub()
+    github.issue_comments = [governed_codex_trigger(view)]
+    value = gateway(github)
+    body, signature = raw_delivery(
+        event_name="issue_comment",
+        action="deleted",
+        comment_id=703,
+        comment_body="@codex review before the governed trigger",
+        comment_created_at="2026-09-30T11:59:00Z",
+    )
+    receipt = value.ingest(
+        session,
+        delivery_id="delivery-deleted-pre-trigger-invocation",
+        event_name="issue_comment",
+        signature=signature,
+        body=body,
+    )
+
+    result = value.reconcile_publication(session, view.publication_id)
+
+    assert result.outcome == "RECONCILED"
+    assert get_view(session, view.publication_id).automated_review_status is AutomatedReviewStatus.RUNNING
+    assert get_webhook_delivery(session, receipt.delivery_id).state == "PENDING"
+
+
 def test_out_of_policy_merged_pull_settles_delivery_and_blocks_watch(session):
     view = published(session)
     github = FakeGitHub()
@@ -736,6 +877,140 @@ def test_out_of_policy_merged_pull_settles_delivery_and_blocks_watch(session):
     assert get_webhook_delivery(session, receipt.delivery_id).state == "PROCESSED"
     assert watch.next_role == "CONTROL_PLANE"
     assert watch.next_action == "BLOCKED"
+
+
+def test_merged_pull_with_head_drift_stales_before_merge_reconciliation(session):
+    view = complete_codex_pass(session, start_codex(session, published(session)))
+    record_review(
+        session,
+        view.publication_id,
+        reviewed_head_sha=HEAD,
+        decision=ReviewDecision.APPROVED,
+        require_codex_review=True,
+    )
+
+    class TrackingMergedGitHub(FakeGitHub):
+        def __init__(self):
+            super().__init__()
+            self.merge_reconciliation_attempts = 0
+
+        def pull_request_merged(self, repository, number, token):
+            self.merge_reconciliation_attempts += 1
+            return super().pull_request_merged(repository, number, token)
+
+        def pull_request_merge_event(self, repository, number, token):
+            self.merge_reconciliation_attempts += 1
+            return super().pull_request_merge_event(repository, number, token)
+
+    github = TrackingMergedGitHub()
+    github.merged = True
+    github.head_sha = "4" * 40
+    value = gateway(github)
+    body, signature = raw_delivery(
+        event_name="pull_request",
+        action="closed",
+    )
+    receipt = value.ingest(
+        session,
+        delivery_id="delivery-merged-stale-head",
+        event_name="pull_request",
+        signature=signature,
+        body=body,
+    )
+
+    result = value.process_delivery(session, receipt.delivery_id)
+
+    watch = get_review_watch(session, view.publication_id)
+    event_types = {
+        event["event_type"]
+        for event in load_events(session, view.publication_id)
+    }
+    assert result.outcome == "STALE_HEAD"
+    assert result.next_role == "CONTROL_PLANE"
+    assert result.next_action == "BLOCKED"
+    assert result.watch_state == "STALE"
+    assert watch.state == "STALE"
+    assert watch.next_role == "CONTROL_PLANE"
+    assert watch.next_action == "BLOCKED"
+    assert github.merge_reconciliation_attempts == 0
+    assert EventType.MERGED.value not in event_types
+    assert get_webhook_delivery(session, receipt.delivery_id).state == "PROCESSED"
+
+
+def test_full_reconcile_stale_merged_head_precedes_codex_terminalization(session):
+    view = start_codex(session, published(session))
+
+    class TrackingMergedGitHub(FakeGitHub):
+        def __init__(self):
+            super().__init__()
+            self.merge_reconciliation_attempts = 0
+
+        def pull_request_merged(self, repository, number, token):
+            self.merge_reconciliation_attempts += 1
+            return super().pull_request_merged(repository, number, token)
+
+        def pull_request_merge_event(self, repository, number, token):
+            self.merge_reconciliation_attempts += 1
+            return super().pull_request_merge_event(repository, number, token)
+
+    github = TrackingMergedGitHub()
+    github.merged = True
+    github.head_sha = "4" * 40
+    github.issue_comments = [
+        governed_codex_trigger(view),
+        usage_limit_response(704, "2026-09-30T12:03:00Z"),
+    ]
+    result = gateway(github).reconcile_publication(session, view.publication_id)
+
+    current = get_view(session, view.publication_id)
+    watch = get_review_watch(session, view.publication_id)
+    event_types = {
+        event["event_type"]
+        for event in load_events(session, view.publication_id)
+    }
+    assert result.outcome == "STALE_HEAD"
+    assert result.next_role == "CONTROL_PLANE"
+    assert result.next_action == "BLOCKED"
+    assert result.watch_state == "STALE"
+    assert watch.state == "STALE"
+    assert current.automated_review_status is AutomatedReviewStatus.RUNNING
+    assert EventType.CODEX_REVIEW_UNAVAILABLE.value not in event_types
+    assert EventType.MERGED.value not in event_types
+    assert github.merge_reconciliation_attempts == 0
+
+
+def test_full_reconcile_exact_merged_head_preserves_merge_policy_path(session):
+    view = start_codex(session, published(session))
+
+    class TrackingMergedGitHub(FakeGitHub):
+        def __init__(self):
+            super().__init__()
+            self.merge_reconciliation_attempts = 0
+
+        def pull_request_merged(self, repository, number, token):
+            self.merge_reconciliation_attempts += 1
+            return super().pull_request_merged(repository, number, token)
+
+        def pull_request_merge_event(self, repository, number, token):
+            self.merge_reconciliation_attempts += 1
+            return super().pull_request_merge_event(repository, number, token)
+
+    github = TrackingMergedGitHub()
+    github.merged = True
+    github.issue_comments = [governed_codex_trigger(view)]
+    result = gateway(github).reconcile_publication(session, view.publication_id)
+
+    current = get_view(session, view.publication_id)
+    event_types = [
+        event["event_type"]
+        for event in load_events(session, view.publication_id)
+    ]
+    assert result.outcome == "MERGE_POLICY_VIOLATION"
+    assert current.merge_policy_violation is True
+    assert current.automated_review_status is AutomatedReviewStatus.RUNNING
+    assert event_types.count(EventType.MERGE_POLICY_VIOLATION.value) == 1
+    assert EventType.CODEX_REVIEW_UNAVAILABLE.value not in event_types
+    assert github.merge_reconciliation_attempts > 0
 
 
 def test_merged_approved_pull_cannot_record_mergeability(session):
@@ -1924,6 +2199,49 @@ def test_direct_mergeability_endpoint_rejects_client_value_mismatch(session):
 
 
 
+@pytest.mark.parametrize("github_mergeable", [False, True])
+def test_direct_mergeability_endpoint_rejects_already_merged_pr(
+    session,
+    github_mergeable,
+):
+    view = complete_codex_pass(session, start_codex(session, published(session)))
+    github = FakeGitHub()
+    value = gateway(github)
+    review_record(
+        view.publication_id,
+        ReviewRequest(
+            reviewed_head_sha=HEAD,
+            decision=ReviewDecision.APPROVED,
+        ),
+        session,
+        value,
+    )
+    github.merged = True
+    github.mergeable = github_mergeable
+
+    with pytest.raises(HTTPException) as caught:
+        mergeability_record(
+            view.publication_id,
+            MergeabilityRequest(
+                head_sha=HEAD,
+                mergeable=github_mergeable,
+            ),
+            session,
+            value,
+        )
+
+    current = get_view(session, view.publication_id)
+    mergeability_events = [
+        event
+        for event in load_events(session, view.publication_id)
+        if event["event_type"] == EventType.MERGEABILITY_RECORDED.value
+    ]
+    assert caught.value.status_code == 409
+    assert "already merged" in caught.value.detail
+    assert current.state is PublicationState.APPROVED
+    assert current.mergeable is None
+    assert mergeability_events == []
+
 def test_duplicate_human_review_delivery_does_not_duplicate_review_event(session):
     view = complete_codex_pass(session, start_codex(session, published(session)))
     github = FakeGitHub()
@@ -2147,10 +2465,10 @@ def test_dismissed_human_review_revokes_exact_head_approval_idempotently(
         for event in load_events(session, view.publication_id)
         if event["event_type"] == EventType.REVIEW_RECORDED.value
     ]
-    assert current.state is PublicationState.CHANGES_REQUIRED
-    assert current.review_decision is ReviewDecision.CHANGES_REQUIRED
-    assert result.outcome == "HUMAN_CHANGES_REQUIRED"
-    assert replay.outcome == "HUMAN_CHANGES_REQUIRED_ALREADY_RECORDED"
+    assert current.state is PublicationState.IN_REVIEW
+    assert current.review_decision is None
+    assert result.outcome == "HUMAN_REVIEW_CLEARED"
+    assert replay.outcome == "HUMAN_REVIEW_NOT_FOUND"
     assert same_delivery_replay.outcome == "PROCESSED"
     assert [event["payload"]["decision"] for event in review_events] == [
         ReviewDecision.APPROVED.value,
@@ -2160,13 +2478,21 @@ def test_dismissed_human_review_revokes_exact_head_approval_idempotently(
         910,
         910,
     ]
+    clearance_events = [
+        event
+        for event in load_events(session, view.publication_id)
+        if event["event_type"] == EventType.HUMAN_REVIEW_CLEARED.value
+    ]
+    assert len(clearance_events) == 1
+    assert clearance_events[0]["payload"]["blocking_review_id"] == 910
+    assert clearance_events[0]["payload"]["clearing_review_id"] == 910
     assert sum(
         event["event_type"] == EventType.MERGEABILITY_RECORDED.value
         for event in load_events(session, view.publication_id)
     ) == mergeability_event_count
     watch = get_review_watch(session, view.publication_id)
-    assert watch.next_role == "IMPLEMENTER"
-    assert watch.next_action == "REMEDIATE_FINDINGS"
+    assert watch.next_role == "HUMAN_REVIEWER"
+    assert watch.next_action == "WAIT_HUMAN_REVIEW"
 
 
 @pytest.mark.parametrize(
@@ -2250,6 +2576,52 @@ def test_stale_unlisted_or_unrelated_dismissal_does_not_revoke_approval(
     assert current.review_decision is ReviewDecision.APPROVED
     assert len(review_events) == 1
     assert review_events[0]["payload"]["github_review_id"] == 920
+
+
+def test_same_reviewer_tied_decision_timestamps_fail_closed(session):
+    view = complete_codex_pass(session, start_codex(session, published(session)))
+    submitted_at = (codex_gate_time(session, view) + timedelta(seconds=1)).isoformat()
+    github = FakeGitHub()
+    github.reviews = [
+        PullReviewSnapshot(
+            review_id=925,
+            actor=HUMAN_ACTOR,
+            body="exact-head approval",
+            state="APPROVED",
+            commit_id=HEAD,
+            submitted_at=submitted_at,
+        ),
+        PullReviewSnapshot(
+            review_id=926,
+            actor=HUMAN_ACTOR,
+            body="exact-head changes request",
+            state="CHANGES_REQUESTED",
+            commit_id=HEAD,
+            submitted_at=submitted_at,
+        ),
+    ]
+    value = gateway(github)
+
+    with pytest.raises(GitHubWebhookError, match="timestamp is ambiguous"):
+        process_human_review_delivery(
+            session,
+            value,
+            delivery_id="delivery-human-review-tied-timestamps",
+            review_id=926,
+        )
+
+    current = get_view(session, view.publication_id)
+    assert current.state is PublicationState.IN_REVIEW
+    assert current.review_decision is None
+    assert not [
+        event
+        for event in load_events(session, view.publication_id)
+        if event["event_type"] == EventType.REVIEW_RECORDED.value
+    ]
+    assert get_webhook_delivery(
+        session,
+        "delivery-human-review-tied-timestamps",
+    ).state == "PENDING"
 
 
 @pytest.mark.parametrize("was_ready", [False, True])
@@ -2385,17 +2757,17 @@ def test_dismissals_follow_effective_approval_per_reviewer(session, was_ready):
         if event["event_type"] == EventType.REVIEW_RECORDED.value
     ]
     assert result.outcome.startswith("HUMAN_APPROVAL_REMAINS")
-    assert final_dismissal.outcome == "HUMAN_CHANGES_REQUIRED"
-    assert final_dismissal_replay.outcome == "HUMAN_CHANGES_REQUIRED_ALREADY_RECORDED"
-    assert current.state is PublicationState.CHANGES_REQUIRED
-    assert current.review_decision is ReviewDecision.CHANGES_REQUIRED
+    assert final_dismissal.outcome == "HUMAN_REVIEW_CLEARED"
+    assert final_dismissal_replay.outcome == "HUMAN_REVIEW_NOT_FOUND"
+    assert current.state is PublicationState.IN_REVIEW
+    assert current.review_decision is None
     assert [event["payload"]["decision"] for event in review_events] == [
         ReviewDecision.APPROVED.value,
         ReviewDecision.CHANGES_REQUIRED.value,
     ]
     assert [event["payload"]["github_review_id"] for event in review_events] == [
         930,
-        931,
+        930,
     ]
 
 
@@ -2472,12 +2844,302 @@ def test_later_nonapproval_supersedes_historical_exact_head_approval(
         for event in load_events(session, view.publication_id)
         if event["event_type"] == EventType.REVIEW_RECORDED.value
     ]
-    assert result.outcome == "HUMAN_CHANGES_REQUIRED"
-    assert current.state is PublicationState.CHANGES_REQUIRED
-    assert current.review_decision is ReviewDecision.CHANGES_REQUIRED
+    expected_state = (
+        PublicationState.IN_REVIEW
+        if later_review_state == "DISMISSED"
+        else PublicationState.CHANGES_REQUIRED
+    )
+    expected_outcome = (
+        "HUMAN_REVIEW_CLEARED"
+        if later_review_state == "DISMISSED"
+        else "HUMAN_CHANGES_REQUIRED"
+    )
+    assert result.outcome == expected_outcome
+    assert current.state is expected_state
+    assert current.review_decision is (
+        None
+        if later_review_state == "DISMISSED"
+        else ReviewDecision.CHANGES_REQUIRED
+    )
     assert [event["payload"]["decision"] for event in review_events] == [
         ReviewDecision.APPROVED.value,
         ReviewDecision.CHANGES_REQUIRED.value,
+    ]
+
+
+def test_full_reconcile_clears_human_block_after_lost_dismissal(session):
+    view = complete_codex_pass(session, start_codex(session, published(session)))
+    gate_time = codex_gate_time(session, view)
+    github = FakeGitHub()
+    github.reviews = [
+        PullReviewSnapshot(
+            review_id=950,
+            actor=HUMAN_ACTOR,
+            body="exact-head changes request",
+            state="CHANGES_REQUESTED",
+            commit_id=HEAD,
+            submitted_at=(gate_time + timedelta(seconds=1)).isoformat(),
+        )
+    ]
+    value = gateway(github)
+    blocking = process_human_review_delivery(
+        session,
+        value,
+        delivery_id="delivery-human-blocker-recorded",
+        review_id=950,
+    )
+    assert blocking.outcome == "HUMAN_CHANGES_REQUIRED"
+    assert get_view(session, view.publication_id).state is PublicationState.CHANGES_REQUIRED
+
+    github.reviews = [
+        PullReviewSnapshot(
+            review_id=950,
+            actor=HUMAN_ACTOR,
+            body="dismissed exact-head changes request",
+            state="DISMISSED",
+            commit_id=HEAD,
+            submitted_at=(gate_time + timedelta(seconds=1)).isoformat(),
+        )
+    ]
+    result = value.reconcile_publication(session, view.publication_id)
+
+    current = get_view(session, view.publication_id)
+    events = load_events(session, view.publication_id)
+    blocker_event = next(
+        event
+        for event in events
+        if event["event_type"] == EventType.REVIEW_RECORDED.value
+        and event["payload"]["decision"] == ReviewDecision.CHANGES_REQUIRED.value
+    )
+    clearance_events = [
+        event
+        for event in events
+        if event["event_type"] == EventType.HUMAN_REVIEW_CLEARED.value
+    ]
+    assert result.outcome == "RECONCILED"
+    assert current.state is PublicationState.IN_REVIEW
+    assert current.review_decision is None
+    assert len(clearance_events) == 1
+    assert clearance_events[0]["payload"] == {
+        "reviewed_head_sha": HEAD,
+        "cleared_review_event_sequence": blocker_event["sequence"],
+        "blocking_review_id": 950,
+        "clearing_review_id": 950,
+        "clearing_review_state": "DISMISSED",
+    }
+
+    clear_human_review_block(
+        session,
+        view.publication_id,
+        reviewed_head_sha=HEAD,
+        cleared_review_event_sequence=blocker_event["sequence"],
+        blocking_review_id=950,
+        clearing_review_id=950,
+        clearing_review_state="DISMISSED",
+    )
+    assert len(
+        [
+            event
+            for event in load_events(session, view.publication_id)
+            if event["event_type"] == EventType.HUMAN_REVIEW_CLEARED.value
+        ]
+    ) == 1
+    with pytest.raises(DomainError, match="provenance is invalid"):
+        clear_human_review_block(
+            session,
+            view.publication_id,
+            reviewed_head_sha=HEAD,
+            cleared_review_event_sequence=True,
+            blocking_review_id=950,
+            clearing_review_id=950,
+            clearing_review_state="DISMISSED",
+        )
+    with pytest.raises(DomainError, match="decision is invalid"):
+        clear_human_review_block(
+            session,
+            view.publication_id,
+            reviewed_head_sha=HEAD,
+            cleared_review_event_sequence=blocker_event["sequence"],
+            blocking_review_id=950,
+            clearing_review_id=950,
+            clearing_review_state="COMMENTED",
+        )
+    with pytest.raises(DomainError, match="evidence conflicts"):
+        clear_human_review_block(
+            session,
+            view.publication_id,
+            reviewed_head_sha=HEAD,
+            cleared_review_event_sequence=blocker_event["sequence"],
+            blocking_review_id=951,
+            clearing_review_id=950,
+            clearing_review_state="DISMISSED",
+        )
+
+
+def test_active_other_reviewer_request_prevents_human_block_clearance(session):
+    view = complete_codex_pass(session, start_codex(session, published(session)))
+    gate_time = codex_gate_time(session, view)
+    github = FakeGitHub()
+    github.reviews = [
+        PullReviewSnapshot(
+            review_id=952,
+            actor=HUMAN_ACTOR,
+            body="blocking changes request",
+            state="CHANGES_REQUESTED",
+            commit_id=HEAD,
+            submitted_at=(gate_time + timedelta(seconds=1)).isoformat(),
+        )
+    ]
+    value = gateway(
+        github,
+        human_actors=(HUMAN_ACTOR, SECOND_HUMAN_ACTOR),
+    )
+    process_human_review_delivery(
+        session,
+        value,
+        delivery_id="delivery-human-blocker-with-other-reviewer",
+        review_id=952,
+    )
+    github.reviews = [
+        PullReviewSnapshot(
+            review_id=952,
+            actor=HUMAN_ACTOR,
+            body="dismissed blocking changes request",
+            state="DISMISSED",
+            commit_id=HEAD,
+            submitted_at=(gate_time + timedelta(seconds=1)).isoformat(),
+        ),
+        PullReviewSnapshot(
+            review_id=953,
+            actor=SECOND_HUMAN_ACTOR,
+            body="active other-reviewer changes request",
+            state="CHANGES_REQUESTED",
+            commit_id=HEAD,
+            submitted_at=(gate_time + timedelta(seconds=2)).isoformat(),
+        ),
+    ]
+
+    result = value.reconcile_publication(session, view.publication_id)
+
+    current = get_view(session, view.publication_id)
+    events = load_events(session, view.publication_id)
+    assert result.outcome == "RECONCILED"
+    assert current.state is PublicationState.CHANGES_REQUIRED
+    assert current.review_decision is ReviewDecision.CHANGES_REQUIRED
+    assert not [
+        event
+        for event in events
+        if event["event_type"] == EventType.HUMAN_REVIEW_CLEARED.value
+    ]
+    assert [
+        event["payload"]["github_review_id"]
+        for event in events
+        if event["event_type"] == EventType.REVIEW_RECORDED.value
+    ] == [952]
+
+
+def test_human_block_is_cleared_before_later_approval_is_recorded(session):
+    view = complete_codex_pass(session, start_codex(session, published(session)))
+    gate_time = codex_gate_time(session, view)
+    github = FakeGitHub()
+    github.reviews = [
+        PullReviewSnapshot(
+            review_id=954,
+            actor=HUMAN_ACTOR,
+            body="blocking changes request",
+            state="CHANGES_REQUESTED",
+            commit_id=HEAD,
+            submitted_at=(gate_time + timedelta(seconds=1)).isoformat(),
+        )
+    ]
+    value = gateway(github)
+    process_human_review_delivery(
+        session,
+        value,
+        delivery_id="delivery-human-blocker-before-approval",
+        review_id=954,
+    )
+    github.reviews.append(
+        PullReviewSnapshot(
+            review_id=955,
+            actor=HUMAN_ACTOR,
+            body="later exact-head approval",
+            state="APPROVED",
+            commit_id=HEAD,
+            submitted_at=(gate_time + timedelta(seconds=2)).isoformat(),
+        )
+    )
+
+    result = value.reconcile_publication(session, view.publication_id)
+
+    current = get_view(session, view.publication_id)
+    events = load_events(session, view.publication_id)
+    review_events = [
+        event
+        for event in events
+        if event["event_type"] == EventType.REVIEW_RECORDED.value
+    ]
+    clearance_event = next(
+        event
+        for event in events
+        if event["event_type"] == EventType.HUMAN_REVIEW_CLEARED.value
+    )
+    assert result.outcome == "RECONCILED"
+    assert current.state is PublicationState.APPROVED
+    assert [event["payload"]["decision"] for event in review_events] == [
+        ReviewDecision.CHANGES_REQUIRED.value,
+        ReviewDecision.APPROVED.value,
+    ]
+    assert review_events[0]["sequence"] < clearance_event["sequence"]
+    assert clearance_event["sequence"] < review_events[1]["sequence"]
+    assert clearance_event["payload"]["clearing_review_id"] == 955
+    assert clearance_event["payload"]["clearing_review_state"] == "APPROVED"
+
+
+def test_required_codex_findings_cannot_be_cleared_as_human_review(session):
+    view = start_codex(session, published(session))
+    complete_codex_review(
+        session,
+        view.publication_id,
+        run_id=view.automated_review_run_id,
+        reviewed_head_sha=HEAD,
+        result=AutomatedReviewStatus.CHANGES_REQUIRED,
+        findings=[
+            {
+                "provider_comment_id": 602,
+                "provider_review_id": 502,
+                "path": "control_plane/domain.py",
+                "line": 11,
+                "body": "Required Codex finding.",
+            }
+        ],
+        provider_review_ids=[502],
+        provider_comment_ids=[602],
+    )
+    github = FakeGitHub()
+    github.reviews = [
+        PullReviewSnapshot(
+            review_id=956,
+            actor=HUMAN_ACTOR,
+            body="dismissed human review",
+            state="DISMISSED",
+            commit_id=HEAD,
+            submitted_at="2026-09-30T12:02:00Z",
+        )
+    ]
+    value = gateway(github)
+
+    result = value.reconcile_publication(session, view.publication_id)
+
+    current = get_view(session, view.publication_id)
+    events = load_events(session, view.publication_id)
+    assert result.outcome == "RECONCILED"
+    assert current.state is PublicationState.CHANGES_REQUIRED
+    assert current.automated_review_status is AutomatedReviewStatus.CHANGES_REQUIRED
+    assert not [
+        event
+        for event in events
+        if event["event_type"] == EventType.HUMAN_REVIEW_CLEARED.value
     ]
 
 
@@ -2530,8 +3192,8 @@ def test_full_reconcile_revokes_approval_after_lost_dismissal(session, was_ready
         if event["event_type"] == EventType.REVIEW_RECORDED.value
     ]
     assert result.outcome == "RECONCILED"
-    assert current.state is PublicationState.CHANGES_REQUIRED
-    assert current.review_decision is ReviewDecision.CHANGES_REQUIRED
+    assert current.state is PublicationState.IN_REVIEW
+    assert current.review_decision is None
     assert [event["payload"]["decision"] for event in review_events] == [
         ReviewDecision.APPROVED.value,
         ReviewDecision.CHANGES_REQUIRED.value,
@@ -2621,7 +3283,16 @@ def test_full_reconcile_revocation_provenance_requires_attributable_dismissal(
         if event["payload"]["decision"] == ReviewDecision.CHANGES_REQUIRED.value
     ]
     assert result.outcome == "RECONCILED"
-    assert current.state is PublicationState.CHANGES_REQUIRED
+    assert current.state is (
+        PublicationState.IN_REVIEW
+        if dismissed_review_present
+        else PublicationState.CHANGES_REQUIRED
+    )
+    assert current.review_decision is (
+        None
+        if dismissed_review_present
+        else ReviewDecision.CHANGES_REQUIRED
+    )
     assert len(revocation_events) == 1
     if expected_review_id is None:
         assert "github_review_id" not in revocation_events[0]["payload"]

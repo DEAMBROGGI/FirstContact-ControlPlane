@@ -653,6 +653,102 @@ def record_review(
     return get_view(session, publication_id)
 
 
+def clear_human_review_block(
+    session: Session,
+    publication_id: str,
+    *,
+    reviewed_head_sha: str,
+    cleared_review_event_sequence: int,
+    blocking_review_id: int,
+    clearing_review_id: int,
+    clearing_review_state: str,
+) -> PublicationView:
+    provenance_values = (
+        cleared_review_event_sequence,
+        blocking_review_id,
+        clearing_review_id,
+    )
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value <= 0
+        for value in provenance_values
+    ):
+        raise DomainError("human review clearance provenance is invalid")
+    if not isinstance(clearing_review_state, str):
+        raise DomainError("human review clearance decision is invalid")
+    normalized_clearing_state = clearing_review_state.strip().upper()
+    if normalized_clearing_state not in {"APPROVED", "DISMISSED"}:
+        raise DomainError("human review clearance decision is invalid")
+
+    view = _locked_publication_view(session, publication_id)
+    payload = {
+        "reviewed_head_sha": _sha(reviewed_head_sha, "reviewed_head_sha"),
+        "cleared_review_event_sequence": cleared_review_event_sequence,
+        "blocking_review_id": blocking_review_id,
+        "clearing_review_id": clearing_review_id,
+        "clearing_review_state": normalized_clearing_state,
+    }
+    events = load_events(session, publication_id)
+    existing = next(
+        (
+            event
+            for event in events
+            if event["event_type"] == EventType.HUMAN_REVIEW_CLEARED.value
+            and event["payload"].get("cleared_review_event_sequence")
+            == payload["cleared_review_event_sequence"]
+        ),
+        None,
+    )
+    if existing is not None:
+        if existing["payload"] != payload:
+            raise DomainError("human review clearance evidence conflicts")
+        session.commit()
+        return get_view(session, publication_id)
+
+    if view.remote_head_sha != payload["reviewed_head_sha"]:
+        raise DomainError("human review clearance head is stale")
+    target = next(
+        (
+            event
+            for event in events
+            if event["sequence"] == payload["cleared_review_event_sequence"]
+        ),
+        None,
+    )
+    if (
+        target is None
+        or target["event_type"] != EventType.REVIEW_RECORDED.value
+        or target["payload"].get("decision")
+        != ReviewDecision.CHANGES_REQUIRED.value
+        or target["payload"].get("reviewed_head_sha")
+        != payload["reviewed_head_sha"]
+        or target["payload"].get("github_review_id")
+        != payload["blocking_review_id"]
+    ):
+        raise DomainError("human review clearance does not match its blocker")
+    latest_review_event = next(
+        (
+            event
+            for event in reversed(events)
+            if event["event_type"] == EventType.REVIEW_RECORDED.value
+            and event["payload"].get("reviewed_head_sha")
+            == payload["reviewed_head_sha"]
+        ),
+        None,
+    )
+    if latest_review_event is None or latest_review_event["sequence"] != target["sequence"]:
+        raise DomainError("human review clearance blocker is no longer current")
+
+    validate_transition(view, EventType.HUMAN_REVIEW_CLEARED, payload)
+    append_event(
+        session,
+        publication_id,
+        EventType.HUMAN_REVIEW_CLEARED,
+        payload,
+    )
+    session.commit()
+    return get_view(session, publication_id)
+
+
 def record_mergeability(
     session: Session,
     publication_id: str,

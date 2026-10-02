@@ -37,6 +37,7 @@ class EventType(StrEnum):
     PLANE_REVIEW_MATERIALIZED = "PLANE_REVIEW_MATERIALIZED"
     REMEDIATION_CLEARED = "REMEDIATION_CLEARED"
     REVIEW_RECORDED = "REVIEW_RECORDED"
+    HUMAN_REVIEW_CLEARED = "HUMAN_REVIEW_CLEARED"
     MERGEABILITY_RECORDED = "MERGEABILITY_RECORDED"
     MERGED = "MERGED"
     MERGE_POLICY_VIOLATION = "MERGE_POLICY_VIOLATION"
@@ -269,6 +270,9 @@ def fold_events(
                 if review_decision is ReviewDecision.APPROVED
                 else PublicationState.CHANGES_REQUIRED
             )
+        elif event_type is EventType.HUMAN_REVIEW_CLEARED:
+            review_decision = None
+            state = PublicationState.IN_REVIEW
         elif event_type is EventType.MERGEABILITY_RECORDED:
             mergeable = bool(payload["mergeable"])
             state = PublicationState.READY_TO_MERGE if mergeable else PublicationState.APPROVED
@@ -515,6 +519,36 @@ def validate_transition(
         if payload.get("reviewed_head_sha") != view.remote_head_sha:
             raise DomainError("reviewed head is stale")
         ReviewDecision(payload["decision"])
+        return
+    if event_type is EventType.HUMAN_REVIEW_CLEARED:
+        if (
+            state is not PublicationState.CHANGES_REQUIRED
+            or view.review_decision is not ReviewDecision.CHANGES_REQUIRED
+        ):
+            raise DomainError(
+                "human review clearance requires a human CHANGES_REQUIRED decision"
+            )
+        if (
+            view.automated_review_status is AutomatedReviewStatus.CHANGES_REQUIRED
+            and view.automated_review_mode == "required"
+        ):
+            raise DomainError(
+                "required Codex findings cannot be cleared as a human review"
+            )
+        if (
+            view.remote_head_sha is None
+            or payload.get("reviewed_head_sha") != view.remote_head_sha
+        ):
+            raise DomainError("human review clearance head is stale")
+        sequence = payload.get("cleared_review_event_sequence")
+        if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence <= 0:
+            raise DomainError("human review clearance provenance is invalid")
+        for key in ("blocking_review_id", "clearing_review_id"):
+            review_id = payload.get(key)
+            if isinstance(review_id, bool) or not isinstance(review_id, int) or review_id <= 0:
+                raise DomainError("human review clearance provenance is invalid")
+        if payload.get("clearing_review_state") not in {"APPROVED", "DISMISSED"}:
+            raise DomainError("human review clearance decision is invalid")
         return
     if event_type is EventType.MERGEABILITY_RECORDED:
         if state is not PublicationState.APPROVED:
