@@ -1110,10 +1110,17 @@ def merge_execute(
 def merge_reconcile(
     publication_id: str,
     session: Session = Depends(get_session),
-    coordinator: MergeCoordinator = Depends(get_merge_coordinator),
+    gateway: GitHubWebhookGateway = Depends(get_github_authoritative_gateway),
 ):
     try:
-        view = coordinator.reconcile(session, publication_id)
+        result = gateway.reconcile_publication(session, publication_id)
+        if result.outcome in {
+            "MERGE_POLICY_VIOLATION",
+            "STALE_HEAD",
+            "STALE_BASE",
+        }:
+            raise MergeError("external merge failed authoritative preclassification")
+        view = get_view(session, publication_id)
         _sync_publication_watch(session, publication_id)
         return _payload(view)
     except KeyError as exc:

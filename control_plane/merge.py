@@ -83,6 +83,8 @@ class MergeCoordinator:
         pull: PullRequestSnapshot,
         merged: bool,
         token: str,
+        require_validated_base: bool = False,
+        human_review_eligible: bool = True,
     ) -> PublicationView:
         self._verify_identity(view, pull)
         try:
@@ -112,6 +114,41 @@ class MergeCoordinator:
             ):
                 raise MergeError("stored merge receipt does not match GitHub")
             return view
+
+        if require_validated_base:
+            candidate = view.current_candidate
+            if candidate is None or view.base_branch is None:
+                raise MergeError("publication base identity is incomplete")
+            try:
+                current_base_sha = self.github.ref_sha(
+                    view.repository,
+                    view.base_branch,
+                    token,
+                )
+            except GitHubApiError as exc:
+                raise MergeError("GitHub base readback failed closed") from exc
+            if current_base_sha != candidate.base_sha:
+                record_merge_policy_violation(
+                    session,
+                    publication_id,
+                    head_sha=view.remote_head_sha,
+                    pull_request_number=view.pull_request_number,
+                    merge_commit_sha=merge_commit_sha,
+                )
+                raise MergePolicyViolationRecorded(
+                    "GitHub reports an external merge after the validated base moved"
+                )
+            if not human_review_eligible:
+                record_merge_policy_violation(
+                    session,
+                    publication_id,
+                    head_sha=view.remote_head_sha,
+                    pull_request_number=view.pull_request_number,
+                    merge_commit_sha=merge_commit_sha,
+                )
+                raise MergePolicyViolationRecorded(
+                    "GitHub reports an external merge without current human approval"
+                )
 
         if view.merge_policy_violation:
             raise MergePolicyViolationRecorded(
@@ -143,6 +180,8 @@ class MergeCoordinator:
         self,
         session: Session,
         publication_id: str,
+        *,
+        human_review_eligible: bool = True,
     ) -> PublicationView:
         view = get_view(session, publication_id)
         if view.pull_request_number is None or view.remote_head_sha is None:
@@ -184,6 +223,8 @@ class MergeCoordinator:
             pull=pull,
             merged=merged,
             token=access.token,
+            require_validated_base=True,
+            human_review_eligible=human_review_eligible,
         )
 
     def merge(

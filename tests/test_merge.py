@@ -352,6 +352,28 @@ def test_reconcile_non_ready_out_of_band_merge_records_violation(session):
     assert current.merge_source == "GITHUB_RECONCILE"
 
 
+def test_reconcile_ready_external_merge_records_violation_when_base_drifted(session):
+    ready = ready_publication(session, issue_number=229)
+    github = GitHub(
+        [pull(merged=True, merge_sha=MERGE_SHA)],
+        merged_statuses=[True],
+        base_shas=["9" * 40],
+    )
+    coordinator = MergeCoordinator(
+        token_provider=TokenProvider(),
+        github=github,
+    )
+
+    with pytest.raises(MergeError, match="validated base moved"):
+        coordinator.reconcile(session, ready.publication_id)
+
+    current = get_view(session, ready.publication_id)
+    assert current.state is PublicationState.READY_TO_MERGE
+    assert current.merge_policy_violation is True
+    assert current.merge_commit_sha == MERGE_SHA
+    assert current.merge_source == "GITHUB_RECONCILE"
+
+
 def test_merge_command_rejects_non_ready_unmerged_publication(session):
     approved = approved_publication(session, issue_number=225)
     coordinator = MergeCoordinator(

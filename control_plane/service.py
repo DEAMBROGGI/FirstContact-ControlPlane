@@ -532,6 +532,13 @@ def _required_review_adjudication(
         return None
 
     events = load_events(session, publication_id)
+    if any(
+        event["event_type"] == EventType.CODEX_REVIEW_INVALIDATED.value
+        and event["payload"].get("run_id") == run_id
+        and event["payload"].get("head_sha") == remote_head
+        for event in events
+    ):
+        return None
     unavailable_position: int | None = None
     recorded_by_run: dict[str, tuple[dict[str, Any], int]] = {}
     materialized: list[tuple[dict[str, Any], int]] = []
@@ -921,6 +928,7 @@ def complete_codex_review(
     provider_review_ids: list[int],
     provider_comment_ids: list[int],
     provider_reaction_ids: list[int] | None = None,
+    provider_completed_at: str | None = None,
 ) -> PublicationView:
     if result not in {
         AutomatedReviewStatus.PASS,
@@ -930,6 +938,10 @@ def complete_codex_review(
     if len(findings) > 200:
         raise DomainError("too many Codex review findings")
     head = _sha(reviewed_head_sha, "reviewed_head_sha")
+    normalized_provider_time = _normalize_provider_timestamp(
+        provider_completed_at,
+        "Codex provider completion timestamp",
+    )
     payload = {
         "run_id": run_id,
         "head_sha": head,
@@ -946,7 +958,40 @@ def complete_codex_review(
             set(int(value) for value in (provider_reaction_ids or []))
         ),
     }
+    if normalized_provider_time is not None:
+        payload["provider_completed_at"] = normalized_provider_time
     view = _locked_publication_view(session, publication_id)
+    if view.automated_review_status is AutomatedReviewStatus.UNAVAILABLE:
+        unavailable_events = [
+            event
+            for event in load_events(session, publication_id)
+            if event["event_type"] == EventType.CODEX_REVIEW_UNAVAILABLE.value
+            and event["payload"].get("run_id") == run_id
+            and event["payload"].get("head_sha") == head
+        ]
+        if (
+            normalized_provider_time is None
+            or not unavailable_events
+            or any(
+                event["event_type"] == EventType.CODEX_REVIEW_INVALIDATED.value
+                and event["payload"].get("run_id") == run_id
+                and event["payload"].get("head_sha") == head
+                for event in load_events(session, publication_id)
+            )
+        ):
+            raise DomainError("Codex result cannot supersede invalidated or untimed unavailability")
+        unavailable_time = unavailable_events[-1]["payload"].get("provider_occurred_at")
+        parsed_unavailable_time = _parse_provider_timestamp(
+            unavailable_time,
+            "Codex unavailability timestamp",
+        )
+        parsed_completion_time = _parse_provider_timestamp(
+            normalized_provider_time,
+            "Codex provider completion timestamp",
+        )
+        if parsed_completion_time <= parsed_unavailable_time:
+            raise DomainError("Codex result does not postdate provider unavailability")
+        payload["supersedes_unavailability"] = True
     validate_transition(view, EventType.CODEX_REVIEW_COMPLETED, payload)
     append_event(session, publication_id, EventType.CODEX_REVIEW_COMPLETED, payload)
     session.commit()
@@ -959,6 +1004,7 @@ def mark_codex_review_unavailable(
     run_id: str,
     reviewed_head_sha: str,
     reason: str,
+    provider_occurred_at: str | None = None,
 ) -> PublicationView:
     if not reason or len(reason) > 200:
         raise DomainError("Codex unavailable reason must be 1..200 characters")
@@ -967,11 +1013,83 @@ def mark_codex_review_unavailable(
         "head_sha": _sha(reviewed_head_sha, "reviewed_head_sha"),
         "reason": reason,
     }
+    normalized_provider_time = _normalize_provider_timestamp(
+        provider_occurred_at,
+        "Codex provider unavailability timestamp",
+    )
+    if normalized_provider_time is not None:
+        payload["provider_occurred_at"] = normalized_provider_time
     view = _locked_publication_view(session, publication_id)
     validate_transition(view, EventType.CODEX_REVIEW_UNAVAILABLE, payload)
     append_event(session, publication_id, EventType.CODEX_REVIEW_UNAVAILABLE, payload)
     session.commit()
     return get_view(session, publication_id)
+
+
+def invalidate_codex_review(
+    session: Session,
+    publication_id: str,
+    *,
+    run_id: str,
+    reviewed_head_sha: str,
+    reason: str,
+    evidence_ids: list[int],
+) -> PublicationView:
+    if not reason or len(reason) > 200:
+        raise DomainError("Codex invalidation reason must be 1..200 characters")
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value <= 0
+        for value in evidence_ids
+    ):
+        raise DomainError("Codex invalidation evidence ids are invalid")
+    payload = {
+        "run_id": run_id,
+        "head_sha": _sha(reviewed_head_sha, "reviewed_head_sha"),
+        "reason": reason,
+        "evidence_ids": sorted(set(evidence_ids)),
+    }
+    if not payload["evidence_ids"]:
+        raise DomainError("Codex invalidation requires evidence ids")
+    view = _locked_publication_view(session, publication_id)
+    if (
+        view.automated_review_run_id != run_id
+        or view.automated_review_head_sha != payload["head_sha"]
+    ):
+        raise DomainError("Codex invalidation run or head is stale")
+    existing = next(
+        (
+            event
+            for event in load_events(session, publication_id)
+            if event["event_type"] == EventType.CODEX_REVIEW_INVALIDATED.value
+            and event["payload"] == payload
+        ),
+        None,
+    )
+    if existing is not None:
+        session.commit()
+        return view
+    validate_transition(view, EventType.CODEX_REVIEW_INVALIDATED, payload)
+    append_event(session, publication_id, EventType.CODEX_REVIEW_INVALIDATED, payload)
+    session.commit()
+    return get_view(session, publication_id)
+
+
+def _parse_provider_timestamp(value: object, field: str) -> datetime:
+    if not isinstance(value, str) or not value.strip():
+        raise DomainError(f"{field} is missing or invalid")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise DomainError(f"{field} is invalid") from exc
+    if parsed.tzinfo is None:
+        raise DomainError(f"{field} must include a timezone")
+    return parsed.astimezone(timezone.utc)
+
+
+def _normalize_provider_timestamp(value: str | None, field: str) -> str | None:
+    if value is None:
+        return None
+    return _parse_provider_timestamp(value, field).isoformat()
 
 
 def _utc(value: datetime) -> datetime:

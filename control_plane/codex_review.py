@@ -28,12 +28,16 @@ from .service import (
     complete_codex_review_trigger_dispatch,
     fence_codex_review_trigger_dispatch,
     get_view,
+    invalidate_codex_review,
     mark_codex_review_unavailable,
     release_codex_review_trigger_dispatch,
     request_codex_review,
 )
 
 _RESERVED_CODEX_MENTION = re.compile(r"(?i)(?<![A-Za-z0-9_])@codex\b")
+_CODEX_USAGE_LIMIT = re.compile(
+    r"(?is)reached\s+your\s+codex\s+usage\s+limits\s+for\s+code\s+reviews"
+)
 
 
 class CodexReviewError(RuntimeError):
@@ -53,11 +57,26 @@ def _parse_time(value: str | None) -> datetime | None:
     if not value:
         return None
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(
-            timezone.utc
-        )
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError as exc:
         raise CodexReviewError("GitHub review timestamp is invalid") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _parse_provider_time(value: object, field: str) -> datetime | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise CodexReviewError(f"{field} is invalid")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise CodexReviewError(f"{field} is invalid") from exc
+    if parsed.tzinfo is None:
+        raise CodexReviewError(f"{field} must include a timezone")
+    return parsed.astimezone(timezone.utc)
 
 
 def assert_no_ambiguous_codex_invocations(
@@ -154,14 +173,22 @@ class CodexReviewBroker:
         return observed.replace(microsecond=0)
 
     @staticmethod
-    def _verify_exact_pr(view, pull) -> None:
+    def _verify_exact_pr(
+        view,
+        pull,
+        *,
+        allow_stale_head: bool = False,
+        allow_merged: bool = False,
+    ) -> None:
         if view.pull_request_number is None:
             raise CodexReviewError("publication has no pull request")
         if pull.number != view.pull_request_number:
             raise CodexReviewError("pull request identity mismatch")
-        if pull.state != "open":
+        if pull.state.strip().lower() != "open" and not (
+            allow_merged and pull.merged
+        ):
             raise CodexReviewError("pull request is not open")
-        if pull.head_sha != view.remote_head_sha:
+        if not allow_stale_head and pull.head_sha != view.remote_head_sha:
             raise CodexReviewError("pull request head moved")
         if view.remote_branch is not None and pull.head_ref != view.remote_branch:
             raise CodexReviewError("pull request head ref moved")
@@ -186,6 +213,218 @@ class CodexReviewBroker:
         except CodexReviewError:
             return False
 
+    @staticmethod
+    def _terminal_event(session: Session, view):
+        if view.automated_review_status in {
+            AutomatedReviewStatus.PASS,
+            AutomatedReviewStatus.CHANGES_REQUIRED,
+        }:
+            expected_result = view.automated_review_status.value
+            matches = [
+                event
+                for event in load_events(session, view.publication_id)
+                if event["event_type"] == EventType.CODEX_REVIEW_COMPLETED.value
+                and event["payload"].get("run_id") == view.automated_review_run_id
+                and event["payload"].get("head_sha") == view.automated_review_head_sha
+                and event["payload"].get("result") == expected_result
+            ]
+        elif view.automated_review_status is AutomatedReviewStatus.UNAVAILABLE:
+            matches = [
+                event
+                for event in load_events(session, view.publication_id)
+                if event["event_type"] == EventType.CODEX_REVIEW_UNAVAILABLE.value
+                and event["payload"].get("run_id") == view.automated_review_run_id
+                and event["payload"].get("head_sha") == view.automated_review_head_sha
+            ]
+        else:
+            return None
+        if len(matches) != 1:
+            raise CodexReviewError("Codex terminal evidence is missing or ambiguous")
+        return matches[0]
+
+    @staticmethod
+    def _terminal_time(event) -> datetime | None:
+        payload = event["payload"]
+        field = (
+            "provider_completed_at"
+            if event["event_type"] == EventType.CODEX_REVIEW_COMPLETED.value
+            else "provider_occurred_at"
+        )
+        return _parse_provider_time(payload.get(field), f"Codex {field}")
+
+    def _deleted_issue_invocation_ids(
+        self,
+        session: Session,
+        view,
+        *,
+        trigger_time: datetime,
+        terminal_time: datetime | None,
+    ) -> tuple[int, ...]:
+        if view.pull_request_number is None:
+            raise CodexReviewError("Codex pull request metadata is incomplete")
+
+        deliveries = session.scalars(
+            select(GitHubWebhookDeliveryRow).where(
+                GitHubWebhookDeliveryRow.event_name == "issue_comment",
+                GitHubWebhookDeliveryRow.action == "deleted",
+                GitHubWebhookDeliveryRow.repository == view.repository,
+                GitHubWebhookDeliveryRow.pull_request_number
+                == view.pull_request_number,
+            )
+        )
+        deleted_ids = []
+        for delivery in deliveries:
+            payload = delivery.payload
+            repository = payload.get("repository") if isinstance(payload, dict) else None
+            issue = payload.get("issue") if isinstance(payload, dict) else None
+            if (
+                not isinstance(repository, dict)
+                or repository.get("full_name") != view.repository
+                or not isinstance(issue, dict)
+                or not isinstance(issue.get("pull_request"), dict)
+                or issue.get("number") != view.pull_request_number
+            ):
+                raise CodexReviewError("deleted issue-comment evidence is incomplete")
+            comment = payload.get("comment")
+            if not isinstance(comment, dict):
+                raise CodexReviewError("deleted issue-comment evidence is incomplete")
+            comment_id = comment.get("id")
+            if (
+                isinstance(comment_id, bool)
+                or not isinstance(comment_id, int)
+                or comment_id <= 0
+            ):
+                raise CodexReviewError("deleted issue-comment evidence is incomplete")
+            if comment_id == view.automated_review_trigger_comment_id:
+                continue
+            body = comment.get("body")
+            if not isinstance(body, str):
+                raise CodexReviewError("deleted issue-comment evidence is incomplete")
+            if not _RESERVED_CODEX_MENTION.search(body):
+                continue
+            created_time = _parse_time(
+                comment.get("created_at")
+                if isinstance(comment.get("created_at"), str)
+                else None
+            )
+            if created_time is None:
+                raise CodexReviewError("deleted invocation timestamp is missing")
+            if created_time < trigger_time:
+                continue
+            if view.automated_review_status is AutomatedReviewStatus.RUNNING:
+                raise CodexReviewError(
+                    "additional Codex invocation detected during governed review"
+                )
+            if terminal_time is None or created_time < terminal_time:
+                deleted_ids.append(comment_id)
+        return tuple(sorted(set(deleted_ids)))
+
+    def _deleted_review_finding_ids(
+        self,
+        session: Session,
+        view,
+        *,
+        reviews,
+        trigger_time: datetime,
+        terminal_event,
+        terminal_time: datetime | None,
+    ) -> tuple[int, ...]:
+        if view.pull_request_number is None:
+            raise CodexReviewError("Codex pull request metadata is incomplete")
+        deliveries = session.scalars(
+            select(GitHubWebhookDeliveryRow).where(
+                GitHubWebhookDeliveryRow.event_name == "pull_request_review_comment",
+                GitHubWebhookDeliveryRow.action == "deleted",
+                GitHubWebhookDeliveryRow.repository == view.repository,
+                GitHubWebhookDeliveryRow.pull_request_number
+                == view.pull_request_number,
+            )
+        )
+        deleted_ids = []
+        for delivery in deliveries:
+            payload = delivery.payload
+            repository = payload.get("repository") if isinstance(payload, dict) else None
+            pull = payload.get("pull_request") if isinstance(payload, dict) else None
+            if (
+                not isinstance(repository, dict)
+                or repository.get("full_name") != view.repository
+                or not isinstance(pull, dict)
+                or pull.get("number") != view.pull_request_number
+            ):
+                raise CodexReviewError(
+                    "deleted review-comment evidence does not match its delivery"
+                )
+            comment = payload.get("comment")
+            if not isinstance(comment, dict):
+                raise CodexReviewError("deleted review-comment evidence is incomplete")
+            comment_id = comment.get("id")
+            review_id = comment.get("pull_request_review_id")
+            if (
+                isinstance(comment_id, bool)
+                or not isinstance(comment_id, int)
+                or comment_id <= 0
+                or isinstance(review_id, bool)
+                or not isinstance(review_id, int)
+                or review_id <= 0
+            ):
+                raise CodexReviewError("deleted review-comment evidence is incomplete")
+            user = comment.get("user")
+            actor = (
+                _actor_key(str(user.get("login") or ""))
+                if isinstance(user, dict)
+                else ""
+            )
+            if actor not in self.allowed_actors:
+                continue
+            head = pull.get("head")
+            payload_head = str(head.get("sha") or "").lower() if isinstance(head, dict) else ""
+            commit_id = str(comment.get("commit_id") or "").lower()
+            if (
+                payload_head != view.automated_review_head_sha
+                or commit_id != view.automated_review_head_sha
+            ):
+                continue
+            body = comment.get("body")
+            if not isinstance(body, str) or not body.strip():
+                continue
+            created_time = _parse_time(
+                comment.get("created_at")
+                if isinstance(comment.get("created_at"), str)
+                else None
+            )
+            if created_time is None:
+                raise CodexReviewError("deleted review-comment timestamp is missing")
+            if created_time < trigger_time:
+                continue
+            parent_reviews = []
+            for review in reviews:
+                if (
+                    review.review_id != review_id
+                    or _actor_key(review.actor) != actor
+                    or review.state.strip().upper() != "COMMENTED"
+                    or review.commit_id != view.automated_review_head_sha
+                ):
+                    continue
+                submitted_time = _parse_time(review.submitted_at)
+                if submitted_time is None:
+                    raise CodexReviewError(
+                        "deleted finding parent review timestamp is missing"
+                    )
+                if submitted_time >= trigger_time and submitted_time <= created_time:
+                    parent_reviews.append(review)
+            if view.automated_review_status is AutomatedReviewStatus.RUNNING:
+                raise CodexReviewError(
+                    "deleted Codex finding makes the active result ambiguous"
+                )
+            result_payload = terminal_event["payload"] if terminal_event else {}
+            recorded_review_ids = result_payload.get("provider_review_ids", [])
+            correlated = review_id in recorded_review_ids or bool(parent_reviews)
+            if correlated and (
+                terminal_time is None or created_time < terminal_time
+            ):
+                deleted_ids.append(comment_id)
+        return tuple(sorted(set(deleted_ids)))
+
     def assert_no_deleted_ambiguous_invocations(self, session: Session, view) -> None:
         if view.automated_review_status is not AutomatedReviewStatus.RUNNING:
             return
@@ -199,76 +438,76 @@ class CodexReviewBroker:
         trigger_time = _parse_time(view.automated_review_triggered_at)
         if trigger_time is None:
             raise CodexReviewError("governed Codex trigger timestamp is missing")
-
-        deliveries = session.scalars(
-            select(GitHubWebhookDeliveryRow).where(
-                GitHubWebhookDeliveryRow.event_name == "issue_comment",
-                GitHubWebhookDeliveryRow.action == "deleted",
-                GitHubWebhookDeliveryRow.repository == view.repository,
-                GitHubWebhookDeliveryRow.pull_request_number
-                == view.pull_request_number,
-            )
+        self._deleted_issue_invocation_ids(
+            session,
+            view,
+            trigger_time=trigger_time,
+            terminal_time=None,
         )
-        for delivery in deliveries:
-            payload = delivery.payload
-            if not isinstance(payload, dict):
-                raise CodexReviewError(
-                    "deleted issue-comment evidence is incomplete"
-                )
-            repository = payload.get("repository")
-            issue = payload.get("issue")
-            if (
-                not isinstance(repository, dict)
-                or repository.get("full_name") != view.repository
-                or not isinstance(issue, dict)
-                or not isinstance(issue.get("pull_request"), dict)
-            ):
-                raise CodexReviewError(
-                    "deleted issue-comment evidence does not match its delivery"
-                )
-            pull_number = issue.get("number")
-            if isinstance(pull_number, bool) or not isinstance(pull_number, int):
-                raise CodexReviewError(
-                    "deleted issue-comment evidence is incomplete"
-                )
-            if pull_number != view.pull_request_number:
-                raise CodexReviewError(
-                    "deleted issue-comment evidence does not match its delivery"
-                )
 
-            comment = payload.get("comment")
-            if not isinstance(comment, dict):
-                raise CodexReviewError(
-                    "deleted issue-comment evidence is incomplete"
-                )
-            comment_id = comment.get("id")
-            if (
-                isinstance(comment_id, bool)
-                or not isinstance(comment_id, int)
-                or comment_id <= 0
-            ):
-                raise CodexReviewError(
-                    "deleted issue-comment evidence is incomplete"
-                )
-            if comment_id == view.automated_review_trigger_comment_id:
-                continue
-
-            body = comment.get("body")
-            if not isinstance(body, str):
-                raise CodexReviewError(
-                    "deleted issue-comment evidence is incomplete"
-                )
-            if not _RESERVED_CODEX_MENTION.search(body):
-                continue
-
-            created_at = comment.get("created_at")
-            created_time = _parse_time(
-                created_at if isinstance(created_at, str) else None
+    def audit_terminal_deletion_evidence(
+        self,
+        session: Session,
+        view,
+    ) -> CodexReviewObservation:
+        if view.automated_review_status not in {
+            AutomatedReviewStatus.PASS,
+            AutomatedReviewStatus.CHANGES_REQUIRED,
+            AutomatedReviewStatus.UNAVAILABLE,
+        }:
+            return self._observation(
+                view,
+                view.automated_review_status.value
+                if view.automated_review_status is not None
+                else "NOT_RUNNING",
+                (),
             )
-            if created_time is None or created_time >= trigger_time:
-                raise CodexReviewError(
-                    "additional Codex invocation detected during governed review"
-                )
+        if self._has_invalidation(session, view):
+            return self._observation(view, "INVALIDATED", ())
+        if (
+            view.automated_review_run_id is None
+            or view.automated_review_head_sha is None
+            or view.automated_review_trigger_comment_id is None
+            or view.automated_review_triggered_at is None
+            or view.pull_request_number is None
+        ):
+            raise CodexReviewError("terminal Codex review metadata is incomplete")
+        trigger_time = _parse_time(view.automated_review_triggered_at)
+        if trigger_time is None:
+            raise CodexReviewError("governed Codex trigger timestamp is missing")
+        terminal_event = self._terminal_event(session, view)
+        terminal_time = self._terminal_time(terminal_event)
+        deleted_invocations = self._deleted_issue_invocation_ids(
+            session,
+            view,
+            trigger_time=trigger_time,
+            terminal_time=terminal_time,
+        )
+        deleted_findings = self._deleted_review_finding_ids(
+            session,
+            view,
+            reviews=(),
+            trigger_time=trigger_time,
+            terminal_event=terminal_event,
+            terminal_time=terminal_time,
+        )
+        if deleted_invocations or deleted_findings:
+            return self._invalidate(
+                session,
+                view,
+                reason=(
+                    "CODEX_DELETED_INVOCATION"
+                    if deleted_invocations
+                    else "CODEX_DELETED_FINDING"
+                ),
+                evidence_ids=list(deleted_invocations or deleted_findings),
+                actors=(),
+            )
+        return self._observation(
+            view,
+            view.automated_review_status.value,
+            (),
+        )
 
     def request(self, session: Session, publication_id: str):
         if self.mode == "disabled":
@@ -499,14 +738,166 @@ class CodexReviewBroker:
 
     def _is_allowed_actor(self, actor: str) -> bool:
         return _actor_key(actor) in self.allowed_actors
+
+    def _matching_native_evidence(
+        self,
+        view,
+        *,
+        trigger_time: datetime,
+        reviews,
+        comments,
+        reactions,
+    ):
+        matching_reviews = []
+        evidence_times = []
+        for item in reviews:
+            submitted = _parse_time(item.submitted_at)
+            candidate = (
+                self._is_allowed_actor(item.actor)
+                and item.state.strip().upper() == "COMMENTED"
+                and item.commit_id == view.automated_review_head_sha
+            )
+            if candidate and submitted is None:
+                raise CodexReviewError("Codex review result timestamp is missing")
+            if candidate and submitted >= trigger_time:
+                matching_reviews.append(item)
+                evidence_times.append(submitted)
+
+        matching_review_ids = {item.review_id for item in matching_reviews}
+        matching_comments = []
+        for item in comments:
+            created = _parse_time(item.created_at)
+            candidate = (
+                self._is_allowed_actor(item.actor)
+                and item.commit_id == view.automated_review_head_sha
+                and item.review_id in matching_review_ids
+            )
+            if candidate and created is None:
+                raise CodexReviewError("Codex finding timestamp is missing")
+            if candidate and created >= trigger_time:
+                matching_comments.append(item)
+                evidence_times.append(created)
+
+        matching_reactions = []
+        for item in reactions:
+            created = _parse_time(item.created_at)
+            candidate = self._is_allowed_actor(item.actor) and item.content == "+1"
+            if candidate and created is None:
+                raise CodexReviewError("Codex reaction timestamp is missing")
+            if candidate and created >= trigger_time:
+                matching_reactions.append(item)
+                evidence_times.append(created)
+
+        return (
+            matching_reviews,
+            matching_comments,
+            matching_reactions,
+            evidence_times,
+        )
+
+    def _usage_limit_evidence(
+        self,
+        issue_comments,
+        *,
+        trigger_comment_id: int,
+        trigger_time: datetime,
+        comment_id: int | None,
+    ):
+        if comment_id is not None:
+            matches = [item for item in issue_comments if item.comment_id == comment_id]
+            if len(matches) != 1:
+                raise CodexReviewError(
+                    "Codex webhook comment receipt is missing or ambiguous"
+                )
+            evidence = matches[0]
+            if evidence.comment_id == trigger_comment_id:
+                raise CodexReviewError("Codex usage-limit evidence collides with trigger")
+            created = _parse_time(evidence.created_at)
+            if (
+                not self._is_allowed_actor(evidence.actor)
+                or created is None
+                or created <= trigger_time
+                or not _CODEX_USAGE_LIMIT.search(evidence.body or "")
+            ):
+                return None
+            return evidence, created
+
+        provider_responses = []
+        for item in issue_comments:
+            if item.comment_id == trigger_comment_id:
+                continue
+            if not self._is_allowed_actor(item.actor):
+                continue
+            created = _parse_time(item.created_at)
+            if created is None:
+                raise CodexReviewError("Codex provider response timestamp is missing")
+            if created > trigger_time:
+                provider_responses.append((created, item.comment_id, item))
+        provider_responses.sort(key=lambda item: (item[0], item[1]))
+        if not provider_responses:
+            return None
+        evidence_time, _evidence_id, evidence = provider_responses[0]
+        if not _CODEX_USAGE_LIMIT.search(evidence.body or ""):
+            return None
+        return evidence, evidence_time
+
+    @staticmethod
+    def _has_invalidation(session: Session, view) -> bool:
+        return any(
+            event["event_type"] == EventType.CODEX_REVIEW_INVALIDATED.value
+            and event["payload"].get("run_id") == view.automated_review_run_id
+            and event["payload"].get("head_sha") == view.automated_review_head_sha
+            for event in load_events(session, view.publication_id)
+        )
+
+    @staticmethod
+    def _observation(view, state: str, actors: tuple[str, ...]) -> CodexReviewObservation:
+        return CodexReviewObservation(
+            run_id=view.automated_review_run_id or "",
+            state=state,
+            matching_reviews=0,
+            matching_comments=0,
+            matching_reactions=0,
+            actors=actors,
+        )
+
+    def _invalidate(
+        self,
+        session: Session,
+        view,
+        *,
+        reason: str,
+        evidence_ids: list[int],
+        actors: tuple[str, ...],
+    ) -> CodexReviewObservation:
+        invalidate_codex_review(
+            session,
+            view.publication_id,
+            run_id=view.automated_review_run_id,
+            reviewed_head_sha=view.automated_review_head_sha,
+            reason=reason,
+            evidence_ids=evidence_ids,
+        )
+        return self._observation(view, "INVALIDATED", actors)
+
     def reconcile(
         self,
         session: Session,
         publication_id: str,
+        *,
+        comment_id: int | None = None,
+        terminalize: bool = True,
+        allow_stale_head: bool = False,
+        allow_merged: bool = False,
     ) -> CodexReviewObservation:
         view = get_view(session, publication_id)
-        if view.automated_review_status is not AutomatedReviewStatus.RUNNING:
-            raise DomainError("publication has no active Codex review")
+        if view.automated_review_status not in {
+            AutomatedReviewStatus.RUNNING,
+            AutomatedReviewStatus.PASS,
+            AutomatedReviewStatus.CHANGES_REQUIRED,
+            AutomatedReviewStatus.UNAVAILABLE,
+        }:
+            raise DomainError("publication has no governed Codex review")
         if (
             view.automated_review_run_id is None
             or view.automated_review_head_sha is None
@@ -518,6 +909,11 @@ class CodexReviewBroker:
             raise DomainError("active Codex review metadata is incomplete")
         if not self.allowed_actors:
             raise CodexReviewError("Codex review actor allowlist is not configured")
+
+        if self._has_invalidation(session, view):
+            return self._observation(view, "INVALIDATED", ())
+        if allow_merged and view.automated_review_status is AutomatedReviewStatus.RUNNING:
+            raise CodexReviewError("active Codex review cannot be reconciled after merge")
 
         trigger_time = _parse_time(view.automated_review_triggered_at)
         assert trigger_time is not None
@@ -533,7 +929,12 @@ class CodexReviewBroker:
                 view.pull_request_number,
                 access.token,
             )
-            self._verify_exact_pr(view, pull)
+            self._verify_exact_pr(
+                view,
+                pull,
+                allow_stale_head=allow_stale_head,
+                allow_merged=allow_merged,
+            )
             issue_comments = self.github.list_issue_comments(
                 view.repository,
                 view.pull_request_number,
@@ -581,43 +982,26 @@ class CodexReviewBroker:
             trigger_comment_id=trigger.comment_id,
             trigger_time=trigger_time,
         )
-        self.assert_no_deleted_ambiguous_invocations(session, view)
-
-        matching_reviews = []
-        for item in reviews:
-            submitted = _parse_time(item.submitted_at)
-            if (
-                self._is_allowed_actor(item.actor)
-                and item.state.strip().upper() == "COMMENTED"
-                and item.commit_id == view.automated_review_head_sha
-                and submitted is not None
-                and submitted >= trigger_time
-            ):
-                matching_reviews.append(item)
-
-        matching_review_ids = {item.review_id for item in matching_reviews}
-        matching_comments = []
-        for item in comments:
-            created = _parse_time(item.created_at)
-            if (
-                self._is_allowed_actor(item.actor)
-                and item.commit_id == view.automated_review_head_sha
-                and created is not None
-                and created >= trigger_time
-                and item.review_id in matching_review_ids
-            ):
-                matching_comments.append(item)
-
-        matching_reactions = []
-        for item in reactions:
-            created = _parse_time(item.created_at)
-            if (
-                self._is_allowed_actor(item.actor)
-                and item.content == "+1"
-                and created is not None
-                and created >= trigger_time
-            ):
-                matching_reactions.append(item)
+        terminal_event = self._terminal_event(session, view)
+        terminal_time = (
+            self._terminal_time(terminal_event)
+            if terminal_event is not None
+            else None
+        )
+        deleted_invocations = self._deleted_issue_invocation_ids(
+            session,
+            view,
+            trigger_time=trigger_time,
+            terminal_time=terminal_time,
+        )
+        deleted_findings = self._deleted_review_finding_ids(
+            session,
+            view,
+            reviews=reviews,
+            trigger_time=trigger_time,
+            terminal_event=terminal_event,
+            terminal_time=terminal_time,
+        )
 
         actors = tuple(
             sorted(
@@ -628,42 +1012,186 @@ class CodexReviewBroker:
                 }
             )
         )
-        if not matching_reviews and not matching_reactions:
-            return CodexReviewObservation(
-                run_id=view.automated_review_run_id,
-                state="RUNNING",
-                matching_reviews=0,
-                matching_comments=len(matching_comments),
-                matching_reactions=0,
+        if deleted_invocations:
+            return self._invalidate(
+                session,
+                view,
+                reason="CODEX_DELETED_INVOCATION",
+                evidence_ids=list(deleted_invocations),
                 actors=actors,
             )
+        if deleted_findings:
+            return self._invalidate(
+                session,
+                view,
+                reason="CODEX_DELETED_FINDING",
+                evidence_ids=list(deleted_findings),
+                actors=actors,
+            )
+        (
+            matching_reviews,
+            matching_comments,
+            matching_reactions,
+            provider_evidence_times,
+        ) = self._matching_native_evidence(
+            view,
+            trigger_time=trigger_time,
+            reviews=reviews,
+            comments=comments,
+            reactions=reactions,
+        )
+        native_time = max(provider_evidence_times) if provider_evidence_times else None
+        usage_evidence = self._usage_limit_evidence(
+            issue_comments,
+            trigger_comment_id=trigger.comment_id,
+            trigger_time=trigger_time,
+            comment_id=comment_id,
+        )
 
         findings = [
             self._normalize_finding(item)
             for item in matching_comments
             if item.body.strip()
         ]
-        result = (
-            AutomatedReviewStatus.CHANGES_REQUIRED
-            if findings
-            else AutomatedReviewStatus.PASS
-        )
+        native_result = None
+        if matching_reviews or matching_reactions:
+            native_result = (
+                AutomatedReviewStatus.CHANGES_REQUIRED
+                if findings
+                else AutomatedReviewStatus.PASS
+            )
+        native_ids = [
+            *[item.review_id for item in matching_reviews],
+            *[item.comment_id for item in matching_comments],
+            *[item.reaction_id for item in matching_reactions],
+        ]
+
+        if view.automated_review_status is AutomatedReviewStatus.RUNNING:
+            if usage_evidence is not None and native_result is not None:
+                usage, usage_time = usage_evidence
+                if native_time is None or native_time <= usage_time:
+                    return self._invalidate(
+                        session,
+                        view,
+                        reason="CODEX_PROVIDER_RESULT_CONFLICT",
+                        evidence_ids=[usage.comment_id, *native_ids],
+                        actors=actors,
+                    )
+                if not terminalize:
+                    return self._observation(view, "RUNNING", actors)
+            elif usage_evidence is not None:
+                usage, usage_time = usage_evidence
+                mark_codex_review_unavailable(
+                    session,
+                    publication_id,
+                    run_id=view.automated_review_run_id,
+                    reviewed_head_sha=view.automated_review_head_sha,
+                    reason=f"CODEX_PROVIDER_USAGE_LIMIT:{usage.comment_id}",
+                    provider_occurred_at=usage_time.isoformat(),
+                )
+                return self._observation(view, "UNAVAILABLE", actors)
+            elif native_result is None or not terminalize:
+                return self._observation(view, "RUNNING", actors)
+        elif view.automated_review_status is AutomatedReviewStatus.UNAVAILABLE:
+            if native_result is not None:
+                usage, usage_time = usage_evidence or (None, None)
+                if (
+                    native_time is None
+                    or terminal_time is None
+                    or native_time <= terminal_time
+                    or (usage_time is not None and native_time <= usage_time)
+                ):
+                    return self._invalidate(
+                        session,
+                        view,
+                        reason="CODEX_PROVIDER_RESULT_CONFLICT",
+                        evidence_ids=[
+                            *([usage.comment_id] if usage is not None else []),
+                            *native_ids,
+                        ],
+                        actors=actors,
+                    )
+            elif usage_evidence is not None:
+                usage, usage_time = usage_evidence
+                reason = terminal_event["payload"].get("reason")
+                recorded_time = terminal_event["payload"].get("provider_occurred_at")
+                if (
+                    reason != f"CODEX_PROVIDER_USAGE_LIMIT:{usage.comment_id}"
+                    or _parse_provider_time(
+                        recorded_time,
+                        "Codex provider unavailability timestamp",
+                    )
+                    != usage_time
+                ):
+                    return self._invalidate(
+                        session,
+                        view,
+                        reason="CODEX_PROVIDER_RESULT_CONFLICT",
+                        evidence_ids=[usage.comment_id],
+                        actors=actors,
+                    )
+                return self._observation(view, "UNAVAILABLE", actors)
+            else:
+                return self._observation(view, "UNAVAILABLE", actors)
+        else:
+            if usage_evidence is not None:
+                usage, usage_time = usage_evidence
+                if terminal_time is None or usage_time >= terminal_time:
+                    return self._invalidate(
+                        session,
+                        view,
+                        reason="CODEX_PROVIDER_RESULT_CONFLICT",
+                        evidence_ids=[usage.comment_id],
+                        actors=actors,
+                    )
+            if native_result is not None:
+                result_payload = terminal_event["payload"]
+                result_review_ids = sorted(item.review_id for item in matching_reviews)
+                result_comment_ids = sorted(item.comment_id for item in matching_comments)
+                result_reaction_ids = sorted(
+                    item.reaction_id for item in matching_reactions
+                )
+                if (
+                    terminal_time is None
+                    or native_time != terminal_time
+                    or native_result.value != result_payload.get("result")
+                    or result_review_ids != result_payload.get("provider_review_ids")
+                    or result_comment_ids != result_payload.get("provider_comment_ids")
+                    or result_reaction_ids != result_payload.get("provider_reaction_ids")
+                ):
+                    return self._invalidate(
+                        session,
+                        view,
+                        reason="CODEX_PROVIDER_RESULT_CHANGED",
+                        evidence_ids=native_ids,
+                        actors=actors,
+                    )
+            return self._observation(
+                view,
+                view.automated_review_status.value,
+                actors,
+            )
+
+        if native_result is None or native_time is None:
+            return self._observation(view, "RUNNING", actors)
+
         complete_codex_review(
             session,
             publication_id,
             run_id=view.automated_review_run_id,
             reviewed_head_sha=view.automated_review_head_sha,
-            result=result,
+            result=native_result,
             findings=findings,
             provider_review_ids=[item.review_id for item in matching_reviews],
             provider_comment_ids=[item.comment_id for item in matching_comments],
             provider_reaction_ids=[
                 item.reaction_id for item in matching_reactions
             ],
+            provider_completed_at=native_time.isoformat(),
         )
         return CodexReviewObservation(
             run_id=view.automated_review_run_id,
-            state=result.value,
+            state=native_result.value,
             matching_reviews=len(matching_reviews),
             matching_comments=len(matching_comments),
             matching_reactions=len(matching_reactions),

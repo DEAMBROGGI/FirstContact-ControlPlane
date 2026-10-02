@@ -308,6 +308,11 @@ def test_merge_endpoints_are_plane_coordinator_commands(session):
             assert supplied_session is session
             coordinator.calls.append(("authorize", publication_id))
 
+        def reconcile_publication(self, supplied_session, publication_id):
+            assert supplied_session is session
+            coordinator.calls.append(("gateway_reconcile", publication_id))
+            return SimpleNamespace(outcome="RECONCILED")
+
     coordinator = FakeMergeCoordinator()
 
     def override_session():
@@ -340,7 +345,7 @@ def test_merge_endpoints_are_plane_coordinator_commands(session):
         assert coordinator.calls == [
             ("authorize", publication.publication_id),
             ("merge", publication.publication_id),
-            ("reconcile", publication.publication_id),
+            ("gateway_reconcile", publication.publication_id),
         ]
     finally:
         app.dependency_overrides.clear()
@@ -512,19 +517,8 @@ def test_merge_endpoint_blocks_active_changes_requested_by_allowlisted_actor(ses
 
 def test_merge_reconcile_syncs_watch_after_recording_policy_violation(session):
     view = merge_publication(session, 526, ready=False)
-    token_provider = MergeApiTokenProvider()
     github = MergeApiGitHub(merged=True)
-    coordinator = MergeCoordinator(
-        token_provider=token_provider,
-        github=github,
-    )
-
-    def override_session():
-        yield session
-
-    app.dependency_overrides[get_session] = override_session
-    app.dependency_overrides[get_merge_coordinator] = lambda: coordinator
-    client = TestClient(app)
+    client = merge_endpoint_client(session, github)
     try:
         response = client.post(
             f"/api/v1/internal/publications/{view.publication_id}/merge/reconcile",

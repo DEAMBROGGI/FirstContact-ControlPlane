@@ -32,7 +32,6 @@ from .repository import load_events
 from .service import (
     clear_human_review_block,
     get_view,
-    mark_codex_review_unavailable,
     record_mergeability,
     record_review,
     required_review_adjudication,
@@ -627,11 +626,6 @@ def watch_payload(view: ReviewWatchView) -> dict[str, Any]:
     return asdict(view)
 
 
-_CODEX_USAGE_LIMIT_RE = re.compile(
-    r"(?is)reached\s+your\s+codex\s+usage\s+limits\s+for\s+code\s+reviews"
-)
-
-
 class GitHubWebhookDeferred(GitHubWebhookError):
     """Evidence is valid but a prerequisite is not yet authoritative."""
 
@@ -710,6 +704,13 @@ def _required_adjudication_time(
             "required review adjudication timestamp is missing or ambiguous"
         )
     adjudicated_at = _parse_time(events[0].get("occurred_at"))
+    if kind == "CODEX_PASS":
+        provider_time = events[0]["payload"].get("provider_completed_at")
+        if not isinstance(provider_time, str) or not provider_time.strip():
+            raise GitHubWebhookError(
+                "Codex provider completion timestamp is missing"
+            )
+        adjudicated_at = _parse_time(provider_time)
     if adjudicated_at is None:
         raise GitHubWebhookError("required review adjudication timestamp is missing")
     return adjudicated_at
@@ -1080,127 +1081,6 @@ class GitHubWebhookGateway:
             trigger_user=None,
         )
 
-    def _maybe_mark_codex_unavailable_from_comment(
-        self,
-        session: Session,
-        publication_id: str,
-        *,
-        comment_id: int | None,
-        token: str,
-    ) -> bool:
-        view = get_view(session, publication_id)
-        if (
-            view.automated_review_status is not AutomatedReviewStatus.RUNNING
-            or view.automated_review_run_id is None
-            or view.automated_review_head_sha is None
-            or view.automated_review_triggered_at is None
-            or view.pull_request_number is None
-        ):
-            return False
-
-        trigger_time = _parse_time(view.automated_review_triggered_at)
-        if trigger_time is None:
-            raise GitHubWebhookError("governed Codex trigger timestamp is missing")
-        comments = self.github.list_issue_comments(
-            view.repository,
-            view.pull_request_number,
-            token,
-        )
-        trigger_matches = [
-            item
-            for item in comments
-            if item.comment_id == view.automated_review_trigger_comment_id
-        ]
-        if len(trigger_matches) != 1:
-            raise GitHubWebhookError("governed Codex trigger receipt is missing or ambiguous")
-        trigger = trigger_matches[0]
-        if _normalize_actor(trigger.actor) != _normalize_actor(
-            view.automated_review_trigger_actor or ""
-        ):
-            raise GitHubWebhookError("governed Codex trigger actor changed")
-        if _parse_time(trigger.created_at) != trigger_time:
-            raise GitHubWebhookError("governed Codex trigger timestamp changed")
-        marker = (
-            "<!-- firstcontact-control-plane:codex-review "
-            f"run={view.automated_review_run_id} "
-            f"head={view.automated_review_head_sha} -->"
-        )
-        if marker not in (trigger.body or ""):
-            raise GitHubWebhookError("governed Codex trigger marker changed")
-
-        assert_no_ambiguous_codex_invocations(
-            comments,
-            trigger_comment_id=trigger.comment_id,
-            trigger_time=trigger_time,
-        )
-        self._codex_broker().assert_no_deleted_ambiguous_invocations(
-            session,
-            view,
-        )
-
-        if comment_id is not None:
-            evidence_matches = [
-                item for item in comments if item.comment_id == comment_id
-            ]
-            if len(evidence_matches) != 1:
-                raise GitHubWebhookError(
-                    "Codex webhook comment receipt is missing or ambiguous"
-                )
-            evidence = evidence_matches[0]
-            if evidence.comment_id == view.automated_review_trigger_comment_id:
-                raise GitHubWebhookError(
-                    "Codex usage-limit evidence collides with trigger"
-                )
-            evidence_time = _parse_time(evidence.created_at)
-            if (
-                _normalize_actor(evidence.actor) not in self.codex_actors
-                or evidence_time is None
-                or evidence_time <= trigger_time
-                or not _CODEX_USAGE_LIMIT_RE.search(evidence.body or "")
-            ):
-                return False
-        else:
-            provider_responses: list[tuple[datetime, int, Any]] = []
-            for item in comments:
-                if item.comment_id == view.automated_review_trigger_comment_id:
-                    continue
-                if _normalize_actor(item.actor) not in self.codex_actors:
-                    continue
-                created = _parse_time(item.created_at)
-                if created is None:
-                    raise GitHubWebhookError(
-                        "Codex provider response timestamp is missing"
-                    )
-                if created > trigger_time:
-                    provider_responses.append((created, item.comment_id, item))
-
-            provider_responses.sort(key=lambda item: (item[0], item[1]))
-            if any(
-                earlier[1] == later[1]
-                for earlier, later in zip(
-                    provider_responses,
-                    provider_responses[1:],
-                )
-            ):
-                raise GitHubWebhookError(
-                    "Codex provider response receipt is ambiguous"
-                )
-            if not provider_responses:
-                return False
-
-            evidence = provider_responses[0][2]
-            if not _CODEX_USAGE_LIMIT_RE.search(evidence.body or ""):
-                return False
-
-        mark_codex_review_unavailable(
-            session,
-            publication_id,
-            run_id=view.automated_review_run_id,
-            reviewed_head_sha=view.automated_review_head_sha,
-            reason=f"CODEX_PROVIDER_USAGE_LIMIT:{evidence.comment_id}",
-        )
-        return True
-
     def _reconcile_codex_unavailability_only(
         self,
         session: Session,
@@ -1214,12 +1094,14 @@ class GitHubWebhookGateway:
         if view.automated_review_status is not AutomatedReviewStatus.RUNNING:
             return False
         try:
-            return self._maybe_mark_codex_unavailable_from_comment(
+            observation = self._codex_broker().reconcile(
                 session,
                 publication_id,
                 comment_id=comment_id,
-                token=token,
+                terminalize=False,
+                allow_stale_head=True,
             )
+            return observation.state in {"UNAVAILABLE", "INVALIDATED"}
         except (
             CodexReviewError,
             DomainError,
@@ -1227,8 +1109,8 @@ class GitHubWebhookGateway:
             GitHubAuthError,
             GitHubWebhookError,
         ):
-            # Stale evidence cannot safely complete the run. The caller still
-            # applies the authoritative stale-head/base fence and blocks review.
+            # A stale wake-up cannot complete a provider result before the
+            # authoritative head/base fence.
             return False
 
     def _reconcile_codex(
@@ -1238,20 +1120,32 @@ class GitHubWebhookGateway:
         *,
         token: str,
         comment_id: int | None = None,
+        allow_merged: bool = False,
+        include_provider_evidence: bool = False,
     ) -> str:
-        if self._maybe_mark_codex_unavailable_from_comment(
-            session,
-            publication_id,
-            comment_id=comment_id,
-            token=token,
-        ):
-            return "CODEX_UNAVAILABLE"
-
         view = get_view(session, publication_id)
-        if view.automated_review_status is not AutomatedReviewStatus.RUNNING:
+        if view.automated_review_status not in {
+            AutomatedReviewStatus.RUNNING,
+            AutomatedReviewStatus.PASS,
+            AutomatedReviewStatus.CHANGES_REQUIRED,
+            AutomatedReviewStatus.UNAVAILABLE,
+        }:
             return "CODEX_NOT_RUNNING"
-
-        observation = self._codex_broker().reconcile(session, publication_id)
+        if (
+            view.automated_review_status is not AutomatedReviewStatus.RUNNING
+            and not include_provider_evidence
+        ):
+            observation = self._codex_broker().audit_terminal_deletion_evidence(
+                session,
+                view,
+            )
+        else:
+            observation = self._codex_broker().reconcile(
+                session,
+                publication_id,
+                comment_id=comment_id,
+                allow_merged=allow_merged,
+            )
         return "CODEX_" + observation.state
 
     def _effective_human_review_decisions(
@@ -1799,6 +1693,46 @@ class GitHubWebhookGateway:
                 "merge requires READY_TO_MERGE after authoritative review reconciliation"
             )
 
+    def _reconcile_external_merge(
+        self,
+        session: Session,
+        publication_id: str,
+    ) -> None:
+        view = get_view(session, publication_id)
+        if view.automated_review_status in {
+            AutomatedReviewStatus.PASS,
+            AutomatedReviewStatus.CHANGES_REQUIRED,
+            AutomatedReviewStatus.UNAVAILABLE,
+        }:
+            self._reconcile_codex(
+                session,
+                publication_id,
+                token=self._access(view.repository).token,
+                allow_merged=True,
+                include_provider_evidence=False,
+            )
+            view = get_view(session, publication_id)
+        human_review_eligible = False
+        if view.state is PublicationState.READY_TO_MERGE:
+            outcome = self._reconcile_human_from_github(
+                session,
+                publication_id,
+                token=self._access(view.repository).token,
+            )
+            current = get_view(session, publication_id)
+            human_review_eligible = (
+                current.state is PublicationState.READY_TO_MERGE
+                and outcome == "HUMAN_APPROVAL_REMAINS"
+            )
+        MergeCoordinator(
+            token_provider=self.token_provider,
+            github=self.github,
+        ).reconcile(
+            session,
+            publication_id,
+            human_review_eligible=human_review_eligible,
+        )
+
     def reconcile_publication(
         self,
         session: Session,
@@ -1853,10 +1787,7 @@ class GitHubWebhookGateway:
         if pull.merged:
             merge_outcome = "RECONCILED"
             try:
-                MergeCoordinator(
-                    token_provider=self.token_provider,
-                    github=self.github,
-                ).reconcile(session, publication_id)
+                self._reconcile_external_merge(session, publication_id)
             except MergePolicyViolationRecorded:
                 merge_outcome = "MERGE_POLICY_VIOLATION"
             except (MergeError, DomainError) as exc:
@@ -1924,6 +1855,17 @@ class GitHubWebhookGateway:
                 session,
                 publication_id,
                 token=access.token,
+            )
+        elif view.automated_review_status in {
+            AutomatedReviewStatus.PASS,
+            AutomatedReviewStatus.CHANGES_REQUIRED,
+            AutomatedReviewStatus.UNAVAILABLE,
+        }:
+            self._reconcile_codex(
+                session,
+                publication_id,
+                token=access.token,
+                include_provider_evidence=False,
             )
 
         self._reconcile_human_from_github(
@@ -2023,10 +1965,7 @@ class GitHubWebhookGateway:
 
         if pull.merged:
             try:
-                MergeCoordinator(
-                    token_provider=self.token_provider,
-                    github=self.github,
-                ).reconcile(session, publication_id)
+                self._reconcile_external_merge(session, publication_id)
             except MergePolicyViolationRecorded:
                 return "MERGE_POLICY_VIOLATION"
             except (MergeError, DomainError) as exc:
@@ -2095,17 +2034,39 @@ class GitHubWebhookGateway:
         ):
             return "STALE_BASE"
 
+        view = get_view(session, publication_id)
+        if view.automated_review_status in {
+            AutomatedReviewStatus.PASS,
+            AutomatedReviewStatus.CHANGES_REQUIRED,
+            AutomatedReviewStatus.UNAVAILABLE,
+        }:
+            self._reconcile_codex(
+                session,
+                publication_id,
+                token=token,
+                include_provider_evidence=False,
+            )
+
         if row.event_name == "pull_request" and row.action == "synchronize":
             return "SYNCHRONIZE_MATCHED"
 
         if row.event_name == "issue_comment":
             if codex_unavailable:
                 return "CODEX_UNAVAILABLE"
+            raw_comment = row.payload.get("comment")
+            actor = ""
+            if isinstance(raw_comment, Mapping):
+                user = raw_comment.get("user")
+                if isinstance(user, Mapping):
+                    actor = _normalize_actor(str(user.get("login") or ""))
+            if actor not in self.codex_actors and row.action != "deleted":
+                return "ISSUE_COMMENT_OBSERVED"
             return self._reconcile_codex(
                 session,
                 publication_id,
                 token=token,
                 comment_id=comment_id,
+                include_provider_evidence=True,
             )
 
         if row.event_name == "pull_request_review":
@@ -2121,6 +2082,7 @@ class GitHubWebhookGateway:
                     session,
                     publication_id,
                     token=token,
+                    include_provider_evidence=True,
                 )
             return self._human_review_from_payload(
                 session,
@@ -2130,12 +2092,18 @@ class GitHubWebhookGateway:
             )
 
         if row.event_name == "pull_request_review_comment":
-            view = get_view(session, publication_id)
-            if view.automated_review_status is AutomatedReviewStatus.RUNNING:
+            raw_comment = row.payload.get("comment")
+            actor = ""
+            if isinstance(raw_comment, Mapping):
+                user = raw_comment.get("user")
+                if isinstance(user, Mapping):
+                    actor = _normalize_actor(str(user.get("login") or ""))
+            if actor in self.codex_actors:
                 return self._reconcile_codex(
                     session,
                     publication_id,
                     token=token,
+                    include_provider_evidence=True,
                 )
             return "REVIEW_COMMENT_OBSERVED"
 

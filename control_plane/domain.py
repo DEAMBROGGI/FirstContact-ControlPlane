@@ -33,6 +33,7 @@ class EventType(StrEnum):
     CODEX_REVIEW_TRIGGERED = "CODEX_REVIEW_TRIGGERED"
     CODEX_REVIEW_COMPLETED = "CODEX_REVIEW_COMPLETED"
     CODEX_REVIEW_UNAVAILABLE = "CODEX_REVIEW_UNAVAILABLE"
+    CODEX_REVIEW_INVALIDATED = "CODEX_REVIEW_INVALIDATED"
     PLANE_REVIEW_RECORDED = "PLANE_REVIEW_RECORDED"
     PLANE_REVIEW_MATERIALIZED = "PLANE_REVIEW_MATERIALIZED"
     REMEDIATION_CLEARED = "REMEDIATION_CLEARED"
@@ -251,6 +252,12 @@ def fold_events(
             automated_review_status = AutomatedReviewStatus(payload["result"])
             automated_review_findings_count = int(payload.get("findings_count", 0))
             automated_reviewer = None
+            if payload.get("supersedes_unavailability") is True:
+                remediation_cleared_review_run_id = None
+                remediation_cleared_head_sha = None
+                review_decision = None
+                mergeable = None
+                state = PublicationState.IN_REVIEW
             if (
                 automated_review_status is AutomatedReviewStatus.CHANGES_REQUIRED
                 and automated_review_mode == "required"
@@ -259,6 +266,14 @@ def fold_events(
         elif event_type is EventType.CODEX_REVIEW_UNAVAILABLE:
             automated_review_status = AutomatedReviewStatus.UNAVAILABLE
             automated_reviewer = None
+        elif event_type is EventType.CODEX_REVIEW_INVALIDATED:
+            automated_review_status = AutomatedReviewStatus.UNAVAILABLE
+            automated_reviewer = None
+            remediation_cleared_review_run_id = None
+            remediation_cleared_head_sha = None
+            review_decision = None
+            mergeable = None
+            state = PublicationState.CHANGES_REQUIRED
         elif event_type is EventType.REMEDIATION_CLEARED:
             remediation_cleared_review_run_id = str(payload["run_id"])
             remediation_cleared_head_sha = str(payload["head_sha"])
@@ -471,7 +486,15 @@ def validate_transition(
         EventType.CODEX_REVIEW_COMPLETED,
         EventType.CODEX_REVIEW_UNAVAILABLE,
     }:
-        if view.automated_review_status is not AutomatedReviewStatus.RUNNING:
+        supersedes_unavailability = (
+            event_type is EventType.CODEX_REVIEW_COMPLETED
+            and view.automated_review_status is AutomatedReviewStatus.UNAVAILABLE
+            and payload.get("supersedes_unavailability") is True
+        )
+        if (
+            view.automated_review_status is not AutomatedReviewStatus.RUNNING
+            and not supersedes_unavailability
+        ):
             raise DomainError("Codex result requires active review")
         if payload.get("run_id") != view.automated_review_run_id:
             raise DomainError("Codex result run is stale")
@@ -484,6 +507,36 @@ def validate_transition(
                 AutomatedReviewStatus.CHANGES_REQUIRED,
             }:
                 raise DomainError("invalid Codex review result")
+        return
+    if event_type is EventType.CODEX_REVIEW_INVALIDATED:
+        if view.automated_review_status not in {
+            AutomatedReviewStatus.RUNNING,
+            AutomatedReviewStatus.PASS,
+            AutomatedReviewStatus.CHANGES_REQUIRED,
+            AutomatedReviewStatus.UNAVAILABLE,
+        }:
+            raise DomainError("Codex invalidation requires a governed review")
+        if (
+            payload.get("run_id") != view.automated_review_run_id
+            or payload.get("head_sha") != view.automated_review_head_sha
+        ):
+            raise DomainError("Codex invalidation run or head is stale")
+        reason = payload.get("reason")
+        evidence_ids = payload.get("evidence_ids")
+        if not isinstance(reason, str) or not reason or len(reason) > 200:
+            raise DomainError("Codex invalidation reason is invalid")
+        if (
+            not isinstance(evidence_ids, list)
+            or not evidence_ids
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value <= 0
+                for value in evidence_ids
+            )
+            or evidence_ids != sorted(set(evidence_ids))
+        ):
+            raise DomainError("Codex invalidation evidence is invalid")
         return
     if event_type is EventType.REMEDIATION_CLEARED:
         if state is not PublicationState.CHANGES_REQUIRED:

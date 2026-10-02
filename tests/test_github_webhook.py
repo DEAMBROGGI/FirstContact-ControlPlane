@@ -22,6 +22,7 @@ from control_plane.github_api import (
     IssueCommentSnapshot,
     PullMergeEventSnapshot,
     PullRequestSnapshot,
+    PullReviewCommentSnapshot,
     PullReviewSnapshot,
 )
 from control_plane.github_app import InstallationAccess
@@ -81,6 +82,7 @@ USAGE_LIMIT = (
     "You have reached your Codex usage limits for code reviews. "
     "You can see your limits in the Codex usage dashboard."
 )
+CODEX_RESULT_AT = "2026-09-30T12:04:00Z"
 
 
 def candidate() -> VerifiedCandidateSource:
@@ -183,6 +185,7 @@ def complete_codex_pass(session, view):
         provider_review_ids=[501],
         provider_comment_ids=[],
         provider_reaction_ids=[],
+        provider_completed_at=CODEX_RESULT_AT,
     )
 
 
@@ -194,7 +197,7 @@ def codex_gate_time(session, view):
         and event["payload"].get("run_id") == view.automated_review_run_id
         and event["payload"].get("result") == AutomatedReviewStatus.PASS.value
     )
-    timestamp = datetime.fromisoformat(event["occurred_at"])
+    timestamp = datetime.fromisoformat(event["payload"]["provider_completed_at"])
     return (
         timestamp.replace(tzinfo=timezone.utc)
         if timestamp.tzinfo is None
@@ -241,6 +244,43 @@ def raw_delivery(
             "id": review_id,
             "user": {"login": review_actor or HUMAN_ACTOR},
         }
+    body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    signature = "sha256=" + hmac.new(
+        SECRET.encode("utf-8"),
+        body,
+        hashlib.sha256,
+    ).hexdigest()
+    return body, signature
+
+
+def raw_review_comment_delivery(
+    *,
+    comment_id,
+    review_id,
+    body_text,
+    created_at,
+    actor=CODEX_ACTOR,
+    commit_id=HEAD,
+):
+    payload = {
+        "action": "deleted",
+        "repository": {"full_name": REPOSITORY},
+        "pull_request": {
+            "number": 44,
+            "head": {"sha": HEAD},
+            "base": {"ref": "master"},
+        },
+        "comment": {
+            "id": comment_id,
+            "pull_request_review_id": review_id,
+            "user": {"login": actor},
+            "body": body_text,
+            "commit_id": commit_id,
+            "path": "control_plane/domain.py",
+            "line": 40,
+            "created_at": created_at,
+        },
+    }
     body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     signature = "sha256=" + hmac.new(
         SECRET.encode("utf-8"),
@@ -819,6 +859,334 @@ def test_deleted_post_trigger_invocation_blocks_codex_terminalization(session):
     assert get_webhook_delivery(session, usage_receipt.delivery_id).state == "PENDING"
 
 
+def test_deleted_codex_finding_comment_blocks_active_run_from_passing(session):
+    view = start_codex(session, published(session))
+    github = FakeGitHub()
+    github.issue_comments = [governed_codex_trigger(view)]
+    github.reviews = [
+        PullReviewSnapshot(
+            review_id=520,
+            actor=CODEX_ACTOR,
+            body="Codex findings",
+            state="COMMENTED",
+            commit_id=HEAD,
+            submitted_at="2026-09-30T12:01:00Z",
+        )
+    ]
+    value = gateway(github)
+    body, signature = raw_review_comment_delivery(
+        comment_id=620,
+        review_id=520,
+        body_text="A finding that was deleted before reconciliation.",
+        created_at="2026-09-30T12:02:00Z",
+    )
+    receipt = value.ingest(
+        session,
+        delivery_id="delivery-deleted-codex-finding-active",
+        event_name="pull_request_review_comment",
+        signature=signature,
+        body=body,
+    )
+
+    with pytest.raises(CodexReviewError, match="deleted Codex finding"):
+        value.process_delivery(session, receipt.delivery_id)
+
+    current = get_view(session, view.publication_id)
+    event_types = {
+        event["event_type"]
+        for event in load_events(session, view.publication_id)
+    }
+    assert current.automated_review_status is AutomatedReviewStatus.RUNNING
+    assert EventType.CODEX_REVIEW_COMPLETED.value not in event_types
+    assert get_webhook_delivery(session, receipt.delivery_id).state == "PENDING"
+
+
+def test_delayed_signed_invocation_deletion_invalidates_completed_codex_run(session):
+    view = complete_codex_pass(session, start_codex(session, published(session)))
+    github = FakeGitHub()
+    github.issue_comments = [governed_codex_trigger(view)]
+    value = gateway(github)
+    body, signature = raw_delivery(
+        event_name="issue_comment",
+        action="deleted",
+        comment_id=710,
+        comment_body="@codex review from an unmanaged invocation",
+        comment_created_at="2026-09-30T12:02:00Z",
+    )
+    receipt = value.ingest(
+        session,
+        delivery_id="delivery-late-deleted-invocation-after-pass",
+        event_name="issue_comment",
+        signature=signature,
+        body=body,
+    )
+
+    result = value.process_delivery(session, receipt.delivery_id)
+
+    current = get_view(session, view.publication_id)
+    invalidation = next(
+        event
+        for event in load_events(session, view.publication_id)
+        if event["event_type"] == EventType.CODEX_REVIEW_INVALIDATED.value
+    )
+    assert result.outcome == "CODEX_INVALIDATED"
+    assert current.automated_review_status is AutomatedReviewStatus.UNAVAILABLE
+    assert current.state is PublicationState.CHANGES_REQUIRED
+    assert invalidation["payload"]["run_id"] == view.automated_review_run_id
+    assert invalidation["payload"]["head_sha"] == HEAD
+    assert invalidation["payload"]["evidence_ids"] == [710]
+    assert get_webhook_delivery(session, receipt.delivery_id).state == "PROCESSED"
+
+
+def test_delayed_signed_finding_deletion_invalidates_terminal_codex_result(session):
+    view = start_codex(session, published(session))
+    complete_codex_review(
+        session,
+        view.publication_id,
+        run_id=view.automated_review_run_id,
+        reviewed_head_sha=HEAD,
+        result=AutomatedReviewStatus.CHANGES_REQUIRED,
+        findings=[
+            {
+                "provider_comment_id": 641,
+                "provider_review_id": 541,
+                "path": "control_plane/domain.py",
+                "line": 40,
+                "body": "Finding removed after terminal evidence was recorded.",
+            }
+        ],
+        provider_review_ids=[541],
+        provider_comment_ids=[641],
+        provider_completed_at=CODEX_RESULT_AT,
+    )
+    github = FakeGitHub()
+    github.issue_comments = [governed_codex_trigger(view)]
+    value = gateway(github)
+    body, signature = raw_review_comment_delivery(
+        comment_id=641,
+        review_id=541,
+        body_text="Finding removed after terminal evidence was recorded.",
+        created_at="2026-09-30T12:02:00Z",
+    )
+    receipt = value.ingest(
+        session,
+        delivery_id="delivery-late-deleted-terminal-codex-finding",
+        event_name="pull_request_review_comment",
+        signature=signature,
+        body=body,
+    )
+
+    result = value.process_delivery(session, receipt.delivery_id)
+
+    current = get_view(session, view.publication_id)
+    invalidation = next(
+        event
+        for event in load_events(session, view.publication_id)
+        if event["event_type"] == EventType.CODEX_REVIEW_INVALIDATED.value
+    )
+    assert result.outcome == "CODEX_INVALIDATED"
+    assert current.automated_review_status is AutomatedReviewStatus.UNAVAILABLE
+    assert current.state is PublicationState.CHANGES_REQUIRED
+    assert invalidation["payload"]["evidence_ids"] == [641]
+    assert get_webhook_delivery(session, receipt.delivery_id).state == "PROCESSED"
+
+
+def test_explicit_reconciliation_invalidates_deleted_finding_by_recorded_review_id(
+    session,
+):
+    view = start_codex(session, published(session))
+    complete_codex_review(
+        session,
+        view.publication_id,
+        run_id=view.automated_review_run_id,
+        reviewed_head_sha=HEAD,
+        result=AutomatedReviewStatus.PASS,
+        findings=[],
+        provider_review_ids=[542],
+        provider_comment_ids=[],
+        provider_reaction_ids=[],
+        provider_completed_at=CODEX_RESULT_AT,
+    )
+    github = FakeGitHub()
+    github.issue_comments = [governed_codex_trigger(view)]
+    value = gateway(github)
+    body, signature = raw_review_comment_delivery(
+        comment_id=642,
+        review_id=542,
+        body_text="A finding deleted before terminal provider readback.",
+        created_at="2026-09-30T12:02:00Z",
+    )
+    receipt = value.ingest(
+        session,
+        delivery_id="delivery-deleted-finding-omitted-from-terminal-result",
+        event_name="pull_request_review_comment",
+        signature=signature,
+        body=body,
+    )
+
+    value.reconcile_publication(session, view.publication_id)
+
+    current = get_view(session, view.publication_id)
+    invalidation = next(
+        event
+        for event in load_events(session, view.publication_id)
+        if event["event_type"] == EventType.CODEX_REVIEW_INVALIDATED.value
+    )
+    assert current.automated_review_status is AutomatedReviewStatus.UNAVAILABLE
+    assert current.state is PublicationState.CHANGES_REQUIRED
+    assert invalidation["payload"]["evidence_ids"] == [642]
+    assert get_webhook_delivery(session, receipt.delivery_id).state == "PENDING"
+
+
+def test_native_findings_only_complete_with_provider_timestamp(session):
+    view = start_codex(session, published(session))
+    github = FakeGitHub()
+    github.issue_comments = [governed_codex_trigger(view)]
+    github.reviews = [
+        PullReviewSnapshot(
+            review_id=530,
+            actor=CODEX_ACTOR,
+            body="Codex findings",
+            state="COMMENTED",
+            commit_id=HEAD,
+            submitted_at="2026-09-30T12:01:00Z",
+        )
+    ]
+    github.review_comments = [
+        PullReviewCommentSnapshot(
+            comment_id=630,
+            review_id=530,
+            actor=CODEX_ACTOR,
+            body="A native Codex finding.",
+            commit_id=HEAD,
+            path="control_plane/domain.py",
+            line=40,
+            created_at="2026-09-30T12:02:00Z",
+        )
+    ]
+
+    result = gateway(github).reconcile_publication(session, view.publication_id)
+
+    current = get_view(session, view.publication_id)
+    completion = next(
+        event
+        for event in load_events(session, view.publication_id)
+        if event["event_type"] == EventType.CODEX_REVIEW_COMPLETED.value
+    )
+    assert current.automated_review_status is AutomatedReviewStatus.CHANGES_REQUIRED
+    assert current.automated_review_findings_count == 1
+    assert completion["payload"]["provider_completed_at"] == "2026-09-30T12:02:00+00:00"
+    assert result.next_action == "REMEDIATE_FINDINGS"
+
+
+def test_ambiguous_usage_limit_and_native_findings_block_codex_gate(session):
+    view = start_codex(session, published(session))
+    github = FakeGitHub()
+    github.issue_comments = [
+        governed_codex_trigger(view),
+        usage_limit_response(731, "2026-09-30T12:03:00Z"),
+    ]
+    github.reviews = [
+        PullReviewSnapshot(
+            review_id=531,
+            actor=CODEX_ACTOR,
+            body="Codex findings",
+            state="COMMENTED",
+            commit_id=HEAD,
+            submitted_at="2026-09-30T12:01:00Z",
+        )
+    ]
+    github.review_comments = [
+        PullReviewCommentSnapshot(
+            comment_id=631,
+            review_id=531,
+            actor=CODEX_ACTOR,
+            body="A finding coincides with the usage-limit response.",
+            commit_id=HEAD,
+            path="control_plane/domain.py",
+            line=40,
+            created_at="2026-09-30T12:03:00Z",
+        )
+    ]
+
+    result = gateway(github).reconcile_publication(session, view.publication_id)
+
+    current = get_view(session, view.publication_id)
+    event_types = [
+        event["event_type"]
+        for event in load_events(session, view.publication_id)
+    ]
+    assert current.automated_review_status is AutomatedReviewStatus.UNAVAILABLE
+    assert current.state is PublicationState.CHANGES_REQUIRED
+    assert result.next_role == "IMPLEMENTER"
+    assert result.next_action == "REMEDIATE_FINDINGS"
+    assert EventType.CODEX_REVIEW_INVALIDATED.value in event_types
+    assert EventType.CODEX_REVIEW_UNAVAILABLE.value not in event_types
+    assert EventType.CODEX_REVIEW_COMPLETED.value not in event_types
+
+
+def test_later_native_findings_supersede_timestamped_usage_limit(session):
+    view = start_codex(session, published(session))
+    github = FakeGitHub()
+    github.issue_comments = [
+        governed_codex_trigger(view),
+        usage_limit_response(732, "2026-09-30T12:02:00Z"),
+    ]
+    value = gateway(github)
+    first = value.reconcile_publication(session, view.publication_id)
+    assert get_view(session, view.publication_id).automated_review_status is AutomatedReviewStatus.UNAVAILABLE
+    assert first.next_action == "PRINCIPAL_FALLBACK"
+
+    github.reviews = [
+        PullReviewSnapshot(
+            review_id=532,
+            actor=CODEX_ACTOR,
+            body="Codex findings arrived after usage-limit artifact",
+            state="COMMENTED",
+            commit_id=HEAD,
+            submitted_at="2026-09-30T12:05:00Z",
+        )
+    ]
+    github.review_comments = [
+        PullReviewCommentSnapshot(
+            comment_id=632,
+            review_id=532,
+            actor=CODEX_ACTOR,
+            body="A native finding that must not be hidden by UNAVAILABLE.",
+            commit_id=HEAD,
+            path="control_plane/domain.py",
+            line=40,
+            created_at="2026-09-30T12:06:00Z",
+        )
+    ]
+    body, signature = raw_delivery(
+        event_name="pull_request_review",
+        review_id=532,
+        review_actor=CODEX_ACTOR,
+    )
+    receipt = value.ingest(
+        session,
+        delivery_id="delivery-native-findings-after-usage-limit",
+        event_name="pull_request_review",
+        signature=signature,
+        body=body,
+    )
+
+    result = value.process_delivery(session, receipt.delivery_id)
+
+    current = get_view(session, view.publication_id)
+    completion = [
+        event
+        for event in load_events(session, view.publication_id)
+        if event["event_type"] == EventType.CODEX_REVIEW_COMPLETED.value
+    ]
+    assert current.automated_review_status is AutomatedReviewStatus.CHANGES_REQUIRED
+    assert current.state is PublicationState.CHANGES_REQUIRED
+    assert len(completion) == 1
+    assert completion[0]["payload"]["supersedes_unavailability"] is True
+    assert result.outcome == "CODEX_CHANGES_REQUIRED"
+
+
 def test_pre_trigger_deleted_codex_invocation_does_not_block_reconciliation(session):
     view = start_codex(session, published(session))
     github = FakeGitHub()
@@ -1012,6 +1380,139 @@ def test_full_reconcile_exact_merged_head_preserves_merge_policy_path(session):
     assert event_types.count(EventType.MERGE_POLICY_VIOLATION.value) == 1
     assert EventType.CODEX_REVIEW_UNAVAILABLE.value not in event_types
     assert github.merge_reconciliation_attempts > 0
+
+
+@pytest.mark.parametrize("delivery_path", [False, True])
+@pytest.mark.parametrize("latest_review_state", ["DISMISSED", "CHANGES_REQUESTED"])
+def test_external_merge_refreshes_human_review_before_classification(
+    session,
+    delivery_path,
+    latest_review_state,
+):
+    view = complete_codex_pass(session, start_codex(session, published(session)))
+    gate_time = codex_gate_time(session, view)
+    github = FakeGitHub()
+    github.reviews = [
+        PullReviewSnapshot(
+            review_id=990,
+            actor=HUMAN_ACTOR,
+            body="exact-head approval",
+            state="APPROVED",
+            commit_id=HEAD,
+            submitted_at=(gate_time + timedelta(seconds=1)).isoformat(),
+        )
+    ]
+    value = gateway(github)
+    process_human_review_delivery(
+        session,
+        value,
+        delivery_id=f"delivery-external-merge-approval-{delivery_path}-{latest_review_state}",
+        review_id=990,
+    )
+    record_mergeability(
+        session,
+        view.publication_id,
+        head_sha=HEAD,
+        mergeable=True,
+    )
+    github.reviews = [
+        PullReviewSnapshot(
+            review_id=990,
+            actor=HUMAN_ACTOR,
+            body="approval changed before external merge",
+            state=latest_review_state,
+            commit_id=HEAD,
+            submitted_at=(gate_time + timedelta(seconds=1)).isoformat(),
+        )
+    ]
+    github.merged = True
+
+    if delivery_path:
+        body, signature = raw_delivery(
+            event_name="pull_request",
+            action="closed",
+        )
+        receipt = value.ingest(
+            session,
+            delivery_id=f"delivery-external-merge-{latest_review_state}",
+            event_name="pull_request",
+            signature=signature,
+            body=body,
+        )
+        result = value.process_delivery(session, receipt.delivery_id)
+    else:
+        result = value.reconcile_publication(session, view.publication_id)
+
+    current = get_view(session, view.publication_id)
+    event_types = {
+        event["event_type"]
+        for event in load_events(session, view.publication_id)
+    }
+    assert result.outcome == "MERGE_POLICY_VIOLATION"
+    assert current.merge_policy_violation is True
+    assert current.state is not PublicationState.MERGED
+    assert EventType.MERGED.value not in event_types
+
+
+@pytest.mark.parametrize("delivery_path", [False, True])
+def test_external_merge_checks_validated_base_before_classification(
+    session,
+    delivery_path,
+):
+    view = complete_codex_pass(session, start_codex(session, published(session)))
+    gate_time = codex_gate_time(session, view)
+    github = FakeGitHub()
+    github.reviews = [
+        PullReviewSnapshot(
+            review_id=991,
+            actor=HUMAN_ACTOR,
+            body="exact-head approval",
+            state="APPROVED",
+            commit_id=HEAD,
+            submitted_at=(gate_time + timedelta(seconds=1)).isoformat(),
+        )
+    ]
+    value = gateway(github)
+    process_human_review_delivery(
+        session,
+        value,
+        delivery_id=f"delivery-external-base-approval-{delivery_path}",
+        review_id=991,
+    )
+    record_mergeability(
+        session,
+        view.publication_id,
+        head_sha=HEAD,
+        mergeable=True,
+    )
+    github.ref_shas["master"] = "8" * 40
+    github.merged = True
+
+    if delivery_path:
+        body, signature = raw_delivery(
+            event_name="pull_request",
+            action="closed",
+        )
+        receipt = value.ingest(
+            session,
+            delivery_id="delivery-external-base-merged",
+            event_name="pull_request",
+            signature=signature,
+            body=body,
+        )
+        result = value.process_delivery(session, receipt.delivery_id)
+    else:
+        result = value.reconcile_publication(session, view.publication_id)
+
+    current = get_view(session, view.publication_id)
+    event_types = {
+        event["event_type"]
+        for event in load_events(session, view.publication_id)
+    }
+    assert result.outcome == "MERGE_POLICY_VIOLATION"
+    assert current.merge_policy_violation is True
+    assert current.state is not PublicationState.MERGED
+    assert EventType.MERGED.value not in event_types
 
 
 def test_merged_approved_pull_cannot_record_mergeability(session):
@@ -1432,7 +1933,18 @@ def test_verified_merge_completes_watch_after_unmerged_close(session):
         head_sha=HEAD,
         mergeable=True,
     )
+    gate_time = codex_gate_time(session, view)
     github = FakeGitHub()
+    github.reviews = [
+        PullReviewSnapshot(
+            review_id=804,
+            actor=HUMAN_ACTOR,
+            body="current exact-head approval",
+            state="APPROVED",
+            commit_id=HEAD,
+            submitted_at=(gate_time + timedelta(seconds=1)).isoformat(),
+        )
+    ]
     github.closed = True
     value = gateway(github)
     sync_review_watch(session, view.publication_id)
@@ -1603,7 +2115,7 @@ def test_pending_pre_gate_human_approval_stays_stale_after_codex_completes(sessi
             body="approved before provider finished",
             state="APPROVED",
             commit_id=HEAD,
-            submitted_at=(datetime.now(timezone.utc) - timedelta(days=1)).isoformat(),
+            submitted_at="2026-09-30T12:03:00Z",
         )
     ]
 
@@ -1745,6 +2257,98 @@ def test_required_approval_must_follow_exact_head_codex_adjudication(
         assert get_view(session, view.publication_id).review_decision is None
     else:
         assert result.outcome.startswith("HUMAN_APPROVED")
+
+
+def test_delayed_codex_reconciliation_uses_provider_evidence_time(session):
+    view = start_codex(session, published(session))
+    now = datetime.now(timezone.utc)
+    provider_time = now - timedelta(minutes=3)
+    approval_time = now - timedelta(minutes=2)
+    completed = complete_codex_review(
+        session,
+        view.publication_id,
+        run_id=view.automated_review_run_id,
+        reviewed_head_sha=HEAD,
+        result=AutomatedReviewStatus.PASS,
+        findings=[],
+        provider_review_ids=[501],
+        provider_comment_ids=[],
+        provider_completed_at=provider_time.isoformat(),
+    )
+    completion_event = next(
+        event
+        for event in load_events(session, view.publication_id)
+        if event["event_type"] == EventType.CODEX_REVIEW_COMPLETED.value
+    )
+    reconciliation_time = datetime.fromisoformat(completion_event["occurred_at"])
+    if reconciliation_time.tzinfo is None:
+        reconciliation_time = reconciliation_time.replace(tzinfo=timezone.utc)
+    assert reconciliation_time > approval_time
+
+    github = FakeGitHub()
+    github.reviews = [
+        PullReviewSnapshot(
+            review_id=808,
+            actor=HUMAN_ACTOR,
+            body="approved after provider completion",
+            state="APPROVED",
+            commit_id=HEAD,
+            submitted_at=approval_time.isoformat(),
+        )
+    ]
+    value = gateway(github)
+    result = process_human_review_delivery(
+        session,
+        value,
+        delivery_id="delivery-human-after-provider-before-reconcile",
+        review_id=808,
+    )
+
+    assert completed.automated_review_status is AutomatedReviewStatus.PASS
+    assert get_view(session, view.publication_id).state is PublicationState.APPROVED
+    assert result.outcome.startswith("HUMAN_APPROVED")
+
+
+def test_missing_codex_provider_timestamp_blocks_human_approval(session):
+    view = start_codex(session, published(session))
+    complete_codex_review(
+        session,
+        view.publication_id,
+        run_id=view.automated_review_run_id,
+        reviewed_head_sha=HEAD,
+        result=AutomatedReviewStatus.PASS,
+        findings=[],
+        provider_review_ids=[501],
+        provider_comment_ids=[],
+    )
+    github = FakeGitHub()
+    github.reviews = [
+        PullReviewSnapshot(
+            review_id=809,
+            actor=HUMAN_ACTOR,
+            body="approval with missing provider time",
+            state="APPROVED",
+            commit_id=HEAD,
+            submitted_at="2026-09-30T12:05:00Z",
+        )
+    ]
+    value = gateway(github)
+
+    with pytest.raises(GitHubWebhookError, match="provider completion timestamp is missing"):
+        process_human_review_delivery(
+            session,
+            value,
+            delivery_id="delivery-human-missing-provider-time",
+            review_id=809,
+        )
+
+    assert get_view(session, view.publication_id).state is PublicationState.IN_REVIEW
+    review_events = [
+        event
+        for event in load_events(session, view.publication_id)
+        if event["event_type"] == EventType.REVIEW_RECORDED.value
+    ]
+    assert review_events == []
 
 
 @pytest.mark.parametrize(
@@ -3699,7 +4303,7 @@ def test_stale_head_reconciliation_marks_first_correlated_usage_limit_only(
 
     current = get_view(session, view.publication_id)
     assert current.automated_review_status is AutomatedReviewStatus.UNAVAILABLE
-    assert github.pull_review_list_calls == 0
+    assert github.pull_review_list_calls == 1
     assert_stale_review_blocked(session, view, result, "STALE_HEAD")
 
 
@@ -3728,7 +4332,7 @@ def test_stale_base_reconciliation_marks_correlated_usage_limit_and_blocks_watch
     result = value.reconcile_publication(session, view.publication_id)
 
     assert get_view(session, view.publication_id).automated_review_status is AutomatedReviewStatus.UNAVAILABLE
-    assert github.pull_review_list_calls == 0
+    assert github.pull_review_list_calls == 1
     assert_stale_review_blocked(session, view, result, "STALE_BASE")
 
 
@@ -3792,7 +4396,7 @@ def test_later_usage_limit_is_ignored_when_first_provider_response_is_unrelated(
     result = value.reconcile_publication(session, view.publication_id)
 
     assert get_view(session, view.publication_id).automated_review_status is AutomatedReviewStatus.RUNNING
-    assert github.pull_review_list_calls == 0
+    assert github.pull_review_list_calls == 1
     assert_stale_review_blocked(session, view, result, "STALE_HEAD")
 
 
@@ -3857,9 +4461,7 @@ def test_usage_limit_with_mutated_trigger_marker_fails_closed(session):
         body=body,
     )
 
-    from control_plane.github_webhook import GitHubWebhookError
-
-    with pytest.raises(GitHubWebhookError, match="trigger marker changed"):
+    with pytest.raises(CodexReviewError, match="trigger marker is missing"):
         value.process_delivery(session, receipt.delivery_id)
 
     assert get_view(session, view.publication_id).automated_review_status is AutomatedReviewStatus.RUNNING
