@@ -3,6 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 from pydantic import SecretStr
@@ -15,6 +16,7 @@ from control_plane.db import get_session
 from control_plane.domain import (
     AutomatedReviewStatus,
     DomainError,
+    EventType,
     PublicationState,
     ReviewDecision,
     ValidationStatus,
@@ -28,9 +30,17 @@ from control_plane.github_api import (
     PullReviewCommentSnapshot,
 )
 from control_plane.github_app import InstallationAccess
-from control_plane.github_webhook import _parse_time, _required_adjudication_time
-from control_plane.main import app, get_remediation_materializer
+from control_plane.github_webhook import (
+    _derive_next,
+    _parse_time,
+    _required_adjudication_time,
+)
+from control_plane.main import app, get_remediation_materializer, get_session
 from control_plane.models import RemediationEventRow, RemediationWorkPackageRow
+from control_plane.plane_review import (
+    complete_plane_review_materialization,
+    record_plane_review,
+)
 from control_plane.profile_registry import profile_for_repository
 from control_plane.quarantine import VerifiedCandidateSource
 from control_plane.remediation import (
@@ -46,6 +56,7 @@ from control_plane.remediation import (
     get_work_package,
     load_work_package_events,
     mark_implementation_rework_required,
+    publication_has_unresolved_remediation_findings,
     record_github_artifact,
     record_issue_closed,
     record_summary_comment,
@@ -56,7 +67,7 @@ from control_plane.remediation_materializer import (
     GitHubRemediationMaterializer,
     RemediationMaterializationError,
 )
-from control_plane.repository import load_events
+from control_plane.repository import append_event, load_events
 from control_plane.service import (
     complete_codex_review,
     create_publication,
@@ -110,6 +121,26 @@ def publish(session, *, issue_number=10):
     )
 
 
+def record_legacy_codex_review_request(session, view, *, head, run_id=None):
+    if run_id is None:
+        run_id = f"legacy-successor:{view.publication_id}:{head}"
+    append_event(
+        session,
+        view.publication_id,
+        EventType.CODEX_REVIEW_REQUESTED,
+        {
+            "run_id": run_id,
+            "provider": "CODEX_CODE_REVIEW",
+            "head_sha": head,
+            "pull_request_number": view.pull_request_number,
+            "mode": "required",
+            "attempt": 1,
+        },
+    )
+    session.commit()
+    return SimpleNamespace(automated_review_run_id=run_id)
+
+
 def add_completed_review(session, view, *, head=HEAD, result=AutomatedReviewStatus.CHANGES_REQUIRED):
     running = request_codex_review(
         session,
@@ -161,11 +192,11 @@ def complete_successor_review(session, view, *, head, review_id, evidence_offset
         base_branch=view.base_branch,
         pull_request_number=view.pull_request_number,
     )
-    running = request_codex_review(
+    running = record_legacy_codex_review_request(
         session,
-        view.publication_id,
-        mode="required",
-        expected_head_sha=head,
+        view,
+        head=head,
+        run_id=f"legacy-successor:{review_id}:{head}",
     )
     complete_codex_review(
         session,
@@ -292,11 +323,10 @@ def prepare_verifying_package(session):
         base_branch=view.base_branch,
         pull_request_number=view.pull_request_number,
     )
-    running = request_codex_review(
+    running = record_legacy_codex_review_request(
         session,
-        view.publication_id,
-        mode="required",
-        expected_head_sha=successor_head,
+        view,
+        head=successor_head,
     )
     complete_codex_review(
         session,
@@ -344,6 +374,7 @@ class FakeRemediationTokenProvider:
         assert repository == REPOSITORY
         assert permissions in (
             {"issues": "write"},
+            {"issues": "write", "pull_requests": "read"},
             {"issues": "write", "pull_requests": "write"},
         )
         self.permission_requests.append(dict(permissions))
@@ -533,6 +564,7 @@ class FakeRemediationGitHub:
         self.replies = []
         self.reply_calls = 0
         self.issue_comments = []
+        self.comment_targets = []
         self.summary_calls = 0
         self.resolved = set()
         self.resolve_calls = 0
@@ -617,6 +649,7 @@ class FakeRemediationGitHub:
 
     def add_issue_comment(self, repository, issue_number, body, token):
         self.summary_calls += 1
+        self.comment_targets.append((issue_number, body))
         existing = next((item for item in self.issue_comments if item.body == body), None)
         if existing is not None:
             return existing
@@ -801,17 +834,17 @@ def test_materializer_recovers_lost_responses_without_duplicate_artifacts(sessio
     assert github.issue_state == "closed"
     assert len(github.reactions) == 1
     assert github.reaction_calls == 2  # lost response retry reused the same reaction
-    assert len(github.replies) == 1
-    assert github.reply_calls == 1  # recovery found the marker before another reply attempt
+    assert len(github.replies) == 2
+    assert github.reply_calls == 2  # decision reply recovery plus final verification reply
     assert github.resolve_calls == 1
     assert len(github.issue_comments) == 1
     assert github.summary_calls == 1  # recovery found the marker before another comment attempt
     assert github.close_calls == 1
     assert github.project_statuses[-1] == ("I_kwDO_issue14", "Done")
-    assert len(load_work_package_events(session, package.work_package_id)) == 12
+    assert len(load_work_package_events(session, package.work_package_id)) == 13
     assert materializer.materialize(session, package.work_package_id) == result
     assert github.reaction_calls == 2
-    assert github.reply_calls == 1
+    assert github.reply_calls == 2
     assert github.summary_calls == 1
     assert github.close_calls == 1
 
@@ -895,6 +928,65 @@ def test_issue_projection_retry_recovers_parent_link_and_releases_lease(session)
         ("I_kwDO_issue101", "Ready"),
         ("I_kwDO_issue101", "Ready"),
     ]
+
+
+def test_implementation_submission_projects_candidate_to_issue_and_pr(session):
+    view, _source_run, package = create_package(session)
+    claim_work_package(
+        session,
+        package.work_package_id,
+        actor="general-implementer",
+        idempotency_key="claim-candidate-projection",
+    )
+    candidate_head = "4" * 40
+    candidate = submit_verified_candidate(
+        session,
+        view.publication_id,
+        source(candidate_head, "5" * 40, "b"),
+    )
+    submit_implementation(
+        session,
+        package.work_package_id,
+        candidate_id=candidate.current_candidate.candidate_id,
+        head_sha=candidate_head,
+        summary="Implementation candidate for Principal verification.",
+        evidence_sha256="c" * 64,
+        idempotency_key="candidate-projection-submission",
+    )
+    github = FakeRemediationGitHub(view)
+    materializer = GitHubRemediationMaterializer(
+        token_provider=FakeRemediationTokenProvider(),
+        github=github,
+        project_token=SecretStr("project-user-token"),
+        review_thread_token=SecretStr("review-user-token"),
+    )
+
+    with pytest.raises(RemediationMaterializationError):
+        materializer.sync_issue_projection(session, package.work_package_id)
+    assert len(github.issue_comments) == 1
+    assert candidate.current_candidate.candidate_id in github.issue_comments[0].body
+    assert candidate_head in github.issue_comments[0].body
+
+    materializer.sync_issue_projection(session, package.work_package_id)
+    materializer.sync_issue_projection(session, package.work_package_id)
+
+    projection = get_work_package(session, package.work_package_id).implementation_projection
+    assert projection == {
+        "candidate_id": candidate.current_candidate.candidate_id,
+        "head_sha": candidate_head,
+        "issue_comment_id": 900,
+        "pull_request_comment_id": 901,
+    }
+    assert [number for number, _body in github.comment_targets] == [14, 13]
+    assert "surface=issue" in github.comment_targets[0][1]
+    assert "surface=pull-request" in github.comment_targets[1][1]
+    assert len(github.issue_comments) == 2
+    projection_events = [
+        event
+        for event in load_work_package_events(session, package.work_package_id)
+        if event["event_type"] == "IMPLEMENTATION_PROJECTION_MATERIALIZED"
+    ]
+    assert len(projection_events) == 1
 
 
 def test_remediation_api_requires_internal_auth_and_claim_is_idempotent(session):
@@ -992,6 +1084,258 @@ def test_implementation_submission_projects_actual_project_review_state(session)
         app.dependency_overrides.pop(get_remediation_materializer, None)
 
 
+@pytest.mark.parametrize(
+    ("decision", "reaction", "expected_resolution"),
+    [
+        ("ACCEPTED", "+1", "NOT_APPLICABLE"),
+        ("REJECTED", "-1", "MATERIALIZED"),
+    ],
+)
+def test_decision_artifacts_materialize_before_implementation(
+    session,
+    decision,
+    reaction,
+    expected_resolution,
+):
+    view = publish(session)
+    source_run = add_completed_review(session, view)
+    finding = initial_findings()[0]
+    finding["principal_decision"] = {
+        "decision": decision,
+        "actor": "principal-reviewer",
+        "reason": "Finding is outside the accepted issue contract."
+        if decision == "REJECTED"
+        else None,
+    }
+    finding["desired_reaction"] = reaction
+    package = create_work_package(
+        session,
+        publication_id=view.publication_id,
+        implementation_issue_number=14,
+        review_run_id=source_run,
+        review_provider="CODEX_CODE_REVIEW",
+        provider_review_id=3101,
+        reviewed_head_sha=HEAD,
+        findings=[finding],
+        idempotency_key=f"decision-phase-{decision.lower()}",
+    )
+    github = FakeRemediationGitHub(view)
+    github.drop_reaction_response = False
+    github.drop_reply_response = False
+    github.drop_summary_response = False
+    materializer = GitHubRemediationMaterializer(
+        token_provider=FakeRemediationTokenProvider(),
+        github=github,
+        project_token=SecretStr("project-user-token"),
+        review_thread_token=SecretStr("review-user-token"),
+    )
+
+    result = materializer.materialize(session, package.work_package_id)
+
+    finding_view = result.findings[0]
+    assert result.state is WorkPackageState.READY
+    assert finding_view["decision_materialization"]["reaction"] == "MATERIALIZED"
+    assert finding_view["decision_materialization"]["reply"] == "MATERIALIZED"
+    assert finding_view["decision_materialization"]["resolution"] == expected_resolution
+    assert len(github.reactions) == 1
+    assert len(github.replies) == 1
+    assert github.resolved == ({4101} if decision == "REJECTED" else set())
+    assert "candidate" not in github.replies[0].body.lower()
+
+
+def test_fixed_principal_verification_materializes_incrementally_with_candidate_head(
+    session,
+):
+    view, _source_run, package = create_package(session)
+    claim_work_package(
+        session,
+        package.work_package_id,
+        actor="general-implementer",
+        idempotency_key="claim-principal-fixed",
+    )
+    implementation_head = "4" * 40
+    candidate = submit_verified_candidate(
+        session,
+        view.publication_id,
+        source(implementation_head, "5" * 40, "b"),
+    )
+    submit_implementation(
+        session,
+        package.work_package_id,
+        candidate_id=candidate.current_candidate.candidate_id,
+        head_sha=implementation_head,
+        summary="Fix the provider finding and preserve exact candidate evidence.",
+        evidence_sha256="d" * 64,
+        idempotency_key="implemented-principal-fixed",
+    )
+    profile = profile_for_repository(REPOSITORY)
+    for index, job_id in enumerate(profile.required_jobs, 1):
+        record_validation(
+            session,
+            view.publication_id,
+            job_id=job_id,
+            status=ValidationStatus.PASS,
+            evidence_sha256=f"{index + 20:064x}",
+        )
+    mark_remote_published(
+        session,
+        view.publication_id,
+        implementation_head,
+        branch=view.remote_branch,
+        base_branch=view.base_branch,
+        pull_request_number=view.pull_request_number,
+    )
+    review_run_id = "principal-review:fixed-incremental"
+    review_reviewer = "principal-reviewer:chatgpt"
+    comments = [
+        {
+            "finding_id": "principal:fixed-provider-thread",
+            "normalized_identity": "principal:fingerprint:fixed-provider-thread",
+            "priority": "P1",
+            "path": "control_plane/remediation.py",
+            "line": 947,
+            "side": "RIGHT",
+            "body": "Verify the exact candidate before resolving the finding thread.",
+        }
+    ]
+    record_plane_review(
+        session,
+        view.publication_id,
+        run_id=review_run_id,
+        reviewer_kind="PRINCIPAL_REVIEWER",
+        reviewer=review_reviewer,
+        reviewed_head_sha=implementation_head,
+        body="Exact-head Principal verification of the implementation candidate.",
+        comments=comments,
+        idempotency_key="principal-fixed-incremental-record",
+    )
+    complete_plane_review_materialization(
+        session,
+        view.publication_id,
+        run_id=review_run_id,
+        provider_review_id=9301,
+        receipts=[
+            {
+                "finding_id": comments[0]["finding_id"],
+                "provider_comment_id": 9401,
+                "provider_review_id": 9301,
+                "path": comments[0]["path"],
+                "line": comments[0]["line"],
+            }
+        ],
+    )
+    github = FakeRemediationGitHub(view)
+    github.head_sha = implementation_head
+    github.drop_reaction_response = False
+    github.drop_reply_response = False
+    github.drop_summary_response = False
+    materializer = GitHubRemediationMaterializer(
+        token_provider=FakeRemediationTokenProvider(),
+        github=github,
+        project_token=SecretStr("project-user-token"),
+        review_thread_token=SecretStr("review-user-token"),
+    )
+    original_overrides = app.dependency_overrides.copy()
+
+    def override_session():
+        yield session
+
+    app.dependency_overrides[get_session] = override_session
+    app.dependency_overrides[get_remediation_materializer] = lambda: materializer
+    try:
+        response = TestClient(app).post(
+            (
+                f"/api/v1/internal/remediation/work-packages/"
+                f"{package.work_package_id}/principal-verification"
+            ),
+            headers={"X-Control-Plane-Token": settings.internal_token},
+            json={
+                "review_run_id": review_run_id,
+                "head_sha": implementation_head,
+                "idempotency_key": "principal-fixed-incremental-start",
+            },
+        )
+        assert response.status_code == 200
+        assert response.json()["state"] == WorkPackageState.VERIFYING.value
+        verification_response = TestClient(app).post(
+            (
+                f"/api/v1/internal/remediation/work-packages/"
+                f"{package.work_package_id}/findings/codex:3101:4101/verification"
+            ),
+            headers={"X-Control-Plane-Token": settings.internal_token},
+            json={
+                "outcome": "FIXED",
+                "evidence": "The exact published candidate contains the correction.",
+                "idempotency_key": "principal-fixed-incremental-result",
+            },
+        )
+        assert verification_response.status_code == 200
+        verified_finding = next(
+            item
+            for item in verification_response.json()["findings"]
+            if item["finding_id"] == "codex:3101:4101"
+        )
+        assert verified_finding["verification"]["reviewer"] == review_reviewer
+        wrong_reviewer_response = TestClient(app).post(
+            (
+                f"/api/v1/internal/remediation/work-packages/"
+                f"{package.work_package_id}/findings/codex:3101:4101/verification"
+            ),
+            headers={"X-Control-Plane-Token": settings.internal_token},
+            json={
+                "outcome": "FIXED",
+                "reviewer": "unbound-client-identity",
+                "evidence": "The exact published candidate contains the correction.",
+                "idempotency_key": "principal-fixed-wrong-reviewer",
+            },
+        )
+        assert wrong_reviewer_response.status_code == 409
+        assert "derived from the bound PLANE_REVIEW" in wrong_reviewer_response.json()[
+            "detail"
+        ]
+    finally:
+        app.dependency_overrides.clear()
+        app.dependency_overrides.update(original_overrides)
+
+    verified = get_work_package(session, package.work_package_id)
+    assert verified.state is WorkPackageState.VERIFYING
+
+    result = materializer.materialize(session, package.work_package_id)
+
+    fixed = next(
+        item for item in result.findings if item["finding_id"] == "codex:3101:4101"
+    )
+    pending = next(
+        item
+        for item in result.findings
+        if item["finding_id"] == "control-plane:bigint-comment-id"
+    )
+    assert result.state is WorkPackageState.VERIFYING
+    assert _derive_next(session, view.publication_id) == (
+        "PRINCIPAL_REVIEWER",
+        "REVIEW_REMEDIATION_FIXES",
+    )
+    assert fixed["verification_materialization"]["reply"] == "MATERIALIZED"
+    assert fixed["verification_materialization"]["resolution"] == "MATERIALIZED"
+    assert pending["verification"] is None
+    assert len(github.replies) == 2
+    assert candidate.current_candidate.candidate_id in github.replies[1].body
+    assert implementation_head in github.replies[1].body
+    assert github.resolved == {4101}
+    assert github.resolve_calls == 1
+    assert len(github.issue_comments) == 2
+    assert all(
+        candidate.current_candidate.candidate_id in comment.body
+        and implementation_head in comment.body
+        for comment in github.issue_comments
+    )
+    assert not any(
+        "Implementation and verification are ready" in comment.body
+        for comment in github.issue_comments
+    )
+    assert github.close_calls == 0
+
+
 def test_rejected_only_package_finalizes_without_candidate_or_successor_review(session):
     view = publish(session)
     source_run = add_completed_review(session, view)
@@ -1042,6 +1386,10 @@ def test_rejected_only_package_finalizes_without_candidate_or_successor_review(s
     assert result.state is WorkPackageState.DONE
     assert result.candidate_id is None
     assert result.successor_review_run_id is None
+    assert not publication_has_unresolved_remediation_findings(
+        session,
+        view.publication_id,
+    )
     assert list(github.reactions) == [(4101, "-1")]
     assert len(github.replies) == 1
     assert github.resolved == {4101}
@@ -1140,11 +1488,10 @@ def test_human_approval_is_blocked_while_required_remediation_is_unfinished(sess
         base_branch=view.base_branch,
         pull_request_number=view.pull_request_number,
     )
-    running = request_codex_review(
+    running = record_legacy_codex_review_request(
         session,
-        view.publication_id,
-        mode="required",
-        expected_head_sha=successor_head,
+        view,
+        head=successor_head,
     )
     complete_codex_review(
         session,
@@ -1157,7 +1504,7 @@ def test_human_approval_is_blocked_while_required_remediation_is_unfinished(sess
         provider_comment_ids=[],
     )
 
-    with pytest.raises(DomainError, match="unfinished remediation"):
+    with pytest.raises(DomainError, match="unresolved remediation findings"):
         record_review(
             session,
             view.publication_id,
@@ -1165,6 +1512,18 @@ def test_human_approval_is_blocked_while_required_remediation_is_unfinished(sess
             decision=ReviewDecision.APPROVED,
             require_codex_review=True,
         )
+
+
+def test_remediation_gate_is_scoped_to_its_publication(session):
+    view, _source_run, package = create_package(session, issue_number=814)
+    unrelated_publication = publish(session, issue_number=815)
+
+    assert publication_has_unresolved_remediation_findings(session, view.publication_id)
+    assert not publication_has_unresolved_remediation_findings(
+        session,
+        unrelated_publication.publication_id,
+    )
+    assert get_work_package(session, package.work_package_id).state is WorkPackageState.READY
 
 
 def test_verifying_package_prevents_successor_from_making_completion_stale(session):
@@ -1602,11 +1961,10 @@ def test_unavailable_successor_requires_audited_fallback_and_can_complete(sessio
         base_branch=view.base_branch,
         pull_request_number=view.pull_request_number,
     )
-    running = request_codex_review(
+    running = record_legacy_codex_review_request(
         session,
-        view.publication_id,
-        mode="required",
-        expected_head_sha=successor_head,
+        view,
+        head=successor_head,
     )
     mark_codex_review_unavailable(
         session,
@@ -1746,11 +2104,10 @@ def test_materializer_accepts_exact_unavailable_fallback(session):
         base_branch=view.base_branch,
         pull_request_number=view.pull_request_number,
     )
-    running = request_codex_review(
+    running = record_legacy_codex_review_request(
         session,
-        view.publication_id,
-        mode="required",
-        expected_head_sha=successor_head,
+        view,
+        head=successor_head,
     )
     mark_codex_review_unavailable(
         session,
@@ -1806,7 +2163,7 @@ def test_materializer_accepts_exact_unavailable_fallback(session):
     assert get_view(session, view.publication_id).automated_review_status is AutomatedReviewStatus.UNAVAILABLE
     assert github.resolve_calls == 1
     assert len(github.reactions) == 1
-    assert len(github.replies) == 1
+    assert len(github.replies) == 2
 
 
 def test_materializer_rejects_unavailable_successor_without_fallback(session, monkeypatch):
@@ -1849,11 +2206,10 @@ def test_materializer_rejects_unavailable_successor_without_fallback(session, mo
         base_branch=view.base_branch,
         pull_request_number=view.pull_request_number,
     )
-    running = request_codex_review(
+    running = record_legacy_codex_review_request(
         session,
-        view.publication_id,
-        mode="required",
-        expected_head_sha=successor_head,
+        view,
+        head=successor_head,
     )
     mark_codex_review_unavailable(
         session,
@@ -2019,19 +2375,26 @@ def test_persists_enters_rework_and_preserves_mixed_verification_history(session
         "status:review",
         "Review",
     )
-    assert all(item["verification"] is None for item in rework.findings)
-    assert all(item["closure_state"] == "AWAITING_VERIFICATION" for item in rework.findings)
+    provider = next(item for item in rework.findings if item["finding_id"] == "codex:3101:4101")
+    assert provider["verification"]["outcome"] == "ABSENT"
+    assert provider["closure_state"] == "VERIFIED_ABSENT"
     internal = next(item for item in rework.findings if item["finding_id"] == "control-plane:bigint-comment-id")
+    assert internal["verification"] is None
+    assert internal["closure_state"] == "AWAITING_VERIFICATION"
     assert [item["outcome"] for item in internal["verification_history"]] == ["PERSISTS"]
     github = FakeRemediationGitHub(view)
-    with pytest.raises(DomainError, match="all accepted findings"):
-        GitHubRemediationMaterializer(
-            token_provider=FakeRemediationTokenProvider(),
-            github=github,
-            project_token=SecretStr("project-user-token"),
-        ).materialize(session, package.work_package_id)
-    assert github.reactions == {}
-    assert github.replies == []
+    github.head_sha = head_one
+    github.drop_reaction_response = False
+    github.drop_reply_response = False
+    projected = GitHubRemediationMaterializer(
+        token_provider=FakeRemediationTokenProvider(),
+        github=github,
+        project_token=SecretStr("project-user-token"),
+    ).materialize(session, package.work_package_id)
+    assert projected.state is WorkPackageState.REWORK_REQUIRED
+    assert len(github.reactions) == 1
+    assert len(github.replies) == 1
+    assert github.resolve_calls == 0
     assert github.resolved == set()
     retry = verify_finding(
         session,
@@ -2084,20 +2447,22 @@ def test_persists_enters_rework_and_preserves_mixed_verification_history(session
         "status:review",
         "Review",
     )
-    for finding_id in ("codex:3101:4101", "control-plane:bigint-comment-id"):
-        verifying = verify_finding(
-            session,
-            package.work_package_id,
-            finding_id=finding_id,
-            outcome="ABSENT",
-            reviewer="principal-reviewer",
-            evidence="Finding absent on implementation C.",
-            idempotency_key=f"verify-attempt-two:{finding_id}",
-        )
+    verifying = verify_finding(
+        session,
+        package.work_package_id,
+        finding_id="control-plane:bigint-comment-id",
+        outcome="ABSENT",
+        reviewer="principal-reviewer",
+        evidence="Finding absent on implementation C.",
+        idempotency_key="verify-attempt-two:control-plane:bigint-comment-id",
+    )
     assert verifying.state is WorkPackageState.VERIFYING
     internal = next(item for item in verifying.findings if item["finding_id"] == "control-plane:bigint-comment-id")
     assert [item["outcome"] for item in internal["verification_history"]] == ["PERSISTS", "ABSENT"]
     assert internal["verification"]["review_run_id"] == review_two
+    provider = next(item for item in verifying.findings if item["finding_id"] == "codex:3101:4101")
+    assert provider["verification"]["review_run_id"] == review_one
+    assert [item["outcome"] for item in provider["verification_history"]] == ["ABSENT"]
     before_old_retry = len(load_work_package_events(session, package.work_package_id))
     old_retry = verify_finding(
         session,
@@ -2158,11 +2523,10 @@ def test_successor_verification_closure_materialization_and_done_require_evidenc
         base_branch=view.base_branch,
         pull_request_number=view.pull_request_number,
     )
-    running = request_codex_review(
+    running = record_legacy_codex_review_request(
         session,
-        view.publication_id,
-        mode="required",
-        expected_head_sha=successor_head,
+        view,
+        head=successor_head,
     )
     complete_codex_review(
         session,

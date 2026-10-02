@@ -27,7 +27,7 @@ from .models import (
     RemediationEventRow,
     RemediationWorkPackageRow,
 )
-from .repository import ZERO_HASH, append_event
+from .repository import ZERO_HASH, append_event, load_events
 from .service import get_view
 
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -71,6 +71,10 @@ class PrincipalDecision(StrEnum):
     REJECTED = "REJECTED"
 
 
+class RemediationFindingsOpen(DomainError):
+    pass
+
+
 @dataclass(frozen=True, slots=True)
 class RemediationWorkPackageView:
     work_package_id: str
@@ -89,6 +93,8 @@ class RemediationWorkPackageView:
     successor_review_run_id: str | None
     successor_head_sha: str | None
     successor_fallback: dict[str, Any] | None
+    principal_verification: dict[str, Any] | None
+    implementation_projection: dict[str, Any] | None
     summary_comment_id: int | None
     issue_closed: bool
 
@@ -264,21 +270,61 @@ def _finding_defaults(finding: dict[str, Any]) -> dict[str, Any]:
     thread_id = finding["source"].get("provider_thread_id")
     has_thread = thread_id is not None
     decision = finding["principal_decision"]["decision"]
+    legacy_materialization = {
+        "reaction": "PENDING" if has_thread and finding["desired_reaction"] != "none" else "NOT_APPLICABLE",
+        "reply": "PENDING" if has_thread else "NOT_APPLICABLE",
+        "resolution": "PENDING" if has_thread else "NOT_APPLICABLE",
+    }
+    decision_materialization = {
+        "reaction": "PENDING" if has_thread and finding["desired_reaction"] != "none" else "NOT_APPLICABLE",
+        "reply": "PENDING" if has_thread else "NOT_APPLICABLE",
+        "resolution": (
+            "PENDING"
+            if has_thread and decision == PrincipalDecision.REJECTED.value
+            else "NOT_APPLICABLE"
+        ),
+    }
+    verification_materialization = {
+        "reply": (
+            "PENDING"
+            if has_thread and decision == PrincipalDecision.ACCEPTED.value
+            else "NOT_APPLICABLE"
+        ),
+        "resolution": (
+            "PENDING"
+            if has_thread and decision == PrincipalDecision.ACCEPTED.value
+            else "NOT_APPLICABLE"
+        ),
+    }
     return {
         **finding,
-        "closure_state": (
+        "closure_state": finding.get(
+            "closure_state",
             "AWAITING_VERIFICATION"
             if decision == PrincipalDecision.ACCEPTED.value
-            else "REJECTED_BY_PRINCIPAL"
+            else "REJECTED_BY_PRINCIPAL",
         ),
-        "verification": None,
-        "verification_history": [],
+        "verification": finding.get("verification"),
+        "verification_history": list(finding.get("verification_history") or []),
         "materialization": {
-            "reaction": "PENDING" if has_thread and finding["desired_reaction"] != "none" else "NOT_APPLICABLE",
-            "reply": "PENDING" if has_thread else "NOT_APPLICABLE",
-            "resolution": "PENDING" if has_thread else "NOT_APPLICABLE",
+            **legacy_materialization,
+            **dict(finding.get("materialization") or {}),
         },
-        "materialization_ids": {},
+        "materialization_ids": dict(finding.get("materialization_ids") or {}),
+        "decision_materialization": {
+            **decision_materialization,
+            **dict(finding.get("decision_materialization") or {}),
+        },
+        "decision_materialization_ids": dict(
+            finding.get("decision_materialization_ids") or {}
+        ),
+        "verification_materialization": {
+            **verification_materialization,
+            **dict(finding.get("verification_materialization") or {}),
+        },
+        "verification_materialization_ids": dict(
+            finding.get("verification_materialization_ids") or {}
+        ),
     }
 
 
@@ -288,8 +334,7 @@ def _fold(work_package_id: str, row: RemediationWorkPackageRow, events: list[dic
     initial = events[0]["payload"]
     findings = {}
     for item in initial["findings"]:
-        finding = dict(item)
-        finding.setdefault("verification_history", [])
+        finding = _finding_defaults(dict(item))
         findings[item["finding_id"]] = finding
     state = WorkPackageState.READY
     implementer = None
@@ -300,6 +345,8 @@ def _fold(work_package_id: str, row: RemediationWorkPackageRow, events: list[dic
     successor_review_run_id = None
     successor_head_sha = None
     successor_fallback = None
+    principal_verification = None
+    implementation_projection = None
     implementation_issue_number = initial.get("implementation_issue_number")
     summary_comment_id = None
     issue_closed = False
@@ -321,12 +368,18 @@ def _fold(work_package_id: str, row: RemediationWorkPackageRow, events: list[dic
             implementation_head_sha = payload["head_sha"]
             implementation_summary = payload["summary"]
             implementation_evidence_sha256 = payload["evidence_sha256"]
+            principal_verification = None
+            implementation_projection = None
         elif event_type == "SUCCESSOR_REVIEW_STARTED":
             state = WorkPackageState.VERIFYING
             successor_review_run_id = payload["review_run_id"]
             successor_head_sha = payload["head_sha"]
             fallback = payload.get("fallback")
             successor_fallback = dict(fallback) if isinstance(fallback, dict) else None
+            principal_verification = None
+        elif event_type == "PRINCIPAL_VERIFICATION_STARTED":
+            state = WorkPackageState.VERIFYING
+            principal_verification = dict(payload)
         elif event_type == "REJECTED_FINDINGS_FINALIZATION_STARTED":
             state = WorkPackageState.VERIFYING
         elif event_type == "FINDING_VERIFIED":
@@ -338,25 +391,65 @@ def _fold(work_package_id: str, row: RemediationWorkPackageRow, events: list[dic
                 "reviewer": payload["reviewer"],
                 "evidence": payload["evidence"],
             }
+            for key in (
+                "provider",
+                "provider_review_id",
+                "reviewer_kind",
+                "review_event_hash",
+                "candidate_id",
+                "implementation_head_sha",
+            ):
+                if key in payload:
+                    verification[key] = payload[key]
             finding["verification_history"].append(verification)
             finding["verification"] = verification
-            finding["closure_state"] = (
-                "VERIFIED_ABSENT"
-                if payload["outcome"] == "ABSENT"
-                else "PERSISTS"
-            )
+            finding["closure_state"] = {
+                "ABSENT": "VERIFIED_ABSENT",
+                "PERSISTS": "PERSISTS",
+                "FIXED": "FIXED",
+                "NOT_FIXED": "NOT_FIXED",
+            }.get(payload["outcome"], "NOT_FIXED")
         elif event_type == "WORK_PACKAGE_REWORK_REQUIRED":
             state = WorkPackageState.REWORK_REQUIRED
-            for finding in findings.values():
-                if finding["principal_decision"]["decision"] == PrincipalDecision.ACCEPTED.value:
-                    finding["verification"] = None
-                    finding["closure_state"] = "AWAITING_VERIFICATION"
+            if payload.get("verification_mode") != "PRINCIPAL_REVIEW":
+                for finding in findings.values():
+                    verification = finding.get("verification")
+                    if (
+                        finding["principal_decision"]["decision"]
+                        == PrincipalDecision.ACCEPTED.value
+                        and verification is not None
+                        and verification["outcome"] == "PERSISTS"
+                    ):
+                        finding["verification"] = None
+                        finding["closure_state"] = "AWAITING_VERIFICATION"
         elif event_type == "GITHUB_ARTIFACT_MATERIALIZED":
             finding = findings[payload["finding_id"]]
             finding["materialization"][payload["artifact"]] = "MATERIALIZED"
             finding["materialization_ids"][payload["artifact"]] = payload["remote_id"]
+        elif event_type in {
+            "DECISION_ARTIFACT_MATERIALIZED",
+            "VERIFICATION_ARTIFACT_MATERIALIZED",
+        }:
+            finding = findings[payload["finding_id"]]
+            if event_type == "DECISION_ARTIFACT_MATERIALIZED":
+                finding["decision_materialization"][payload["artifact"]] = "MATERIALIZED"
+                finding["decision_materialization_ids"][payload["artifact"]] = payload[
+                    "remote_id"
+                ]
+            else:
+                finding["verification_materialization"][payload["artifact"]] = "MATERIALIZED"
+                finding["verification_materialization_ids"][payload["artifact"]] = payload[
+                    "remote_id"
+                ]
         elif event_type == "WORK_PACKAGE_SUMMARY_MATERIALIZED":
             summary_comment_id = payload["comment_id"]
+        elif event_type == "IMPLEMENTATION_PROJECTION_MATERIALIZED":
+            implementation_projection = {
+                "candidate_id": payload["candidate_id"],
+                "head_sha": payload["head_sha"],
+                "issue_comment_id": payload["issue_comment_id"],
+                "pull_request_comment_id": payload["pull_request_comment_id"],
+            }
         elif event_type == "IMPLEMENTATION_ISSUE_CLOSED":
             issue_closed = True
         elif event_type == "WORK_PACKAGE_COMPLETED":
@@ -382,6 +475,8 @@ def _fold(work_package_id: str, row: RemediationWorkPackageRow, events: list[dic
         successor_review_run_id=successor_review_run_id,
         successor_head_sha=successor_head_sha,
         successor_fallback=successor_fallback,
+        principal_verification=principal_verification,
+        implementation_projection=implementation_projection,
         summary_comment_id=summary_comment_id,
         issue_closed=issue_closed,
     )
@@ -392,6 +487,355 @@ def get_work_package(session: Session, work_package_id: str) -> RemediationWorkP
     if row is None:
         raise KeyError(work_package_id)
     return _fold(work_package_id, row, load_work_package_events(session, work_package_id))
+
+
+def _artifact_ready(finding: Mapping[str, Any], phase: str, artifact: str) -> bool:
+    phase_state = finding.get(phase, {}).get(artifact)
+    if phase_state in {"MATERIALIZED", "NOT_APPLICABLE"}:
+        return True
+    return finding.get("materialization", {}).get(artifact) in {
+        "MATERIALIZED",
+        "NOT_APPLICABLE",
+    }
+
+
+def finding_is_terminal(finding: Mapping[str, Any]) -> bool:
+    decision = finding["principal_decision"]["decision"]
+    closure_state = finding.get("closure_state")
+    has_thread = finding["source"].get("provider_thread_id") is not None
+    if decision == PrincipalDecision.REJECTED.value:
+        if closure_state != "REJECTED_BY_PRINCIPAL":
+            return False
+        return not has_thread or all(
+            _artifact_ready(finding, "decision_materialization", artifact)
+            for artifact in (
+                "reaction",
+                "reply",
+                "resolution",
+            )
+            if artifact != "reaction" or finding["desired_reaction"] != "none"
+        )
+    if decision != PrincipalDecision.ACCEPTED.value or closure_state not in {
+        "FIXED",
+        "VERIFIED_ABSENT",
+    }:
+        return False
+    if not has_thread:
+        return True
+    return (
+        _artifact_ready(finding, "decision_materialization", "reaction")
+        if finding["desired_reaction"] != "none"
+        else True
+    ) and _artifact_ready(
+        finding,
+        "decision_materialization",
+        "reply",
+    ) and _artifact_ready(
+        finding,
+        "verification_materialization",
+        "reply",
+    ) and _artifact_ready(
+        finding,
+        "verification_materialization",
+        "resolution",
+    )
+
+
+def publication_has_unresolved_remediation_findings(
+    session: Session,
+    publication_id: str,
+) -> bool:
+    package_ids = session.scalars(
+        select(RemediationWorkPackageRow.id)
+        .where(RemediationWorkPackageRow.publication_id == publication_id)
+        .order_by(RemediationWorkPackageRow.created_at, RemediationWorkPackageRow.id)
+    )
+    for work_package_id in package_ids:
+        view = get_work_package(session, work_package_id)
+        if view.state is WorkPackageState.DONE:
+            continue
+        if any(not finding_is_terminal(finding) for finding in view.findings):
+            return True
+    return False
+
+
+def remediation_watch_action(
+    session: Session,
+    publication_id: str,
+) -> tuple[str, str] | None:
+    if not publication_has_unresolved_remediation_findings(session, publication_id):
+        return None
+    package_ids = session.scalars(
+        select(RemediationWorkPackageRow.id)
+        .where(RemediationWorkPackageRow.publication_id == publication_id)
+        .order_by(RemediationWorkPackageRow.created_at, RemediationWorkPackageRow.id)
+    )
+    for work_package_id in package_ids:
+        view = get_work_package(session, work_package_id)
+        if view.state is WorkPackageState.DONE:
+            continue
+        unresolved = [finding for finding in view.findings if not finding_is_terminal(finding)]
+        needs_implementation = any(
+            finding["principal_decision"]["decision"] == PrincipalDecision.ACCEPTED.value
+            and finding.get("closure_state")
+            in {"AWAITING_VERIFICATION", "NOT_FIXED", "PERSISTS"}
+            for finding in unresolved
+        )
+        if needs_implementation and view.state in {
+            WorkPackageState.READY,
+            WorkPackageState.IN_PROGRESS,
+            WorkPackageState.REWORK_REQUIRED,
+        }:
+            return "IMPLEMENTER", "REMEDIATE_FINDINGS"
+        if needs_implementation and view.state in {
+            WorkPackageState.IMPLEMENTED,
+            WorkPackageState.VERIFYING,
+        }:
+            return "PRINCIPAL_REVIEWER", "REVIEW_REMEDIATION_FIXES"
+    return "CONTROL_PLANE", "MATERIALIZE_REMEDIATION"
+
+
+def _validate_governed_published_candidate(
+    session: Session,
+    view: RemediationWorkPackageView,
+) -> CandidateRow:
+    if view.candidate_id is None or view.implementation_head_sha is None:
+        raise DomainError("implementation candidate identity is incomplete")
+    candidate = session.get(CandidateRow, view.candidate_id)
+    if (
+        candidate is None
+        or candidate.publication_id != view.publication_id
+        or candidate.head_sha != view.implementation_head_sha
+    ):
+        raise DomainError("implementation candidate does not belong to this publication and head")
+
+    active_candidate_id = None
+    active_admitted = False
+    exact_submission_seen = False
+    published = False
+    for event in load_events(session, view.publication_id):
+        payload = event["payload"]
+        event_type = event["event_type"]
+        if event_type == EventType.CANDIDATE_SUBMITTED.value:
+            active_candidate_id = payload.get("candidate_id")
+            active_admitted = False
+            if active_candidate_id == candidate.id:
+                exact_submission_seen = all(
+                    payload.get(key) == value
+                    for key, value in (
+                        ("base_sha", candidate.base_sha),
+                        ("head_sha", candidate.head_sha),
+                        ("tree_sha", candidate.tree_sha),
+                        ("profile_id", candidate.profile_id),
+                        ("profile_version", candidate.profile_version),
+                        ("profile_digest", candidate.profile_digest),
+                    )
+                )
+        elif event_type == EventType.CANDIDATE_ADMITTED.value:
+            if active_candidate_id == candidate.id:
+                active_admitted = all(
+                    payload.get(key) == value
+                    for key, value in (
+                        ("candidate_id", candidate.id),
+                        ("profile_id", candidate.profile_id),
+                        ("profile_version", candidate.profile_version),
+                        ("profile_digest", candidate.profile_digest),
+                    )
+                )
+        elif event_type == EventType.CANDIDATE_REJECTED.value:
+            if active_candidate_id == candidate.id:
+                active_admitted = False
+        elif event_type == EventType.REMOTE_PUBLISHED.value:
+            if (
+                active_candidate_id == candidate.id
+                and active_admitted
+                and payload.get("head_sha") == candidate.head_sha
+            ):
+                published = True
+    if not exact_submission_seen or not published:
+        raise DomainError("implementation candidate was not admitted and governed-published")
+    return candidate
+
+
+def _principal_review_evidence(
+    session: Session,
+    publication_id: str,
+    *,
+    review_run_id: str,
+    head_sha: str,
+) -> dict[str, Any]:
+    events = load_events(session, publication_id)
+    recorded = [
+        event
+        for event in events
+        if event["event_type"] == EventType.PLANE_REVIEW_RECORDED.value
+        and event["payload"].get("run_id") == review_run_id
+    ]
+    materialized = [
+        event
+        for event in events
+        if event["event_type"] == EventType.PLANE_REVIEW_MATERIALIZED.value
+        and event["payload"].get("run_id") == review_run_id
+    ]
+    if len(recorded) != 1 or len(materialized) != 1:
+        raise DomainError("exact immutable Principal PLANE_REVIEW evidence is required")
+    recorded_payload = recorded[0]["payload"]
+    materialized_event = materialized[0]
+    payload = materialized_event["payload"]
+    if (
+        payload.get("provider") != "PLANE_REVIEW"
+        or payload.get("reviewer_kind") != "PRINCIPAL_REVIEWER"
+        or not isinstance(payload.get("reviewer"), str)
+        or not payload["reviewer"].strip()
+        or payload.get("run_id") != review_run_id
+        or payload.get("head_sha") != head_sha
+        or recorded_payload.get("provider") != "PLANE_REVIEW"
+        or recorded_payload.get("reviewer_kind") != "PRINCIPAL_REVIEWER"
+        or recorded_payload.get("reviewer") != payload.get("reviewer")
+        or recorded_payload.get("run_id") != review_run_id
+        or recorded_payload.get("head_sha") != head_sha
+    ):
+        raise DomainError("Principal PLANE_REVIEW identity does not match the requested run and head")
+
+    provider_review_ids = payload.get("provider_review_ids")
+    findings = payload.get("findings")
+    provider_comment_ids = payload.get("provider_comment_ids")
+    recorded_comments = recorded_payload.get("comments")
+    if (
+        not isinstance(provider_review_ids, list)
+        or len(provider_review_ids) != 1
+        or not isinstance(provider_review_ids[0], int)
+        or isinstance(provider_review_ids[0], bool)
+        or provider_review_ids[0] <= 0
+        or not isinstance(findings, list)
+        or not isinstance(provider_comment_ids, list)
+        or not isinstance(recorded_comments, list)
+        or payload.get("findings_count") != len(findings)
+        or payload.get("result") != ("CHANGES_REQUIRED" if findings else "PASS")
+        or provider_comment_ids != [item.get("provider_comment_id") for item in findings]
+        or len({item.get("finding_id") for item in findings}) != len(findings)
+    ):
+        raise DomainError("Principal PLANE_REVIEW provider receipt is inconsistent")
+    recorded_by_id = {
+        item.get("finding_id"): item
+        for item in recorded_comments
+        if isinstance(item, dict)
+    }
+    if len(recorded_by_id) != len(recorded_comments) or len(recorded_by_id) != len(findings):
+        raise DomainError("Principal PLANE_REVIEW source findings are inconsistent")
+    for item in findings:
+        source = recorded_by_id.get(item.get("finding_id"))
+        if (
+            source is None
+            or item.get("provider_review_id") != provider_review_ids[0]
+            or item.get("path") != source.get("path")
+            or item.get("line") != source.get("line")
+            or item.get("side") != source.get("side")
+            or item.get("body") != source.get("body")
+            or item.get("normalized_identity") != source.get("normalized_identity")
+            or item.get("priority") != source.get("priority")
+        ):
+            raise DomainError("Principal PLANE_REVIEW finding receipt changed")
+    return {
+        "review_run_id": review_run_id,
+        "provider": "PLANE_REVIEW",
+        "provider_review_id": provider_review_ids[0],
+        "head_sha": head_sha,
+        "reviewer_kind": "PRINCIPAL_REVIEWER",
+        "reviewer": payload["reviewer"],
+        "review_event_hash": materialized_event["event_hash"],
+    }
+
+
+def _finding_needs_principal_verification(finding: Mapping[str, Any]) -> bool:
+    return (
+        finding["principal_decision"]["decision"] == PrincipalDecision.ACCEPTED.value
+        and finding.get("closure_state")
+        in {"AWAITING_VERIFICATION", "NOT_FIXED", "PERSISTS"}
+    )
+
+
+def begin_principal_verification(
+    session: Session,
+    work_package_id: str,
+    *,
+    review_run_id: str,
+    head_sha: str,
+    idempotency_key: str,
+) -> RemediationWorkPackageView:
+    row = _lock_publication_then_work_package(session, work_package_id)
+    normalized_run_id = review_run_id.strip()
+    normalized_head_sha = head_sha.lower()
+    if not normalized_run_id or len(normalized_run_id) > 160:
+        raise DomainError("Principal review run id is invalid")
+    _assert_safe_client_text(normalized_run_id, "Principal review run id")
+    if not _SHA_RE.fullmatch(normalized_head_sha):
+        raise DomainError("Principal review head must be an exact 40-hex Git SHA")
+
+    current = get_work_package(session, work_package_id)
+    if current.implementation_head_sha != normalized_head_sha:
+        raise DomainError("Principal review head does not match the implementation head")
+    _validate_governed_published_candidate(session, current)
+    evidence = _principal_review_evidence(
+        session,
+        row.publication_id,
+        review_run_id=normalized_run_id,
+        head_sha=normalized_head_sha,
+    )
+    if current.principal_verification is not None:
+        existing_binding = current.principal_verification
+        if (
+            existing_binding.get("review_run_id") == normalized_run_id
+            and existing_binding.get("head_sha") == normalized_head_sha
+            and existing_binding.get("review_event_hash")
+            == evidence["review_event_hash"]
+            and existing_binding.get("candidate_id") == current.candidate_id
+        ):
+            duplicate = _command_duplicate(
+                session,
+                row,
+                event_type="PRINCIPAL_VERIFICATION_STARTED",
+                idempotency_key=idempotency_key,
+                payload=existing_binding,
+            )
+            if duplicate is not None:
+                return duplicate
+            if current.state is WorkPackageState.VERIFYING:
+                session.commit()
+                return current
+        raise DomainError("work package is already bound to another Principal verification")
+    if current.state is not WorkPackageState.IMPLEMENTED:
+        raise DomainError("Principal verification can only start from IMPLEMENTED")
+    pending_ids = sorted(
+        finding["finding_id"]
+        for finding in current.findings
+        if _finding_needs_principal_verification(finding)
+    )
+    if not pending_ids:
+        raise DomainError("work package has no accepted findings awaiting Principal verification")
+    payload = {
+        **evidence,
+        "candidate_id": current.candidate_id,
+        "finding_ids": pending_ids,
+    }
+    duplicate = _command_duplicate(
+        session,
+        row,
+        event_type="PRINCIPAL_VERIFICATION_STARTED",
+        idempotency_key=idempotency_key,
+        payload=payload,
+    )
+    if duplicate is not None:
+        return duplicate
+    _append(
+        session,
+        row,
+        event_type="PRINCIPAL_VERIFICATION_STARTED",
+        idempotency_key=idempotency_key,
+        payload=payload,
+    )
+    session.commit()
+    return get_work_package(session, work_package_id)
 
 
 def _find_source_review(
@@ -796,7 +1240,12 @@ def create_work_package(
             f"{publication_id}|{review_run_id}|{implementation_issue_number or 'pending'}",
         )
     )
-    publication_row = session.get(PublicationRow, publication_id)
+    publication_row = session.scalar(
+        select(PublicationRow)
+        .where(PublicationRow.id == publication_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
     if publication_row is None:
         raise KeyError(publication_id)
     _lock_create_scope(
@@ -1241,6 +1690,145 @@ def begin_rejected_findings_finalization(
     return get_work_package(session, work_package_id)
 
 
+def _verify_principal_finding(
+    session: Session,
+    work_package_id: str,
+    *,
+    finding_id: str,
+    outcome: str,
+    reviewer: str,
+    evidence: str,
+    idempotency_key: str,
+) -> RemediationWorkPackageView:
+    row = _lock_work_package(session, work_package_id)
+    current = get_work_package(session, work_package_id)
+    binding = current.principal_verification
+    finding = next(
+        (item for item in current.findings if item["finding_id"] == finding_id),
+        None,
+    )
+    if finding is None:
+        raise DomainError("finding does not belong to this work package")
+    if finding["principal_decision"]["decision"] != PrincipalDecision.ACCEPTED.value:
+        raise DomainError("only accepted findings require Principal verification")
+    if binding is None or finding_id not in binding.get("finding_ids", []):
+        raise DomainError("finding is not part of the active Principal verification")
+    normalized_outcome = outcome.upper()
+    if normalized_outcome not in {"FIXED", "NOT_FIXED"}:
+        raise DomainError("Principal finding outcome must be FIXED or NOT_FIXED")
+    normalized_reviewer = reviewer.strip()
+    normalized_evidence = evidence.strip()
+    _assert_safe_client_text(normalized_reviewer, "finding verification reviewer")
+    _assert_safe_client_text(normalized_evidence, "finding verification evidence")
+    if normalized_reviewer != binding.get("reviewer"):
+        raise DomainError("finding verifier does not match the Principal PLANE_REVIEW identity")
+    if not normalized_evidence or len(normalized_evidence) > 4000:
+        raise DomainError("verification evidence is required and bounded")
+    if not idempotency_key.strip() or len(idempotency_key) > 200:
+        raise DomainError("idempotency_key must contain 1..200 characters")
+
+    _validate_governed_published_candidate(session, current)
+    evidence_binding = _principal_review_evidence(
+        session,
+        row.publication_id,
+        review_run_id=str(binding["review_run_id"]),
+        head_sha=str(binding["head_sha"]),
+    )
+    if any(binding.get(key) != evidence_binding.get(key) for key in evidence_binding):
+        raise DomainError("Principal verification evidence changed after it was started")
+    payload = {
+        "finding_id": finding_id,
+        "outcome": normalized_outcome,
+        "review_run_id": binding["review_run_id"],
+        "head_sha": binding["head_sha"],
+        "reviewer": normalized_reviewer,
+        "evidence": normalized_evidence,
+        "provider": binding["provider"],
+        "provider_review_id": binding["provider_review_id"],
+        "reviewer_kind": binding["reviewer_kind"],
+        "review_event_hash": binding["review_event_hash"],
+        "candidate_id": binding["candidate_id"],
+        "implementation_head_sha": current.implementation_head_sha,
+    }
+    duplicate = _command_duplicate(
+        session,
+        row,
+        event_type="FINDING_VERIFIED",
+        idempotency_key=idempotency_key,
+        payload=payload,
+    )
+    if duplicate is not None:
+        return duplicate
+    if current.state is not WorkPackageState.VERIFYING:
+        raise DomainError("Principal findings can only be verified during VERIFYING")
+    prior = finding.get("verification")
+    if prior is not None:
+        same_review = (
+            prior.get("review_run_id") == binding["review_run_id"]
+            and prior.get("head_sha") == binding["head_sha"]
+        )
+        if same_review:
+            if all(prior.get(key) == value for key, value in payload.items()):
+                session.commit()
+                return current
+            raise DomainError("finding already has a different result for this Principal review")
+        if prior.get("outcome") in {"FIXED", "ABSENT"}:
+            raise DomainError("a fixed finding cannot be reopened by a later verification")
+        if prior.get("outcome") not in {"NOT_FIXED", "PERSISTS"}:
+            raise DomainError("finding already has a different verification result")
+
+    _append(
+        session,
+        row,
+        event_type="FINDING_VERIFIED",
+        idempotency_key=idempotency_key,
+        payload=payload,
+    )
+    updated = get_work_package(session, work_package_id)
+    verification = updated.principal_verification
+    assert verification is not None
+    cycle_findings = {
+        item["finding_id"]: item
+        for item in updated.findings
+        if item["finding_id"] in verification["finding_ids"]
+    }
+    if all(
+        item.get("verification") is not None
+        and item["verification"].get("review_run_id")
+        == verification["review_run_id"]
+        and item["verification"].get("head_sha") == verification["head_sha"]
+        for item in cycle_findings.values()
+    ):
+        not_fixed_ids = sorted(
+            finding_key
+            for finding_key, item in cycle_findings.items()
+            if item["verification"]["outcome"] == "NOT_FIXED"
+        )
+        if not_fixed_ids:
+            fixed_ids = sorted(set(cycle_findings) - set(not_fixed_ids))
+            _append(
+                session,
+                row,
+                event_type="WORK_PACKAGE_REWORK_REQUIRED",
+                idempotency_key=(
+                    f"auto-principal-rework:{verification['review_run_id']}:"
+                    f"{verification['head_sha']}"
+                ),
+                payload={
+                    "review_run_id": verification["review_run_id"],
+                    "head_sha": verification["head_sha"],
+                    "implementation_head_sha": verification["head_sha"],
+                    "candidate_id": verification["candidate_id"],
+                    "principal_review_event_hash": verification["review_event_hash"],
+                    "verification_mode": "PRINCIPAL_REVIEW",
+                    "persistent_finding_ids": not_fixed_ids,
+                    "fixed_finding_ids": fixed_ids,
+                },
+            )
+    session.commit()
+    return get_work_package(session, work_package_id)
+
+
 def verify_finding(
     session: Session,
     work_package_id: str,
@@ -1251,6 +1839,16 @@ def verify_finding(
     evidence: str,
     idempotency_key: str,
 ) -> RemediationWorkPackageView:
+    if outcome.upper() in {"FIXED", "NOT_FIXED"}:
+        return _verify_principal_finding(
+            session,
+            work_package_id,
+            finding_id=finding_id,
+            outcome=outcome,
+            reviewer=reviewer,
+            evidence=evidence,
+            idempotency_key=idempotency_key,
+        )
     row = _lock_work_package(session, work_package_id)
     current = get_work_package(session, work_package_id)
     finding = next((item for item in current.findings if item["finding_id"] == finding_id), None)
@@ -1380,11 +1978,10 @@ def record_github_artifact(
     artifact: str,
     remote_id: int | str,
     idempotency_key: str,
+    phase: str | None = None,
 ) -> RemediationWorkPackageView:
     row = _lock_work_package(session, work_package_id)
     view = get_work_package(session, work_package_id)
-    if view.state is not WorkPackageState.VERIFYING:
-        raise DomainError("GitHub finding artifacts can only be recorded during VERIFYING")
     finding = next((item for item in view.findings if item["finding_id"] == finding_id), None)
     if finding is None:
         raise DomainError("finding does not belong to this work package")
@@ -1394,32 +1991,114 @@ def record_github_artifact(
         raise DomainError("internal findings do not have GitHub thread artifacts")
     if artifact == "reaction" and finding["desired_reaction"] == "none":
         raise DomainError("finding decision does not request a reaction")
-    if finding["closure_state"] not in {
-        "VERIFIED_ABSENT",
-        "REJECTED_BY_PRINCIPAL",
-    }:
-        raise DomainError("finding closure evidence is required before thread materialization")
+    if phase not in {None, "decision", "verification"}:
+        raise DomainError("GitHub finding artifact phase is invalid")
+    if phase is None:
+        if view.state is not WorkPackageState.VERIFYING:
+            raise DomainError("legacy GitHub finding artifacts can only be recorded during VERIFYING")
+        if finding["closure_state"] not in {"VERIFIED_ABSENT", "REJECTED_BY_PRINCIPAL"}:
+            raise DomainError("finding closure evidence is required before thread materialization")
+        event_type = "GITHUB_ARTIFACT_MATERIALIZED"
+        artifact_state = finding["materialization"]
+        artifact_ids = finding["materialization_ids"]
+    elif phase == "decision":
+        if view.state is WorkPackageState.DONE:
+            raise DomainError("decision artifacts cannot change after work-package completion")
+        if artifact == "resolution" and (
+            finding["principal_decision"]["decision"] != PrincipalDecision.REJECTED.value
+        ):
+            raise DomainError("accepted provider threads remain open during adjudication")
+        event_type = "DECISION_ARTIFACT_MATERIALIZED"
+        artifact_state = finding["decision_materialization"]
+        artifact_ids = finding["decision_materialization_ids"]
+    else:
+        if (
+            view.state not in {WorkPackageState.VERIFYING, WorkPackageState.REWORK_REQUIRED}
+            or finding["principal_decision"]["decision"] != PrincipalDecision.ACCEPTED.value
+            or finding.get("verification", {}).get("outcome") != "FIXED"
+            or artifact not in {"reply", "resolution"}
+        ):
+            raise DomainError("verification artifacts require an accepted FIXED finding")
+        event_type = "VERIFICATION_ARTIFACT_MATERIALIZED"
+        artifact_state = finding["verification_materialization"]
+        artifact_ids = finding["verification_materialization_ids"]
     if isinstance(remote_id, int) and remote_id <= 0:
         raise DomainError("GitHub materialization id must be positive")
     payload = {"finding_id": finding_id, "artifact": artifact, "remote_id": remote_id}
     duplicate = _command_duplicate(
         session,
         row,
-        event_type="GITHUB_ARTIFACT_MATERIALIZED",
+        event_type=event_type,
         idempotency_key=idempotency_key,
         payload=payload,
     )
     if duplicate is not None:
         return duplicate
-    if finding["materialization"][artifact] == "MATERIALIZED":
-        if finding["materialization_ids"].get(artifact) == remote_id:
+    if artifact_state[artifact] == "MATERIALIZED":
+        if artifact_ids.get(artifact) == remote_id:
             session.commit()
             return view
         raise DomainError("GitHub artifact already has a different materialization")
     _append(
         session,
         row,
-        event_type="GITHUB_ARTIFACT_MATERIALIZED",
+        event_type=event_type,
+        idempotency_key=idempotency_key,
+        payload=payload,
+    )
+    session.commit()
+    return get_work_package(session, work_package_id)
+
+
+def record_implementation_projection(
+    session: Session,
+    work_package_id: str,
+    *,
+    candidate_id: str,
+    head_sha: str,
+    issue_comment_id: int,
+    pull_request_comment_id: int,
+    idempotency_key: str,
+) -> RemediationWorkPackageView:
+    row = _lock_work_package(session, work_package_id)
+    view = get_work_package(session, work_package_id)
+    payload = {
+        "candidate_id": candidate_id,
+        "head_sha": head_sha.lower(),
+        "issue_comment_id": issue_comment_id,
+        "pull_request_comment_id": pull_request_comment_id,
+    }
+    if (
+        view.state
+        not in {
+            WorkPackageState.IMPLEMENTED,
+            WorkPackageState.VERIFYING,
+            WorkPackageState.REWORK_REQUIRED,
+            WorkPackageState.DONE,
+        }
+        or view.candidate_id != payload["candidate_id"]
+        or view.implementation_head_sha != payload["head_sha"]
+        or issue_comment_id <= 0
+        or pull_request_comment_id <= 0
+        or issue_comment_id == pull_request_comment_id
+    ):
+        raise DomainError("implementation projection does not match its submitted candidate")
+    duplicate = _command_duplicate(
+        session,
+        row,
+        event_type="IMPLEMENTATION_PROJECTION_MATERIALIZED",
+        idempotency_key=idempotency_key,
+        payload=payload,
+    )
+    if duplicate is not None:
+        return duplicate
+    if view.implementation_projection == payload:
+        session.commit()
+        return view
+    _append(
+        session,
+        row,
+        event_type="IMPLEMENTATION_PROJECTION_MATERIALIZED",
         idempotency_key=idempotency_key,
         payload=payload,
     )
@@ -1438,11 +2117,7 @@ def record_summary_comment(
     view = get_work_package(session, work_package_id)
     if view.state is not WorkPackageState.VERIFYING or comment_id <= 0:
         raise DomainError("work package summary comment cannot be recorded yet")
-    if any(
-        finding["closure_state"] not in {"VERIFIED_ABSENT", "REJECTED_BY_PRINCIPAL"}
-        or any(value not in {"MATERIALIZED", "NOT_APPLICABLE"} for value in finding["materialization"].values())
-        for finding in view.findings
-    ):
+    if any(not finding_is_terminal(finding) for finding in view.findings):
         raise DomainError("all finding verification and thread artifacts must finish first")
     payload = {"comment_id": comment_id}
     duplicate = _command_duplicate(
@@ -1530,26 +2205,38 @@ def complete_work_package(
     if view.state is not WorkPackageState.VERIFYING:
         raise DomainError("work package can only complete after verification")
     if view.summary_comment_id is None or any(
-        finding["closure_state"] not in {"VERIFIED_ABSENT", "REJECTED_BY_PRINCIPAL"}
-        or any(value not in {"MATERIALIZED", "NOT_APPLICABLE"} for value in finding["materialization"].values())
-        for finding in view.findings
+        not finding_is_terminal(finding) for finding in view.findings
     ):
         raise DomainError("work package findings are not fully closed")
 
     publication = get_view(session, row.publication_id)
-    expected_run_id = view.successor_review_run_id or row.review_run_id
-    expected_head_sha = view.successor_head_sha or row.reviewed_head_sha
-    terminal_review = successor_review_is_terminal(
-        publication.automated_review_status,
-        view.successor_fallback if view.successor_review_run_id is not None else None,
-    )
-    if (
-        publication.remote_head_sha != expected_head_sha
-        or publication.automated_review_head_sha != expected_head_sha
-        or publication.automated_review_run_id != expected_run_id
-        or not terminal_review
-    ):
-        raise DomainError("work package completion is stale for the current review/head")
+    if view.principal_verification is not None:
+        _validate_governed_published_candidate(session, view)
+        evidence_binding = _principal_review_evidence(
+            session,
+            row.publication_id,
+            review_run_id=view.principal_verification["review_run_id"],
+            head_sha=view.principal_verification["head_sha"],
+        )
+        if any(
+            view.principal_verification.get(key) != value
+            for key, value in evidence_binding.items()
+        ):
+            raise DomainError("work package Principal verification evidence changed")
+    else:
+        expected_run_id = view.successor_review_run_id or row.review_run_id
+        expected_head_sha = view.successor_head_sha or row.reviewed_head_sha
+        terminal_review = successor_review_is_terminal(
+            publication.automated_review_status,
+            view.successor_fallback if view.successor_review_run_id is not None else None,
+        )
+        if (
+            publication.remote_head_sha != expected_head_sha
+            or publication.automated_review_head_sha != expected_head_sha
+            or publication.automated_review_run_id != expected_run_id
+            or not terminal_review
+        ):
+            raise DomainError("work package completion is stale for the current review/head")
 
     _append(
         session,
@@ -1563,7 +2250,7 @@ def complete_work_package(
     # Reviewer) has no successor review. Preserve the provider's original
     # CHANGES_REQUIRED evidence while explicitly restoring same-head Human
     # Review eligibility after the package is fully materialized and closed.
-    if view.successor_review_run_id is None:
+    if view.successor_review_run_id is None and view.principal_verification is None:
         clearance = {
             "run_id": row.review_run_id,
             "head_sha": row.reviewed_head_sha,

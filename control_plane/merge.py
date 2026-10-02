@@ -182,6 +182,20 @@ class MergeCoordinator:
                 raise MergeError("stored merge receipt does not match GitHub")
             return view
 
+        from .remediation import publication_has_unresolved_remediation_findings
+
+        if publication_has_unresolved_remediation_findings(session, publication_id):
+            record_merge_policy_violation(
+                session,
+                publication_id,
+                head_sha=view.remote_head_sha or "",
+                pull_request_number=view.pull_request_number or 0,
+                merge_commit_sha=merge_commit_sha,
+            )
+            raise MergePolicyViolationRecorded(
+                "GitHub merge occurred while remediation findings remained unresolved"
+            )
+
         if require_validated_base:
             candidate = view.current_candidate
             if candidate is None or view.base_branch is None:
@@ -308,6 +322,17 @@ class MergeCoordinator:
             # out-of-band merge before rejecting this command.
             self.reconcile(session, publication_id)
             raise DomainError("merge requires READY_TO_MERGE state")
+        from .remediation import publication_has_unresolved_remediation_findings
+
+        if publication_has_unresolved_remediation_findings(session, publication_id):
+            self.reconcile(session, publication_id)
+            view = get_view(session, publication_id)
+            if view.state is PublicationState.MERGED:
+                return view
+            if publication_has_unresolved_remediation_findings(session, publication_id):
+                raise DomainError("merge is blocked by unresolved remediation findings")
+            if view.state is not PublicationState.READY_TO_MERGE:
+                raise DomainError("merge requires READY_TO_MERGE state")
         if view.pull_request_number is None or view.remote_head_sha is None:
             raise DomainError("merge requires published PR metadata")
 

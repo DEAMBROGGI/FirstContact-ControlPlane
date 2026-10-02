@@ -536,6 +536,15 @@ class CodexReviewBroker:
             raise DomainError("Codex review broker is disabled")
 
         view = get_view(session, publication_id)
+        from .remediation import (
+            RemediationFindingsOpen,
+            publication_has_unresolved_remediation_findings,
+        )
+
+        if publication_has_unresolved_remediation_findings(session, publication_id):
+            raise RemediationFindingsOpen(
+                "Codex review is blocked while remediation findings remain unresolved"
+            )
         if view.remote_head_sha is None or view.pull_request_number is None:
             raise DomainError("Codex review requires published PR metadata")
 
@@ -730,6 +739,8 @@ class CodexReviewBroker:
                 actor=comment.actor,
                 created_at=comment.created_at,
             )
+        except RemediationFindingsOpen:
+            raise
         except (
             GitHubAuthError,
             GitHubReviewAuthError,

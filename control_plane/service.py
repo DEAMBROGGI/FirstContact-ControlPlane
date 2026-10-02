@@ -626,11 +626,11 @@ def record_review(
 ) -> PublicationView:
     view = _locked_publication_view(session, publication_id)
     if decision is ReviewDecision.APPROVED:
-        unfinished = _unfinished_remediation_work_package_ids(session, publication_id)
-        if unfinished:
+        from .remediation import publication_has_unresolved_remediation_findings
+
+        if publication_has_unresolved_remediation_findings(session, publication_id):
             raise DomainError(
-                "human approval is blocked by unfinished remediation: "
-                + ", ".join(unfinished)
+                "human approval is blocked by unresolved remediation findings"
             )
     required_adjudication = None
     required_mode = require_codex_review or view.automated_review_mode == "required"
@@ -817,6 +817,10 @@ def record_merged(
             raise DomainError("merged publication receipt does not match")
         session.commit()
         return view
+    from .remediation import publication_has_unresolved_remediation_findings
+
+    if publication_has_unresolved_remediation_findings(session, publication_id):
+        raise DomainError("merge is blocked by unresolved remediation findings")
     validate_transition(view, EventType.MERGED, payload)
     append_event(session, publication_id, EventType.MERGED, payload)
     session.commit()
@@ -871,6 +875,15 @@ def request_codex_review(
     if mode not in {"advisory", "required"}:
         raise DomainError("Codex review mode must be advisory or required")
     view = _locked_publication_view(session, publication_id)
+    from .remediation import (
+        RemediationFindingsOpen,
+        publication_has_unresolved_remediation_findings,
+    )
+
+    if publication_has_unresolved_remediation_findings(session, publication_id):
+        raise RemediationFindingsOpen(
+            "Codex review is blocked while remediation findings remain unresolved"
+        )
     if view.remote_head_sha is None:
         raise DomainError("Codex review requires published head")
     expected_head = _sha(expected_head_sha, "expected_head_sha")

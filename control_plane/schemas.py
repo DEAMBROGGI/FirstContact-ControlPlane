@@ -68,9 +68,15 @@ class StartSuccessorVerificationRequest(BaseModel):
     fallback_reason: str | None = Field(default=None, min_length=1, max_length=1000)
 
 
+class StartPrincipalVerificationRequest(BaseModel):
+    review_run_id: str = Field(min_length=1, max_length=160)
+    head_sha: str
+    idempotency_key: str = Field(min_length=1, max_length=200)
+
+
 class VerifyRemediationFindingRequest(BaseModel):
     outcome: str
-    reviewer: str = Field(min_length=1, max_length=200)
+    reviewer: str | None = Field(default=None, min_length=1, max_length=200)
     evidence: str = Field(min_length=1, max_length=4000)
     idempotency_key: str = Field(min_length=1, max_length=200)
 

@@ -53,6 +53,7 @@ from .schemas import (
     ReleaseWorkClaimRequest,
     RenewWorkClaimRequest,
     ResumeWorkItemRequest,
+    StartPrincipalVerificationRequest,
     StartSuccessorVerificationRequest,
     SubmitRemediationImplementationRequest,
     SubmitWorkImplementationRequest,
@@ -62,6 +63,7 @@ from .schemas import (
 )
 from .remediation import (
     begin_rejected_findings_finalization,
+    begin_principal_verification,
     begin_successor_verification,
     claim_work_package,
     create_work_package,
@@ -1306,6 +1308,38 @@ def remediation_work_package_start_verification(
 
 
 @app.post(
+    "/api/v1/internal/remediation/work-packages/{work_package_id}/principal-verification",
+    dependencies=[Depends(require_token)],
+)
+def remediation_work_package_start_principal_verification(
+    work_package_id: str,
+    request: StartPrincipalVerificationRequest,
+    session: Session = Depends(get_session),
+    materializer: GitHubRemediationMaterializer = Depends(get_remediation_materializer),
+):
+    try:
+        view = begin_principal_verification(
+            session,
+            work_package_id,
+            review_run_id=request.review_run_id,
+            head_sha=request.head_sha,
+            idempotency_key=request.idempotency_key,
+        )
+        return _work_package_payload(
+            materializer.sync_issue_projection(session, view.work_package_id)
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="work package not found") from exc
+    except DomainError as exc:
+        raise _conflict(exc) from exc
+    except RemediationMaterializationError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="remediation status projection failed closed",
+        ) from exc
+
+
+@app.post(
     "/api/v1/internal/remediation/work-packages/{work_package_id}/rejected-finalization",
     dependencies=[Depends(require_token)],
 )
@@ -1346,13 +1380,28 @@ def remediation_finding_verify(
     session: Session = Depends(get_session),
 ):
     try:
+        if request.outcome.upper() in {"FIXED", "NOT_FIXED"}:
+            binding = get_work_package(session, work_package_id).principal_verification
+            reviewer = str((binding or {}).get("reviewer", "")).strip()
+            if not reviewer:
+                raise DomainError(
+                    "Principal reviewer identity is missing from the active ledger binding"
+                )
+            if request.reviewer is not None and request.reviewer.strip() != reviewer:
+                raise DomainError(
+                    "Principal verification reviewer is derived from the bound PLANE_REVIEW"
+                )
+        else:
+            if request.reviewer is None:
+                raise DomainError("successor verification reviewer is required")
+            reviewer = request.reviewer
         return _work_package_payload(
             verify_finding(
                 session,
                 work_package_id,
                 finding_id=finding_id,
                 outcome=request.outcome,
-                reviewer=request.reviewer,
+                reviewer=reviewer,
                 evidence=request.evidence,
                 idempotency_key=request.idempotency_key,
             )

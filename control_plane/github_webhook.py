@@ -376,6 +376,11 @@ def _derive_next(
         return "NONE", "DONE"
     if view.merge_policy_violation:
         return "CONTROL_PLANE", "BLOCKED"
+    from .remediation import remediation_watch_action
+
+    remediation_action = remediation_watch_action(session, publication_id)
+    if remediation_action is not None:
+        return remediation_action
     if view.state is PublicationState.READY_TO_MERGE:
         return "CONTROL_PLANE", "MERGE"
     if view.state is PublicationState.APPROVED:
@@ -1904,6 +1909,12 @@ class GitHubWebhookGateway:
             publication_id,
             require_authoritative_codex_evidence=True,
         )
+        from .remediation import publication_has_unresolved_remediation_findings
+
+        if publication_has_unresolved_remediation_findings(session, publication_id):
+            raise DomainError(
+                "governed merge is blocked by unresolved remediation findings"
+            )
         view = get_view(session, publication_id)
         watch = get_review_watch(session, publication_id)
         if (

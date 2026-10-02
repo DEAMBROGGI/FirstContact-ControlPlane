@@ -16,8 +16,10 @@ from .remediation import (
     complete_work_package,
     fence_github_artifact_dispatch,
     get_work_package,
+    finding_is_terminal,
     record_implementation_issue_linked,
     record_github_artifact,
+    record_implementation_projection,
     record_issue_closed,
     record_summary_comment,
     release_github_artifact_dispatch,
@@ -49,11 +51,18 @@ class GitHubRemediationMaterializer:
         self.project_lifecycle_field = project_lifecycle_field
 
     @staticmethod
-    def _marker(work_package_id: str, finding_id: str, artifact: str) -> str:
+    def _marker(
+        work_package_id: str,
+        finding_id: str,
+        artifact: str,
+        *,
+        phase: str | None = None,
+    ) -> str:
         finding_key = hashlib.sha256(finding_id.encode("utf-8")).hexdigest()[:24]
+        artifact_key = f"{phase}-{artifact}" if phase is not None else artifact
         return (
             "<!-- firstcontact-control-plane:remediation "
-            f"batch={work_package_id} finding={finding_key} artifact={artifact} -->"
+            f"batch={work_package_id} finding={finding_key} artifact={artifact_key} -->"
         )
 
     @staticmethod
@@ -83,32 +92,56 @@ class GitHubRemediationMaterializer:
     ) -> None:
         publication = get_view(session, view.publication_id)
         package = get_work_package(session, view.work_package_id)
-        if package.successor_review_run_id and package.successor_head_sha:
+        principal_review = package.principal_verification
+        if principal_review is not None:
+            expected_run_id = principal_review.get("review_run_id")
+            expected_head_sha = principal_review.get("head_sha")
+            review_is_terminal = (
+                principal_review.get("provider") == "PLANE_REVIEW"
+                and principal_review.get("reviewer_kind") == "PRINCIPAL_REVIEWER"
+                and bool(principal_review.get("reviewer"))
+                and bool(principal_review.get("review_event_hash"))
+                and principal_review.get("candidate_id") == package.candidate_id
+                and expected_head_sha == package.implementation_head_sha
+            )
+            automated_review_bound = False
+        elif package.successor_review_run_id and package.successor_head_sha:
             expected_run_id = package.successor_review_run_id
             expected_head_sha = package.successor_head_sha
+            review_is_terminal = successor_review_is_terminal(
+                publication.automated_review_status,
+                package.successor_fallback,
+            )
+            automated_review_bound = True
         elif all(
             finding["principal_decision"]["decision"] == "REJECTED"
             for finding in package.findings
         ):
             expected_run_id = package.review_run["run_id"]
             expected_head_sha = package.reviewed_head_sha
+            review_is_terminal = successor_review_is_terminal(
+                publication.automated_review_status,
+                None,
+            )
+            automated_review_bound = True
         else:
             expected_run_id = None
             expected_head_sha = None
-        terminal_review = successor_review_is_terminal(
-            publication.automated_review_status,
-            package.successor_fallback
-            if package.successor_review_run_id is not None
-            else None,
-        )
+            review_is_terminal = False
+            automated_review_bound = True
         if (
             package.state is not WorkPackageState.VERIFYING
             or not expected_run_id
             or not expected_head_sha
             or publication.remote_head_sha != expected_head_sha
-            or publication.automated_review_head_sha != expected_head_sha
-            or publication.automated_review_run_id != expected_run_id
-            or not terminal_review
+            or (
+                automated_review_bound
+                and (
+                    publication.automated_review_head_sha != expected_head_sha
+                    or publication.automated_review_run_id != expected_run_id
+                )
+            )
+            or not review_is_terminal
         ):
             raise RemediationMaterializationError(
                 "successor review is no longer current for materialization"
@@ -124,12 +157,51 @@ class GitHubRemediationMaterializer:
         )
         self._exact_pull_request(view, publication, pull, expected_head_sha)
 
-    @staticmethod
-    def _closure_ready(view: RemediationWorkPackageView) -> bool:
-        return all(
-            finding["closure_state"] in {"VERIFIED_ABSENT", "REJECTED_BY_PRINCIPAL"}
-            for finding in view.findings
+    def _verify_decision_context(
+        self,
+        session: Session,
+        view: RemediationWorkPackageView,
+        token: str,
+    ) -> None:
+        publication = get_view(session, view.publication_id)
+        package = get_work_package(session, view.work_package_id)
+        if (
+            publication.remote_head_sha is None
+            or publication.pull_request_number is None
+            or not package.review_run.get("run_id")
+            or not package.reviewed_head_sha
+        ):
+            raise RemediationMaterializationError(
+                "Principal decision is missing its published review identity"
+            )
+        pull = self.github.pull_request(
+            publication.repository,
+            publication.pull_request_number,
+            token,
         )
+        self._exact_pull_request(
+            view,
+            publication,
+            pull,
+            publication.remote_head_sha,
+        )
+
+    @staticmethod
+    def _artifact_status(
+        finding: dict,
+        artifact: str,
+        phase: str | None,
+    ) -> str:
+        if phase is None:
+            return finding["materialization"][artifact]
+        field = f"{phase}_materialization"
+        status = finding[field][artifact]
+        if (
+            status == "PENDING"
+            and finding["materialization"][artifact] == "MATERIALIZED"
+        ):
+            return "MATERIALIZED"
+        return status
 
     @staticmethod
     def _status_projection(
@@ -267,6 +339,129 @@ class GitHubRemediationMaterializer:
         )
         self._project(view, issue.issue_node_id)
 
+    @staticmethod
+    def _implementation_projection_marker(
+        view: RemediationWorkPackageView,
+        surface: str,
+    ) -> str:
+        return (
+            "<!-- firstcontact-control-plane:remediation-candidate "
+            f"batch={view.work_package_id} candidate={view.candidate_id} "
+            f"head={view.implementation_head_sha} surface={surface} -->"
+        )
+
+    def _ensure_implementation_projection(
+        self,
+        session: Session,
+        view: RemediationWorkPackageView,
+        *,
+        token: str,
+        bot_login: str,
+        lease_id: str,
+    ) -> RemediationWorkPackageView:
+        if view.candidate_id is None or view.implementation_head_sha is None:
+            return view
+        publication = get_view(session, view.publication_id)
+        if (
+            view.implementation_issue_number is None
+            or publication.pull_request_number is None
+            or publication.remote_head_sha is None
+        ):
+            raise RemediationMaterializationError(
+                "implementation projection is missing its canonical issue or pull request"
+            )
+        pull = self.github.pull_request(
+            view.repository,
+            publication.pull_request_number,
+            token,
+        )
+        if (
+            pull.number != publication.pull_request_number
+            or pull.state != "open"
+            or pull.head_sha != publication.remote_head_sha
+            or pull.head_ref != publication.remote_branch
+            or pull.base_ref != publication.base_branch
+        ):
+            raise RemediationMaterializationError(
+                "canonical pull request changed before candidate projection"
+            )
+
+        comment_ids: dict[str, int] = {}
+        destinations = (
+            (view.implementation_issue_number, "issue"),
+            (publication.pull_request_number, "pull-request"),
+        )
+        for issue_number, surface in destinations:
+            marker = self._implementation_projection_marker(view, surface)
+            matches = [
+                comment
+                for comment in self.github.list_issue_comments(
+                    view.repository,
+                    issue_number,
+                    token,
+                )
+                if marker in comment.body
+            ]
+            if len(matches) > 1:
+                raise RemediationMaterializationError(
+                    "duplicate implementation candidate comments exist"
+                )
+            if matches:
+                comment = matches[0]
+                if comment.actor.strip().lower() != bot_login.strip().lower():
+                    raise RemediationMaterializationError(
+                        "existing implementation candidate comment actor is unexpected"
+                    )
+            else:
+                if not fence_github_artifact_dispatch(
+                    session,
+                    view.work_package_id,
+                    artifact_key="implementation-issue:projection",
+                    lease_id=lease_id,
+                ):
+                    return get_work_package(session, view.work_package_id)
+                body = (
+                    f"Implementation candidate recorded for remediation batch "
+                    f"`{view.work_package_id}`. Candidate: `{view.candidate_id}`. "
+                    f"Implementation head: `{view.implementation_head_sha}`."
+                )
+                if surface == "pull-request":
+                    body += (
+                        f" Canonical PR head at projection time: "
+                        f"`{publication.remote_head_sha}`."
+                    )
+                comment = self.github.add_issue_comment(
+                    view.repository,
+                    issue_number,
+                    f"{body}\n\n{marker}",
+                    token,
+                )
+                if comment.actor.strip().lower() != bot_login.strip().lower():
+                    raise RemediationMaterializationError(
+                        "implementation candidate comment actor does not match the Control Plane App"
+                    )
+            comment_ids[surface] = comment.comment_id
+
+        if not fence_github_artifact_dispatch(
+            session,
+            view.work_package_id,
+            artifact_key="implementation-issue:projection",
+            lease_id=lease_id,
+        ):
+            return get_work_package(session, view.work_package_id)
+        return record_implementation_projection(
+            session,
+            view.work_package_id,
+            candidate_id=view.candidate_id,
+            head_sha=view.implementation_head_sha,
+            issue_comment_id=comment_ids["issue"],
+            pull_request_comment_id=comment_ids["pull-request"],
+            idempotency_key=(
+                f"github:implementation-projection:{view.candidate_id}:"
+                f"{view.implementation_head_sha}"
+            ),
+        )
+
     def sync_issue_projection(
         self,
         session: Session,
@@ -291,10 +486,14 @@ class GitHubRemediationMaterializer:
         ):
             return get_work_package(session, work_package_id)
         try:
+            permissions = {"issues": "write"}
+            if view.candidate_id is not None and view.implementation_head_sha is not None:
+                permissions["pull_requests"] = "read"
             access = self.token_provider.installation_access(
                 view.repository,
-                permissions={"issues": "write"},
+                permissions=permissions,
             )
+            bot_login = self.token_provider.bot_login()
             issue = self.github.issue(
                 view.repository,
                 view.implementation_issue_number,
@@ -308,7 +507,13 @@ class GitHubRemediationMaterializer:
             ):
                 return get_work_package(session, work_package_id)
             self._ensure_issue_projections(session, view, issue, access.token)
-            return view
+            return self._ensure_implementation_projection(
+                session,
+                view,
+                token=access.token,
+                bot_login=bot_login,
+                lease_id=lease_id,
+            )
         except (GitHubApiError, GitHubAuthError, DomainError) as exc:
             raise RemediationMaterializationError(
                 "GitHub remediation projection failed closed"
@@ -413,11 +618,13 @@ class GitHubRemediationMaterializer:
         *,
         finding_id: str,
         artifact: str,
+        phase: str | None = None,
         token: str,
         operation,
     ) -> bool:
         lease_id = str(uuid.uuid4())
-        artifact_key = f"finding:{finding_id}:{artifact}"
+        phase_key = phase or "legacy"
+        artifact_key = f"finding:{finding_id}:{phase_key}:{artifact}"
         if not claim_github_artifact_dispatch(
             session,
             view.work_package_id,
@@ -426,7 +633,10 @@ class GitHubRemediationMaterializer:
         ):
             return False
         try:
-            self._verify_current_head(session, view, token)
+            if phase == "decision":
+                self._verify_decision_context(session, view, token)
+            else:
+                self._verify_current_head(session, view, token)
             if not fence_github_artifact_dispatch(
                 session,
                 view.work_package_id,
@@ -450,7 +660,8 @@ class GitHubRemediationMaterializer:
                 finding_id=finding_id,
                 artifact=artifact,
                 remote_id=remote_id,
-                idempotency_key=f"github:{finding_id}:{artifact}",
+                idempotency_key=f"github:{phase_key}:{finding_id}:{artifact}",
+                phase=phase,
             )
             return True
         finally:
@@ -469,10 +680,11 @@ class GitHubRemediationMaterializer:
         *,
         token: str,
         bot_login: str,
+        phase: str | None = None,
     ) -> bool:
         desired = finding["desired_reaction"]
-        artifact = finding["materialization"]["reaction"]
-        if desired == "none" or artifact == "MATERIALIZED":
+        artifact = self._artifact_status(finding, "reaction", phase)
+        if desired == "none" or artifact in {"MATERIALIZED", "NOT_APPLICABLE"}:
             return True
         comment_id = finding["source"]["provider_thread_id"]
 
@@ -494,6 +706,7 @@ class GitHubRemediationMaterializer:
             view,
             finding_id=finding["finding_id"],
             artifact="reaction",
+            phase=phase,
             token=token,
             operation=add_reaction,
         )
@@ -506,10 +719,19 @@ class GitHubRemediationMaterializer:
         *,
         token: str,
         bot_login: str,
+        phase: str | None = None,
     ) -> bool:
-        if finding["materialization"]["reply"] == "MATERIALIZED":
+        if self._artifact_status(finding, "reply", phase) in {
+            "MATERIALIZED",
+            "NOT_APPLICABLE",
+        }:
             return True
-        marker = self._marker(view.work_package_id, finding["finding_id"], "reply")
+        marker = self._marker(
+            view.work_package_id,
+            finding["finding_id"],
+            "reply",
+            phase=phase,
+        )
         source = finding["source"]
         parent_comment_id = source["provider_thread_id"]
         publication = get_view(session, view.publication_id)
@@ -542,7 +764,30 @@ class GitHubRemediationMaterializer:
                 return reply.comment_id
 
             decision = finding["principal_decision"]["decision"]
-            if decision == "ACCEPTED":
+            if phase == "decision" and decision == "ACCEPTED":
+                issue_number = view.implementation_issue_number
+                issue_reference = (
+                    f"[implementation issue #{issue_number}]"
+                    f"(https://github.com/{view.repository}/issues/{issue_number})"
+                    if issue_number is not None
+                    else f"work package `{view.work_package_id}`"
+                )
+                text = (
+                    "The Principal Reviewer accepted this finding as actionable. "
+                    f"Remediation is tracked in {issue_reference}; the thread remains "
+                    "open pending implementation and verification."
+                )
+            elif phase == "verification":
+                verification = finding.get("verification") or {}
+                principal_review = view.principal_verification or {}
+                text = (
+                    "The Principal Reviewer verified this finding as FIXED in "
+                    f"candidate `{view.candidate_id}` at implementation head "
+                    f"`{view.implementation_head_sha}` using review run "
+                    f"`{principal_review.get('review_run_id')}` at "
+                    f"`{principal_review.get('head_sha')}`."
+                )
+            elif decision == "ACCEPTED":
                 text = (
                     f"Verified absent in successor review "
                     f"{view.successor_review_run_id} at {view.successor_head_sha}. "
@@ -572,6 +817,7 @@ class GitHubRemediationMaterializer:
             view,
             finding_id=finding["finding_id"],
             artifact="reply",
+            phase=phase,
             token=token,
             operation=add_or_recover_reply,
         )
@@ -583,8 +829,12 @@ class GitHubRemediationMaterializer:
         finding: dict,
         *,
         token: str,
+        phase: str | None = None,
     ) -> bool:
-        if finding["materialization"]["resolution"] == "MATERIALIZED":
+        if self._artifact_status(finding, "resolution", phase) in {
+            "MATERIALIZED",
+            "NOT_APPLICABLE",
+        }:
             return True
         publication = get_view(session, view.publication_id)
         if publication.pull_request_number is None:
@@ -600,6 +850,7 @@ class GitHubRemediationMaterializer:
             view,
             finding_id=finding["finding_id"],
             artifact="resolution",
+            phase=phase,
             token=token,
             operation=lambda: self.github.resolve_pull_review_thread(
                 view.repository,
@@ -695,12 +946,6 @@ class GitHubRemediationMaterializer:
             raise RemediationMaterializationError(
                 "remediation Project V2 number is not configured"
             )
-        if view.state is not WorkPackageState.DONE and (
-            view.state is not WorkPackageState.VERIFYING or not self._closure_ready(view)
-        ):
-            raise DomainError(
-                "all accepted findings require successor verification before materialization"
-            )
         try:
             access = self.token_provider.installation_access(
                 view.repository,
@@ -727,6 +972,7 @@ class GitHubRemediationMaterializer:
                     finding,
                     token=access.token,
                     bot_login=bot_login,
+                    phase="decision",
                 ):
                     return get_work_package(session, work_package_id)
                 finding = next(
@@ -740,6 +986,53 @@ class GitHubRemediationMaterializer:
                     finding,
                     token=access.token,
                     bot_login=bot_login,
+                    phase="decision",
+                ):
+                    return get_work_package(session, work_package_id)
+                if finding["principal_decision"]["decision"] == "REJECTED":
+                    finding = next(
+                        item
+                        for item in get_work_package(session, work_package_id).findings
+                        if item["finding_id"] == initial_finding["finding_id"]
+                    )
+                    if not self._resolve(
+                        session,
+                        view,
+                        finding,
+                        token=access.token,
+                        phase="decision",
+                    ):
+                        return get_work_package(session, work_package_id)
+
+            view = get_work_package(session, work_package_id)
+            if view.state is not WorkPackageState.VERIFYING:
+                return view
+
+            for initial_finding in view.findings:
+                finding = next(
+                    item
+                    for item in get_work_package(session, work_package_id).findings
+                    if item["finding_id"] == initial_finding["finding_id"]
+                )
+                if (
+                    finding["source"].get("provider_thread_id") is None
+                    or finding["principal_decision"]["decision"] != "ACCEPTED"
+                ):
+                    continue
+                outcome = (finding.get("verification") or {}).get("outcome")
+                if outcome == "FIXED":
+                    phase = "verification"
+                elif finding["closure_state"] == "VERIFIED_ABSENT":
+                    phase = None
+                else:
+                    continue
+                if not self._reply(
+                    session,
+                    view,
+                    finding,
+                    token=access.token,
+                    bot_login=bot_login,
+                    phase=phase,
                 ):
                     return get_work_package(session, work_package_id)
                 finding = next(
@@ -752,10 +1045,14 @@ class GitHubRemediationMaterializer:
                     view,
                     finding,
                     token=access.token,
+                    phase=phase,
                 ):
                     return get_work_package(session, work_package_id)
 
             view = get_work_package(session, work_package_id)
+            if not all(finding_is_terminal(finding) for finding in view.findings):
+                return view
+
             if view.summary_comment_id is None:
                 lease_id = str(uuid.uuid4())
                 artifact_key = "implementation-issue:summary"

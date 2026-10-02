@@ -7,8 +7,11 @@ import pytest
 from pydantic import SecretStr
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.schema import CreateTable
+from fastapi.testclient import TestClient
 
 import control_plane.codex_review as codex_review_module
+import control_plane.remediation as remediation_module
+from control_plane.config import settings
 from control_plane.codex_review import (
     CodexReviewBroker,
     CodexReviewError,
@@ -35,6 +38,7 @@ from control_plane.github_review_auth import (
 )
 from control_plane.github_webhook import _derive_next
 from control_plane.models import CodexReviewDispatchRow
+from control_plane.main import app, get_codex_review_broker, get_session
 from control_plane.profile_registry import profile_for_repository
 from control_plane.quarantine import VerifiedCandidateSource
 from control_plane.repository import load_events
@@ -199,6 +203,47 @@ def broker(
         trigger_user=trigger_user,
     )
     return value, token_provider, github
+
+
+def test_open_remediation_blocks_codex_request_before_run_or_dispatch_lease(
+    session,
+    monkeypatch,
+):
+    view = published_publication(session)
+    value, tokens, github = broker()
+    before_events = load_events(session, view.publication_id)
+    original_overrides = app.dependency_overrides.copy()
+    monkeypatch.setattr(
+        remediation_module,
+        "publication_has_unresolved_remediation_findings",
+        lambda *_args: True,
+    )
+    monkeypatch.setattr(settings, "codex_review_mode", "required")
+
+    def override_session():
+        yield session
+
+    app.dependency_overrides[get_session] = override_session
+    app.dependency_overrides[get_codex_review_broker] = lambda: value
+
+    try:
+        response = TestClient(app).post(
+            f"/api/v1/internal/publications/{view.publication_id}/codex-review/request",
+            headers={"X-Control-Plane-Token": settings.internal_token},
+        )
+
+        assert response.status_code == 409
+        assert "remediation findings remain unresolved" in response.json()["detail"]
+    finally:
+        app.dependency_overrides.clear()
+        app.dependency_overrides.update(original_overrides)
+
+    assert load_events(session, view.publication_id) == before_events
+    assert get_view(session, view.publication_id).automated_review_status is None
+    assert tokens.requests == []
+    assert github.pull_request_requests == 0
+    assert github.posted_bodies == []
+    assert session.query(CodexReviewDispatchRow).count() == 0
 
 
 def remove_trigger_credential(value):

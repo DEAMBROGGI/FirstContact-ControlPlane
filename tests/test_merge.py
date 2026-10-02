@@ -4,6 +4,8 @@ from types import SimpleNamespace
 
 import pytest
 
+import control_plane.remediation as remediation_module
+
 from control_plane.domain import DomainError, PublicationState, ReviewDecision, ValidationStatus
 from control_plane.github_api import GitHubApiError, PullRequestSnapshot
 from control_plane.merge import (
@@ -319,6 +321,62 @@ def test_plane_merge_executes_exact_head_and_records_native_receipt(session):
             "pull_requests": "write",
         }
     ]
+
+
+def test_plane_merge_is_blocked_before_write_with_open_remediation(
+    session,
+    monkeypatch,
+):
+    ready = ready_publication(session)
+    github = GitHub(
+        [pull(merged=False)],
+        merged_statuses=[False],
+    )
+    monkeypatch.setattr(
+        remediation_module,
+        "publication_has_unresolved_remediation_findings",
+        lambda *_args: True,
+    )
+    coordinator = MergeCoordinator(
+        token_provider=TokenProvider(),
+        github=github,
+    )
+
+    with pytest.raises(DomainError, match="unresolved remediation"):
+        coordinator.merge(session, ready.publication_id)
+
+    assert github.merge_calls == []
+
+
+def test_external_merge_with_open_remediation_records_policy_violation(
+    session,
+    monkeypatch,
+):
+    ready = ready_publication(session)
+    github = GitHub(
+        [pull(merged=True, merge_sha=MERGE_SHA)],
+        merged_statuses=[True],
+    )
+    monkeypatch.setattr(
+        remediation_module,
+        "publication_has_unresolved_remediation_findings",
+        lambda *_args: True,
+    )
+    coordinator = MergeCoordinator(
+        token_provider=TokenProvider(),
+        github=github,
+    )
+
+    with pytest.raises(
+        MergePolicyViolationRecorded,
+        match="remediation findings remained unresolved",
+    ):
+        coordinator.reconcile(session, ready.publication_id)
+
+    current = get_view(session, ready.publication_id)
+    assert current.state is PublicationState.READY_TO_MERGE
+    assert current.merge_policy_violation is True
+    assert github.merge_calls == []
 
 
 def test_merge_accepts_raced_external_merge_matching_candidate_graph(session):
