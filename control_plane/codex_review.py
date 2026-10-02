@@ -98,13 +98,22 @@ def assert_no_ambiguous_codex_invocations(
     trigger_comment_id: int,
     trigger_time: datetime,
 ) -> None:
-    ambiguous_invocations = [
-        item
-        for item in comments
-        if item.comment_id != trigger_comment_id
-        and _RESERVED_CODEX_MENTION.search(item.body or "")
-        and (_parse_time(item.created_at) or trigger_time) >= trigger_time
-    ]
+    ambiguous_invocations = []
+    for item in comments:
+        if (
+            item.comment_id == trigger_comment_id
+            or not _RESERVED_CODEX_MENTION.search(item.body or "")
+        ):
+            continue
+        try:
+            created_at = _parse_time(item.created_at)
+        except CodexReviewError as exc:
+            raise CodexReviewInvalidInvocationError(
+                "unmanaged Codex invocation has an invalid timestamp",
+                evidence_ids=(item.comment_id,),
+            ) from exc
+        if (created_at or trigger_time) >= trigger_time:
+            ambiguous_invocations.append(item)
     if ambiguous_invocations:
         raise CodexReviewError(
             "additional Codex invocation detected during governed review"
@@ -616,13 +625,23 @@ class CodexReviewBroker:
                 locked.pull_request_number or 0,
                 access.token,
             )
-            foreign_invocations = [
-                item
-                for item in issue_comments
-                if _RESERVED_CODEX_MENTION.search(item.body or "")
-                and marker not in item.body
-                and (_parse_time(item.created_at) or published_at) >= published_at
-            ]
+            foreign_invocations = []
+            for item in issue_comments:
+                body = item.body or ""
+                if (
+                    not _RESERVED_CODEX_MENTION.search(body)
+                    or marker in body
+                ):
+                    continue
+                try:
+                    created_at = _parse_time(item.created_at)
+                except CodexReviewError as exc:
+                    raise CodexReviewInvalidInvocationError(
+                        "unmanaged Codex invocation has an invalid timestamp",
+                        evidence_ids=(item.comment_id,),
+                    ) from exc
+                if (created_at or published_at) >= published_at:
+                    foreign_invocations.append(item)
             if foreign_invocations:
                 raise CodexReviewInvalidInvocationError(
                     "pre-existing Codex invocation makes governed review ambiguous",
@@ -1060,11 +1079,20 @@ class CodexReviewBroker:
         if _parse_time(trigger.created_at) != trigger_time:
             raise CodexReviewError("governed Codex trigger timestamp changed")
 
-        assert_no_ambiguous_codex_invocations(
-            issue_comments,
-            trigger_comment_id=trigger.comment_id,
-            trigger_time=trigger_time,
-        )
+        try:
+            assert_no_ambiguous_codex_invocations(
+                issue_comments,
+                trigger_comment_id=trigger.comment_id,
+                trigger_time=trigger_time,
+            )
+        except CodexReviewInvalidInvocationError as exc:
+            return self._invalidate(
+                session,
+                view,
+                reason="CODEX_AMBIGUOUS_INVOCATION",
+                evidence_ids=list(exc.evidence_ids),
+                actors=(),
+            )
         terminal_event = self._terminal_event(session, view)
         terminal_time = (
             self._terminal_time(terminal_event)

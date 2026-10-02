@@ -178,8 +178,8 @@ class MergeApiGitHub:
         assert token == "installation-token"
         return GitHubCommitSnapshot(
             sha=MERGE_COMMIT,
-            tree_sha="5" * 40,
-            parents=(),
+            tree_sha=MERGE_TREE if self.merge_calls else "5" * 40,
+            parents=(MERGE_BASE, MERGE_HEAD) if self.merge_calls else (),
         )
 
     def ref_sha(self, repository, branch, token):

@@ -33,6 +33,7 @@ from control_plane.github_app import InstallationAccess
 from control_plane.github_review_auth import (
     GitHubReviewTokenProvider,
 )
+from control_plane.github_webhook import _derive_next
 from control_plane.models import CodexReviewDispatchRow
 from control_plane.profile_registry import profile_for_repository
 from control_plane.quarantine import VerifiedCandidateSource
@@ -42,6 +43,7 @@ from control_plane.service import (
     fence_codex_review_trigger_dispatch,
     create_publication,
     get_view,
+    invalidate_codex_review,
     mark_remote_published,
     mark_codex_review_unavailable,
     record_review,
@@ -1059,6 +1061,160 @@ def test_same_second_unmanaged_codex_invocation_blocks_governed_trigger(session)
     )
     assert not any(
         event["event_type"] == "CODEX_REVIEW_UNAVAILABLE"
+        for event in events
+    )
+
+
+def test_malformed_unmanaged_codex_invocation_invalidates_without_fallback(session):
+    view = published_publication(session)
+    github = FakeGitHub()
+    github.issue_comments.append(
+        IssueCommentSnapshot(
+            comment_id=851,
+            actor="DEAMBROGGI",
+            body="@codex review",
+            created_at="not-a-timestamp",
+        )
+    )
+    value, _tokens, github = broker(github=github)
+
+    with pytest.raises(CodexReviewError, match="failed closed"):
+        value.request(session, view.publication_id)
+
+    current = get_view(session, view.publication_id)
+    events = load_events(session, view.publication_id)
+    invalidations = [
+        event
+        for event in events
+        if event["event_type"] == "CODEX_REVIEW_INVALIDATED"
+    ]
+    assert len(invalidations) == 1
+    assert invalidations[0]["payload"]["reason"] == "CODEX_AMBIGUOUS_INVOCATION"
+    assert invalidations[0]["payload"]["evidence_ids"] == [851]
+    assert not any(
+        event["event_type"] == "CODEX_REVIEW_UNAVAILABLE"
+        for event in events
+    )
+    assert current.state is PublicationState.CHANGES_REQUIRED
+    assert current.review_decision is None
+    assert github.posted_bodies == []
+    assert _derive_next(
+        session,
+        view.publication_id,
+        codex_review_mode="required",
+    ) == ("IMPLEMENTER", "REMEDIATE_FINDINGS")
+
+    invalidate_codex_review(
+        session,
+        view.publication_id,
+        run_id=current.automated_review_run_id,
+        reviewed_head_sha=current.automated_review_head_sha,
+        reason="CODEX_AMBIGUOUS_INVOCATION",
+        evidence_ids=[851],
+    )
+    repeated_events = load_events(session, view.publication_id)
+    assert sum(
+        event["event_type"] == "CODEX_REVIEW_INVALIDATED"
+        for event in repeated_events
+    ) == 1
+
+
+def test_malformed_timestamp_on_non_codex_comment_does_not_block_trigger(session):
+    view = published_publication(session)
+    github = FakeGitHub()
+    github.issue_comments.append(
+        IssueCommentSnapshot(
+            comment_id=852,
+            actor="DEAMBROGGI",
+            body="Ordinary review coordination note",
+            created_at="not-a-timestamp",
+        )
+    )
+    value, _tokens, github = broker(github=github)
+
+    triggered = value.request(session, view.publication_id)
+
+    assert triggered.automated_review_status is AutomatedReviewStatus.RUNNING
+    assert len(github.posted_bodies) == 1
+    assert not any(
+        event["event_type"] in {
+            "CODEX_REVIEW_INVALIDATED",
+            "CODEX_REVIEW_UNAVAILABLE",
+        }
+        for event in load_events(session, view.publication_id)
+    )
+
+
+def test_malformed_unmanaged_codex_invocation_invalidates_during_reconcile(session):
+    view = published_publication(session)
+    value, _tokens, github = broker()
+    running = value.request(session, view.publication_id)
+    trigger_comment_id = running.automated_review_trigger_comment_id
+    assert trigger_comment_id is not None
+    github.issue_comments.append(
+        IssueCommentSnapshot(
+            comment_id=853,
+            actor="DEAMBROGGI",
+            body="@codex review",
+            created_at="not-a-timestamp",
+        )
+    )
+
+    observed = value.reconcile(session, view.publication_id)
+
+    current = get_view(session, view.publication_id)
+    events = load_events(session, view.publication_id)
+    invalidation = next(
+        event
+        for event in events
+        if event["event_type"] == "CODEX_REVIEW_INVALIDATED"
+    )
+    assert observed.state == "INVALIDATED"
+    assert invalidation["payload"]["reason"] == "CODEX_AMBIGUOUS_INVOCATION"
+    assert invalidation["payload"]["evidence_ids"] == [853]
+    assert current.state is PublicationState.CHANGES_REQUIRED
+    assert _derive_next(
+        session,
+        view.publication_id,
+        codex_review_mode="required",
+    ) == ("IMPLEMENTER", "REMEDIATE_FINDINGS")
+    assert not any(
+        event["event_type"] == "CODEX_REVIEW_UNAVAILABLE"
+        for event in events
+    )
+
+
+def test_genuine_trigger_readback_failure_remains_unavailable(session):
+    class TriggerReadbackFailureGitHub(FakeGitHub):
+        def __init__(self):
+            super().__init__()
+            self.trigger_pull_requests = 0
+
+        def pull_request(self, repository, number, token):
+            self.trigger_pull_requests += 1
+            if self.trigger_pull_requests == 2:
+                raise GitHubApiError("temporary trigger pull read failure")
+            return super().pull_request(repository, number, token)
+
+    view = published_publication(session)
+    github = TriggerReadbackFailureGitHub()
+    value, _tokens, github = broker(github=github)
+
+    with pytest.raises(CodexReviewError, match="failed closed"):
+        value.request(session, view.publication_id)
+
+    current = get_view(session, view.publication_id)
+    events = load_events(session, view.publication_id)
+    unavailable = [
+        event
+        for event in events
+        if event["event_type"] == "CODEX_REVIEW_UNAVAILABLE"
+    ]
+    assert current.automated_review_status is AutomatedReviewStatus.UNAVAILABLE
+    assert len(unavailable) == 1
+    assert unavailable[0]["payload"]["reason"] == "CODEX_TRIGGER_UNAVAILABLE"
+    assert not any(
+        event["event_type"] == "CODEX_REVIEW_INVALIDATED"
         for event in events
     )
 

@@ -6,7 +6,11 @@ import pytest
 
 from control_plane.domain import DomainError, PublicationState, ReviewDecision, ValidationStatus
 from control_plane.github_api import GitHubApiError, PullRequestSnapshot
-from control_plane.merge import MergeCoordinator, MergeError
+from control_plane.merge import (
+    MergeCoordinator,
+    MergeError,
+    MergePolicyViolationRecorded,
+)
 from control_plane.profile_registry import profile_for_repository
 from control_plane.quarantine import VerifiedCandidateSource
 from control_plane.service import (
@@ -315,6 +319,155 @@ def test_plane_merge_executes_exact_head_and_records_native_receipt(session):
             "pull_requests": "write",
         }
     ]
+
+
+def test_merge_accepts_raced_external_merge_matching_candidate_graph(session):
+    ready = ready_publication(session, issue_number=233)
+    github = GitHub(
+        [pull(merged=False), pull(merged=True, merge_sha=MERGE_SHA)],
+        merged_statuses=[True],
+        merge_events=[SimpleNamespace(commit_id=MERGE_SHA)],
+    )
+    coordinator = MergeCoordinator(
+        token_provider=TokenProvider(),
+        github=github,
+    )
+
+    merged = coordinator.merge(session, ready.publication_id)
+
+    assert merged.state is PublicationState.MERGED
+    assert merged.merge_commit_sha == MERGE_SHA
+    assert merged.merge_source == "GITHUB_RECONCILE"
+    assert github.merge_calls == []
+
+
+@pytest.mark.parametrize(
+    ("merge_commit_tree", "merge_commit_parents"),
+    [
+        ("5" * 40, (BASE, HEAD)),
+        (TREE, ("9" * 40, HEAD)),
+    ],
+)
+def test_merge_rejects_raced_external_merge_outside_candidate_graph(
+    session,
+    merge_commit_tree,
+    merge_commit_parents,
+):
+    ready = ready_publication(session, issue_number=234)
+    github = GitHub(
+        [pull(merged=False), pull(merged=True, merge_sha=MERGE_SHA)],
+        merged_statuses=[True],
+        merge_events=[SimpleNamespace(commit_id=MERGE_SHA)],
+        merge_commit_tree=merge_commit_tree,
+        merge_commit_parents=merge_commit_parents,
+    )
+    coordinator = MergeCoordinator(
+        token_provider=TokenProvider(),
+        github=github,
+    )
+
+    with pytest.raises(MergePolicyViolationRecorded, match="does not match"):
+        coordinator.merge(session, ready.publication_id)
+
+    current = get_view(session, ready.publication_id)
+    assert current.state is PublicationState.READY_TO_MERGE
+    assert current.merge_policy_violation is True
+    assert current.merge_commit_sha == MERGE_SHA
+    assert github.merge_calls == []
+
+
+@pytest.mark.parametrize(
+    ("pull_merge_sha", "event_merge_sha", "message"),
+    [
+        (None, None, "incomplete"),
+        (MERGE_SHA, "5" * 40, "inconsistent"),
+    ],
+)
+def test_merge_fails_closed_on_incomplete_or_ambiguous_race_receipt(
+    session,
+    pull_merge_sha,
+    event_merge_sha,
+    message,
+):
+    ready = ready_publication(session, issue_number=235)
+    merge_event = (
+        SimpleNamespace(commit_id=event_merge_sha)
+        if event_merge_sha is not None
+        else None
+    )
+    github = GitHub(
+        [pull(merged=False), pull(merged=True, merge_sha=pull_merge_sha)],
+        merged_statuses=[True],
+        merge_events=[merge_event],
+    )
+    coordinator = MergeCoordinator(
+        token_provider=TokenProvider(),
+        github=github,
+    )
+
+    with pytest.raises(MergeError, match=message):
+        coordinator.merge(session, ready.publication_id)
+
+    current = get_view(session, ready.publication_id)
+    assert current.state is PublicationState.READY_TO_MERGE
+    assert current.merge_policy_violation is False
+    assert current.merge_commit_sha is None
+    assert github.merge_calls == []
+
+
+@pytest.mark.parametrize(
+    ("merge_method", "parents", "comparisons"),
+    [
+        ("merge", (BASE, HEAD), []),
+        ("squash", (BASE,), []),
+        (
+            "rebase",
+            ("5" * 40,),
+            [
+                SimpleNamespace(
+                    base_sha=BASE,
+                    head_sha=HEAD,
+                    merge_base_sha=BASE,
+                    ahead_by=2,
+                    behind_by=0,
+                ),
+                SimpleNamespace(
+                    base_sha=BASE,
+                    head_sha=MERGE_SHA,
+                    merge_base_sha=BASE,
+                    ahead_by=2,
+                    behind_by=0,
+                ),
+            ],
+        ),
+    ],
+)
+def test_plane_merge_validates_supported_merge_method_graphs(
+    session,
+    merge_method,
+    parents,
+    comparisons,
+):
+    ready = ready_publication(session, issue_number=236)
+    github = GitHub(
+        [pull(merged=False), pull(merged=True, merge_sha=MERGE_SHA)],
+        merged_statuses=[False, True],
+        merge_events=[SimpleNamespace(commit_id=MERGE_SHA)],
+        merge_commit_parents=parents,
+        comparison_results=comparisons,
+    )
+    coordinator = MergeCoordinator(
+        token_provider=TokenProvider(),
+        github=github,
+        merge_method=merge_method,
+    )
+
+    merged = coordinator.merge(session, ready.publication_id)
+
+    assert merged.state is PublicationState.MERGED
+    assert merged.merge_source == "PLANE_MERGE"
+    assert github.merge_calls[0]["merge_method"] == merge_method
+    assert github.comparison_results == []
 
 
 def test_plane_merge_recovers_remote_success_after_uncertain_write(session):
