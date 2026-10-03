@@ -3,18 +3,27 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 
-from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.concurrency import run_in_threadpool
 from sqlalchemy.orm import Session
 
 from .codex_review import CodexReviewBroker, CodexReviewError
 from .config import settings
-from .db import get_session, init_db
+from .db import SessionLocal, get_session, init_db
 from .domain import DomainError
-from .github_api import GitHubRepositoryGateway
-from .github_app import GitHubAppTokenProvider
+from .github_api import GitHubApiError, GitHubRepositoryGateway
+from .github_app import GitHubAppTokenProvider, GitHubAuthError
 from .github_review_auth import GitHubReviewTokenProvider
-from .merge import MergeCoordinator, MergeError
+from .github_webhook import (
+    GitHubWebhookAuthError,
+    GitHubWebhookError,
+    GitHubWebhookGateway,
+    get_webhook_delivery,
+    get_review_watch,
+    sync_review_watch,
+)
+from .merge import MergeCoordinator, MergeError, MergePolicyViolationRecorded
 from .profile_registry import all_profiles
 from .publisher import GitHubPublisher, PublicationError
 from .plane_review import (
@@ -30,6 +39,8 @@ from .remediation_materializer import (
 from .repository import load_events
 from .schemas import (
     AddWorkDependencyRequest,
+    AdoptHistoricalPRFindingRequest,
+    AdoptHistoricalImplementationRequest,
     ClaimNextWorkRequest,
     ClaimWorkItemRequest,
     CompleteWorkItemRequest,
@@ -44,6 +55,7 @@ from .schemas import (
     ReleaseWorkClaimRequest,
     RenewWorkClaimRequest,
     ResumeWorkItemRequest,
+    StartPrincipalVerificationRequest,
     StartSuccessorVerificationRequest,
     SubmitRemediationImplementationRequest,
     SubmitWorkImplementationRequest,
@@ -53,7 +65,10 @@ from .schemas import (
 )
 from .remediation import (
     begin_rejected_findings_finalization,
+    begin_principal_verification,
     begin_successor_verification,
+    adopt_historical_implementation,
+    adopt_historical_pr_finding,
     claim_work_package,
     create_work_package,
     get_work_package,
@@ -91,6 +106,7 @@ from .work import (
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     init_db()
+    _startup_reconcile_pending_webhooks()
     yield
 
 
@@ -155,6 +171,53 @@ def get_merge_coordinator():
         github.close()
 
 
+def _configured_actors(raw: str) -> tuple[str, ...]:
+    return tuple(
+        value.strip()
+        for value in raw.split(",")
+        if value.strip()
+    )
+
+
+def _startup_reconcile_pending_webhooks() -> int:
+    if settings.publisher_mode != "github-app":
+        return 0
+    webhook_secret = settings.github_webhook_secret.get_secret_value().strip()
+    if not webhook_secret:
+        return 0
+    limit = settings.github_webhook_startup_reconcile_limit
+    if limit <= 0:
+        return 0
+
+    token_provider = GitHubAppTokenProvider(
+        app_id=settings.github_app_id,
+        private_key_path=settings.github_app_private_key_path,
+        api_url=settings.github_api_url,
+    )
+    github = GitHubRepositoryGateway(api_url=settings.github_api_url)
+    session = SessionLocal()
+    try:
+        gateway = GitHubWebhookGateway(
+            token_provider=token_provider,
+            github=github,
+            codex_review_mode=settings.codex_review_mode,
+            codex_actors=_configured_actors(settings.codex_review_actors),
+            human_review_actors=_configured_actors(settings.human_review_actors),
+            webhook_secret=webhook_secret,
+            maximum_payload_bytes=settings.github_webhook_max_payload_bytes,
+        )
+        return len(
+            gateway.reconcile_pending_best_effort(
+                session,
+                limit=limit,
+            )
+        )
+    finally:
+        session.close()
+        token_provider.close()
+        github.close()
+
+
 def get_codex_review_broker():
     token_provider = GitHubAppTokenProvider(
         app_id=settings.github_app_id,
@@ -162,11 +225,7 @@ def get_codex_review_broker():
         api_url=settings.github_api_url,
     )
     github = GitHubRepositoryGateway(api_url=settings.github_api_url)
-    actors = tuple(
-        value.strip()
-        for value in settings.codex_review_actors.split(",")
-        if value.strip()
-    )
+    actors = _configured_actors(settings.codex_review_actors)
     trigger_user = GitHubReviewTokenProvider(
         token=settings.codex_review_user_token,
         expected_login=settings.codex_review_trigger_login,
@@ -183,6 +242,43 @@ def get_codex_review_broker():
     finally:
         token_provider.close()
         github.close()
+
+
+def _github_webhook_gateway(*, webhook_secret: str | None):
+    token_provider = GitHubAppTokenProvider(
+        app_id=settings.github_app_id,
+        private_key_path=settings.github_app_private_key_path,
+        api_url=settings.github_api_url,
+    )
+    github = GitHubRepositoryGateway(api_url=settings.github_api_url)
+    try:
+        yield GitHubWebhookGateway(
+            token_provider=token_provider,
+            github=github,
+            codex_review_mode=settings.codex_review_mode,
+            codex_actors=_configured_actors(settings.codex_review_actors),
+            human_review_actors=_configured_actors(settings.human_review_actors),
+            webhook_secret=webhook_secret,
+            maximum_payload_bytes=settings.github_webhook_max_payload_bytes,
+        )
+    finally:
+        token_provider.close()
+        github.close()
+
+
+def get_github_authoritative_gateway():
+    if settings.publisher_mode != "github-app":
+        raise HTTPException(status_code=503, detail="GitHub webhook gateway is disabled")
+    yield from _github_webhook_gateway(webhook_secret=None)
+
+
+def get_github_webhook_gateway():
+    if settings.publisher_mode != "github-app":
+        raise HTTPException(status_code=503, detail="GitHub webhook gateway is disabled")
+    webhook_secret = settings.github_webhook_secret.get_secret_value().strip()
+    if not webhook_secret:
+        raise HTTPException(status_code=503, detail="GitHub webhook secret is not configured")
+    yield from _github_webhook_gateway(webhook_secret=webhook_secret)
 
 
 def get_plane_review_publisher():
@@ -258,8 +354,51 @@ def _work_item_payload(view: WorkItemView):
     return data
 
 
+def _sync_publication_watch(session: Session, publication_id: str):
+    view = get_view(session, publication_id)
+    if view.pull_request_number is None or view.remote_head_sha is None:
+        return None
+    return sync_review_watch(
+        session,
+        publication_id,
+        expected_actors=(
+            *_configured_actors(settings.codex_review_actors),
+            *_configured_actors(settings.human_review_actors),
+        ),
+        codex_review_mode=settings.codex_review_mode,
+    )
+
+
 def _conflict(exc: Exception) -> HTTPException:
     return HTTPException(status_code=409, detail=str(exc))
+
+
+async def _read_limited_webhook_body(request: Request, maximum_bytes: int) -> bytes:
+    if maximum_bytes <= 0:
+        raise HTTPException(status_code=400, detail="webhook payload limit is invalid")
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            declared_bytes = int(content_length)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail="webhook content length is invalid",
+            ) from exc
+        if declared_bytes < 0:
+            raise HTTPException(
+                status_code=400,
+                detail="webhook content length is invalid",
+            )
+        if declared_bytes > maximum_bytes:
+            raise HTTPException(status_code=413, detail="webhook payload is too large")
+
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > maximum_bytes:
+            raise HTTPException(status_code=413, detail="webhook payload is too large")
+        body.extend(chunk)
+    return bytes(body)
 
 
 @app.get("/api/v1/health")
@@ -652,13 +791,39 @@ def publication_publish(
     publisher: GitHubPublisher = Depends(get_publisher),
 ):
     try:
-        return _payload(publisher.publish(session, publication_id))
+        view = publisher.publish(session, publication_id)
+        _sync_publication_watch(session, publication_id)
+        return _payload(view)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="publication not found") from exc
     except DomainError as exc:
         raise _conflict(exc) from exc
     except PublicationError as exc:
         raise HTTPException(status_code=502, detail="publication failed closed") from exc
+
+
+@app.post(
+    "/api/v1/internal/publications/{publication_id}/pr-findings/reconcile",
+    dependencies=[Depends(require_token)],
+)
+def publication_pr_findings_reconcile(
+    publication_id: str,
+    session: Session = Depends(get_session),
+    gateway: GitHubWebhookGateway = Depends(get_github_authoritative_gateway),
+):
+    try:
+        result = gateway.reconcile_pr_findings(session, publication_id)
+        _sync_publication_watch(session, publication_id)
+        return result
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="publication not found") from exc
+    except DomainError as exc:
+        raise _conflict(exc) from exc
+    except (GitHubAuthError, GitHubApiError, GitHubWebhookError) as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="PR finding reconciliation failed closed",
+        ) from exc
 
 
 
@@ -674,7 +839,9 @@ def codex_review_request(
     if settings.codex_review_mode.strip().lower() == "disabled":
         raise HTTPException(status_code=503, detail="Codex review broker is disabled")
     try:
-        return _payload(broker.request(session, publication_id))
+        view = broker.request(session, publication_id)
+        _sync_publication_watch(session, publication_id)
+        return _payload(view)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="publication not found") from exc
     except DomainError as exc:
@@ -694,6 +861,15 @@ def codex_review_reconcile(
 ):
     try:
         observation = broker.reconcile(session, publication_id)
+        sync_review_watch(
+            session,
+            publication_id,
+            expected_actors=(
+                *_configured_actors(settings.codex_review_actors),
+                *_configured_actors(settings.human_review_actors),
+            ),
+            codex_review_mode=settings.codex_review_mode,
+        )
         return {
             "observation": asdict(observation),
             "publication": _payload(get_view(session, publication_id)),
@@ -704,6 +880,113 @@ def codex_review_reconcile(
         raise _conflict(exc) from exc
     except CodexReviewError as exc:
         raise HTTPException(status_code=502, detail="Codex review reconciliation failed closed") from exc
+
+
+@app.post("/api/v1/github/webhooks")
+async def github_webhook_receive(
+    request: Request,
+    x_hub_signature_256: str | None = Header(
+        default=None,
+        alias="X-Hub-Signature-256",
+    ),
+    x_github_delivery: str | None = Header(
+        default=None,
+        alias="X-GitHub-Delivery",
+    ),
+    x_github_event: str | None = Header(
+        default=None,
+        alias="X-GitHub-Event",
+    ),
+    session: Session = Depends(get_session),
+    gateway: GitHubWebhookGateway = Depends(get_github_webhook_gateway),
+):
+    body = await _read_limited_webhook_body(
+        request,
+        gateway.maximum_payload_bytes,
+    )
+    try:
+        receipt = gateway.ingest(
+            session,
+            delivery_id=(x_github_delivery or ""),
+            event_name=(x_github_event or ""),
+            signature=x_hub_signature_256,
+            body=body,
+        )
+    except GitHubWebhookAuthError as exc:
+        raise HTTPException(status_code=401, detail="invalid GitHub webhook signature") from exc
+    except DomainError as exc:
+        raise _conflict(exc) from exc
+    except GitHubWebhookError as exc:
+        raise HTTPException(status_code=400, detail="invalid GitHub webhook delivery") from exc
+
+    try:
+        processing = await run_in_threadpool(
+            gateway.process_delivery,
+            session,
+            receipt.delivery_id,
+        )
+        delivery = get_webhook_delivery(session, receipt.delivery_id)
+        return {
+            "delivery": asdict(delivery),
+            "processing": asdict(processing),
+        }
+    except DomainError as exc:
+        raise _conflict(exc) from exc
+    except (
+        GitHubAuthError,
+        GitHubApiError,
+        CodexReviewError,
+        GitHubWebhookError,
+    ) as exc:
+        raise HTTPException(status_code=502, detail="GitHub webhook processing failed closed") from exc
+
+
+@app.post(
+    "/api/v1/internal/github/webhooks/reconcile",
+    dependencies=[Depends(require_token)],
+)
+def github_webhook_reconcile(
+    publication_id: str | None = None,
+    session: Session = Depends(get_session),
+    gateway: GitHubWebhookGateway = Depends(get_github_authoritative_gateway),
+):
+    try:
+        if publication_id is not None:
+            return asdict(
+                gateway.reconcile_publication(
+                    session,
+                    publication_id,
+                )
+            )
+        return [
+            asdict(item)
+            for item in gateway.reconcile_pending(session)
+        ]
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="webhook/publication not found") from exc
+    except DomainError as exc:
+        raise _conflict(exc) from exc
+    except (
+        GitHubAuthError,
+        GitHubApiError,
+        CodexReviewError,
+        GitHubWebhookError,
+    ) as exc:
+        raise HTTPException(status_code=502, detail="GitHub reconciliation failed closed") from exc
+
+
+@app.get(
+    "/api/v1/internal/github/review-watches/{publication_id}",
+    dependencies=[Depends(require_token)],
+)
+def github_review_watch_get(
+    publication_id: str,
+    session: Session = Depends(get_session),
+):
+    try:
+        return asdict(get_review_watch(session, publication_id))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="review watch not found") from exc
 
 
 @app.post(
@@ -728,11 +1011,13 @@ def plane_review_submit(
             comments=request.comments,
             idempotency_key=request.idempotency_key,
         )
-        return publisher.materialize(
+        result = publisher.materialize(
             session,
             publication_id,
             request.review_run_id,
         )
+        _sync_publication_watch(session, publication_id)
+        return result
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="publication not found") from exc
     except DomainError as exc:
@@ -745,9 +1030,15 @@ def plane_review_submit(
 
 
 @app.post("/api/v1/publications/{publication_id}/reviews", dependencies=[Depends(require_token)])
-def review_record(publication_id: str, request: ReviewRequest, session: Session = Depends(get_session)):
+def review_record(
+    publication_id: str,
+    request: ReviewRequest,
+    session: Session = Depends(get_session),
+    gateway: GitHubWebhookGateway = Depends(get_github_authoritative_gateway),
+):
     try:
-        return _payload(record_review(
+        gateway.assert_review_write_current(session, publication_id)
+        view = record_review(
             session,
             publication_id,
             reviewed_head_sha=request.reviewed_head_sha,
@@ -755,26 +1046,55 @@ def review_record(publication_id: str, request: ReviewRequest, session: Session 
             require_codex_review=(
                 settings.codex_review_mode.strip().lower() == "required"
             ),
-        ))
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail="publication not found") from exc
-    except DomainError as exc:
-        raise _conflict(exc) from exc
-@app.post("/api/v1/internal/publications/{publication_id}/mergeability", dependencies=[Depends(require_token)])
-def mergeability_record(publication_id: str, request: MergeabilityRequest, session: Session = Depends(get_session)):
-    try:
-        return _payload(
-            record_mergeability(
-                session,
-                publication_id,
-                head_sha=request.head_sha,
-                mergeable=request.mergeable,
-            )
         )
+        _sync_publication_watch(session, publication_id)
+        return _payload(view)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="publication not found") from exc
     except DomainError as exc:
         raise _conflict(exc) from exc
+    except GitHubWebhookError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="GitHub review write readback failed closed",
+        ) from exc
+
+@app.post("/api/v1/internal/publications/{publication_id}/mergeability", dependencies=[Depends(require_token)])
+def mergeability_record(
+    publication_id: str,
+    request: MergeabilityRequest,
+    session: Session = Depends(get_session),
+    gateway: GitHubWebhookGateway = Depends(get_github_authoritative_gateway),
+):
+    try:
+        pull = gateway.assert_mergeability_write_current(
+            session,
+            publication_id,
+            head_sha=request.head_sha,
+        )
+        if pull.mergeable is None:
+            raise DomainError("GitHub mergeability is still pending")
+        if request.mergeable is not pull.mergeable:
+            raise DomainError(
+                "reported mergeability does not match current GitHub state"
+            )
+        view = record_mergeability(
+            session,
+            publication_id,
+            head_sha=pull.head_sha,
+            mergeable=pull.mergeable,
+        )
+        _sync_publication_watch(session, publication_id)
+        return _payload(view)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="publication not found") from exc
+    except DomainError as exc:
+        raise _conflict(exc) from exc
+    except GitHubWebhookError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="GitHub mergeability readback failed closed",
+        ) from exc
 
 
 @app.post(
@@ -785,13 +1105,27 @@ def merge_execute(
     publication_id: str,
     session: Session = Depends(get_session),
     coordinator: MergeCoordinator = Depends(get_merge_coordinator),
+    gateway: GitHubWebhookGateway = Depends(get_github_authoritative_gateway),
 ):
     try:
-        return _payload(coordinator.merge(session, publication_id))
+        gateway.authorize_merge(session, publication_id)
+        view = coordinator.merge(session, publication_id)
+        _sync_publication_watch(session, publication_id)
+        return _payload(view)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="publication not found") from exc
     except DomainError as exc:
         raise _conflict(exc) from exc
+    except (
+        GitHubAuthError,
+        GitHubApiError,
+        CodexReviewError,
+        GitHubWebhookError,
+    ) as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="governed merge failed closed",
+        ) from exc
     except MergeError as exc:
         raise HTTPException(
             status_code=502,
@@ -806,14 +1140,29 @@ def merge_execute(
 def merge_reconcile(
     publication_id: str,
     session: Session = Depends(get_session),
-    coordinator: MergeCoordinator = Depends(get_merge_coordinator),
+    gateway: GitHubWebhookGateway = Depends(get_github_authoritative_gateway),
 ):
     try:
-        return _payload(coordinator.reconcile(session, publication_id))
+        result = gateway.reconcile_publication(session, publication_id)
+        if result.outcome in {
+            "MERGE_POLICY_VIOLATION",
+            "STALE_HEAD",
+            "STALE_BASE",
+        }:
+            raise MergeError("external merge failed authoritative preclassification")
+        view = get_view(session, publication_id)
+        _sync_publication_watch(session, publication_id)
+        return _payload(view)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="publication not found") from exc
     except DomainError as exc:
         raise _conflict(exc) from exc
+    except MergePolicyViolationRecorded as exc:
+        _sync_publication_watch(session, publication_id)
+        raise HTTPException(
+            status_code=502,
+            detail="merge reconciliation failed closed",
+        ) from exc
     except MergeError as exc:
         raise HTTPException(
             status_code=502,
@@ -919,6 +1268,42 @@ def remediation_work_package_claim(
 
 
 @app.post(
+    "/api/v1/internal/remediation/work-packages/{work_package_id}/pr-findings/adopt",
+    dependencies=[Depends(require_token)],
+)
+def remediation_work_package_adopt_pr_finding(
+    work_package_id: str,
+    request: AdoptHistoricalPRFindingRequest,
+    session: Session = Depends(get_session),
+    materializer: GitHubRemediationMaterializer = Depends(get_remediation_materializer),
+):
+    try:
+        view = adopt_historical_pr_finding(
+            session,
+            work_package_id,
+            reconciliation_id=request.reconciliation_id,
+            root_comment_id=request.root_comment_id,
+            principal_review_run_id=request.principal_review_run_id,
+            decision=request.decision,
+            reason=request.reason,
+            priority=request.priority,
+            idempotency_key=request.idempotency_key,
+        )
+        return _work_package_payload(
+            materializer.sync_issue_projection(session, view.work_package_id)
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="work package or receipt not found") from exc
+    except DomainError as exc:
+        raise _conflict(exc) from exc
+    except RemediationMaterializationError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="remediation status projection failed closed",
+        ) from exc
+
+
+@app.post(
     "/api/v1/internal/remediation/work-packages/{work_package_id}/implementation",
     dependencies=[Depends(require_token)],
 )
@@ -953,6 +1338,40 @@ def remediation_work_package_submit_implementation(
 
 
 @app.post(
+    "/api/v1/internal/remediation/work-packages/{work_package_id}/implementation/adopt-historical",
+    dependencies=[Depends(require_token)],
+)
+def remediation_work_package_adopt_historical_implementation(
+    work_package_id: str,
+    request: AdoptHistoricalImplementationRequest,
+    session: Session = Depends(get_session),
+    materializer: GitHubRemediationMaterializer = Depends(get_remediation_materializer),
+):
+    try:
+        view = adopt_historical_implementation(
+            session,
+            work_package_id,
+            candidate_id=request.candidate_id,
+            actor=request.actor,
+            reason=request.reason,
+            summary=request.summary,
+            idempotency_key=request.idempotency_key,
+        )
+        return _work_package_payload(
+            materializer.sync_issue_projection(session, view.work_package_id)
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="work package or candidate not found") from exc
+    except DomainError as exc:
+        raise _conflict(exc) from exc
+    except RemediationMaterializationError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="remediation status projection failed closed",
+        ) from exc
+
+
+@app.post(
     "/api/v1/internal/remediation/work-packages/{work_package_id}/successor-review",
     dependencies=[Depends(require_token)],
 )
@@ -971,6 +1390,38 @@ def remediation_work_package_start_verification(
             idempotency_key=request.idempotency_key,
             fallback_reviewer=request.fallback_reviewer,
             fallback_reason=request.fallback_reason,
+        )
+        return _work_package_payload(
+            materializer.sync_issue_projection(session, view.work_package_id)
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="work package not found") from exc
+    except DomainError as exc:
+        raise _conflict(exc) from exc
+    except RemediationMaterializationError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="remediation status projection failed closed",
+        ) from exc
+
+
+@app.post(
+    "/api/v1/internal/remediation/work-packages/{work_package_id}/principal-verification",
+    dependencies=[Depends(require_token)],
+)
+def remediation_work_package_start_principal_verification(
+    work_package_id: str,
+    request: StartPrincipalVerificationRequest,
+    session: Session = Depends(get_session),
+    materializer: GitHubRemediationMaterializer = Depends(get_remediation_materializer),
+):
+    try:
+        view = begin_principal_verification(
+            session,
+            work_package_id,
+            review_run_id=request.review_run_id,
+            head_sha=request.head_sha,
+            idempotency_key=request.idempotency_key,
         )
         return _work_package_payload(
             materializer.sync_issue_projection(session, view.work_package_id)
@@ -1027,13 +1478,28 @@ def remediation_finding_verify(
     session: Session = Depends(get_session),
 ):
     try:
+        if request.outcome.upper() in {"FIXED", "NOT_FIXED"}:
+            binding = get_work_package(session, work_package_id).principal_verification
+            reviewer = str((binding or {}).get("reviewer", "")).strip()
+            if not reviewer:
+                raise DomainError(
+                    "Principal reviewer identity is missing from the active ledger binding"
+                )
+            if request.reviewer is not None and request.reviewer.strip() != reviewer:
+                raise DomainError(
+                    "Principal verification reviewer is derived from the bound PLANE_REVIEW"
+                )
+        else:
+            if request.reviewer is None:
+                raise DomainError("successor verification reviewer is required")
+            reviewer = request.reviewer
         return _work_package_payload(
             verify_finding(
                 session,
                 work_package_id,
                 finding_id=finding_id,
                 outcome=request.outcome,
-                reviewer=request.reviewer,
+                reviewer=reviewer,
                 evidence=request.evidence,
                 idempotency_key=request.idempotency_key,
             )
@@ -1054,9 +1520,9 @@ def remediation_work_package_materialize(
     materializer: GitHubRemediationMaterializer = Depends(get_remediation_materializer),
 ):
     try:
-        return _work_package_payload(
-            materializer.materialize(session, work_package_id)
-        )
+        view = materializer.materialize(session, work_package_id)
+        _sync_publication_watch(session, view.publication_id)
+        return _work_package_payload(view)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="work package not found") from exc
     except DomainError as exc:

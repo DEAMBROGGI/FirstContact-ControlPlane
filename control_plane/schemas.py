@@ -52,11 +52,29 @@ class ClaimRemediationWorkPackageRequest(BaseModel):
     idempotency_key: str = Field(min_length=1, max_length=200)
 
 
+class AdoptHistoricalPRFindingRequest(BaseModel):
+    reconciliation_id: str = Field(min_length=1, max_length=36)
+    root_comment_id: int = Field(gt=0)
+    principal_review_run_id: str = Field(min_length=1, max_length=160)
+    decision: str = Field(min_length=1, max_length=20)
+    reason: str = Field(min_length=1, max_length=1000)
+    priority: str = Field(min_length=2, max_length=2)
+    idempotency_key: str = Field(min_length=1, max_length=200)
+
+
 class SubmitRemediationImplementationRequest(BaseModel):
     candidate_id: str = Field(min_length=1, max_length=36)
     head_sha: str
     summary: str = Field(min_length=1, max_length=4000)
     evidence_sha256: str
+    idempotency_key: str = Field(min_length=1, max_length=200)
+
+
+class AdoptHistoricalImplementationRequest(BaseModel):
+    candidate_id: str = Field(min_length=1, max_length=36)
+    actor: str = Field(min_length=1, max_length=200)
+    reason: str = Field(min_length=1, max_length=1000)
+    summary: str = Field(min_length=1, max_length=4000)
     idempotency_key: str = Field(min_length=1, max_length=200)
 
 
@@ -68,9 +86,15 @@ class StartSuccessorVerificationRequest(BaseModel):
     fallback_reason: str | None = Field(default=None, min_length=1, max_length=1000)
 
 
+class StartPrincipalVerificationRequest(BaseModel):
+    review_run_id: str = Field(min_length=1, max_length=160)
+    head_sha: str
+    idempotency_key: str = Field(min_length=1, max_length=200)
+
+
 class VerifyRemediationFindingRequest(BaseModel):
     outcome: str
-    reviewer: str = Field(min_length=1, max_length=200)
+    reviewer: str | None = Field(default=None, min_length=1, max_length=200)
     evidence: str = Field(min_length=1, max_length=4000)
     idempotency_key: str = Field(min_length=1, max_length=200)
 

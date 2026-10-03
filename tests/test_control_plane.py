@@ -1,4 +1,5 @@
 import uuid
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy.dialects import postgresql
@@ -12,12 +13,14 @@ from control_plane.domain import (
     ReviewDecision,
     ValidationStatus,
 )
+from control_plane.github_api import PullRequestSnapshot
 from control_plane.models import CandidateRow, CandidateSourceRow, EventRow, PublicationRow
 from control_plane.plane_review import (
     complete_plane_review_materialization,
     record_plane_review,
 )
 from control_plane.profile_registry import all_profiles, profile_for_repository
+from control_plane.pr_findings import reconcile_pr_findings
 from control_plane.repository import append_event, load_events
 from control_plane.quarantine import VerifiedCandidateSource
 from control_plane.service import (
@@ -82,13 +85,38 @@ def successor_source():
 
 def published_publication(session, issue_number=42):
     view = admitted_publication(session, issue_number=issue_number)
-    return mark_remote_published(
+    view = mark_remote_published(
         session,
         view.publication_id,
         view.current_candidate.head_sha,
         branch=f"control-plane/issue-{issue_number}-canonical",
         base_branch="master",
         pull_request_number=13,
+    )
+    _reconcile_empty_pr_findings(session, view)
+    return view
+
+
+def _reconcile_empty_pr_findings(session, view):
+    github = SimpleNamespace(
+        pull_request=lambda repository, number, token: PullRequestSnapshot(
+            number=view.pull_request_number,
+            state="open",
+            base_ref=view.base_branch,
+            head_ref=view.remote_branch,
+            head_sha=view.remote_head_sha,
+            base_sha=BASE,
+        ),
+        ref_sha=lambda repository, branch, token: BASE,
+        list_pull_reviews=lambda repository, number, token: [],
+        list_pull_review_comments=lambda repository, number, token: [],
+        list_pull_review_threads=lambda repository, number, token: [],
+    )
+    return reconcile_pr_findings(
+        session,
+        view.publication_id,
+        github=github,
+        token="test-installation-token",
     )
 
 
@@ -190,7 +218,15 @@ def test_same_candidate_submission_is_idempotent(session):
     assert first.current_candidate == second.current_candidate
 def test_review_is_exact_remote_head_bound(session):
     view = admitted_publication(session)
-    view = mark_remote_published(session, view.publication_id, HEAD)
+    view = mark_remote_published(
+        session,
+        view.publication_id,
+        HEAD,
+        branch="control-plane/issue-42-canonical",
+        base_branch="master",
+        pull_request_number=13,
+    )
+    _reconcile_empty_pr_findings(session, view)
     assert view.state is PublicationState.IN_REVIEW
     with pytest.raises(DomainError, match="stale"):
         record_review(
@@ -214,6 +250,147 @@ def test_review_is_exact_remote_head_bound(session):
     )
     assert ready.state is PublicationState.READY_TO_MERGE
     assert ready.projection.project == "Review"
+
+
+@pytest.mark.parametrize("was_ready", [False, True])
+def test_changes_requested_revokes_approval_without_erasing_evidence(
+    session,
+    was_ready,
+):
+    view = published_publication(session)
+    approved = record_review(
+        session,
+        view.publication_id,
+        reviewed_head_sha=HEAD,
+        decision=ReviewDecision.APPROVED,
+    )
+    if was_ready:
+        approved = record_mergeability(
+            session,
+            view.publication_id,
+            head_sha=HEAD,
+            mergeable=True,
+        )
+        assert approved.state is PublicationState.READY_TO_MERGE
+    events_before = load_events(session, view.publication_id)
+
+    demoted = record_review(
+        session,
+        view.publication_id,
+        reviewed_head_sha=HEAD,
+        decision=ReviewDecision.CHANGES_REQUIRED,
+    )
+
+    events_after = load_events(session, view.publication_id)
+    review_events = [
+        event
+        for event in events_after
+        if event["event_type"] == EventType.REVIEW_RECORDED.value
+    ]
+    assert demoted.state is PublicationState.CHANGES_REQUIRED
+    assert demoted.review_decision is ReviewDecision.CHANGES_REQUIRED
+    assert events_after[:-1] == events_before
+    assert [event["payload"]["decision"] for event in review_events] == [
+        ReviewDecision.APPROVED.value,
+        ReviewDecision.CHANGES_REQUIRED.value,
+    ]
+    if was_ready:
+        assert demoted.mergeable is True
+        assert sum(
+            event["event_type"] == EventType.MERGEABILITY_RECORDED.value
+            for event in events_after
+        ) == 1
+    else:
+        assert demoted.mergeable is None
+
+    with pytest.raises(DomainError, match="merge requires READY_TO_MERGE state"):
+        record_merged(
+            session,
+            view.publication_id,
+            head_sha=HEAD,
+            pull_request_number=13,
+            merge_commit_sha="9" * 40,
+            source="PLANE_MERGE",
+        )
+    with pytest.raises(DomainError, match="review requires IN_REVIEW state"):
+        record_review(
+            session,
+            view.publication_id,
+            reviewed_head_sha=HEAD,
+            decision=ReviewDecision.APPROVED,
+        )
+    assert get_view(session, view.publication_id).state is PublicationState.CHANGES_REQUIRED
+
+
+def test_changes_required_does_not_require_codex_pass(session):
+    view = published_publication(session)
+    running = request_codex_review(
+        session,
+        view.publication_id,
+        mode="required",
+        expected_head_sha=HEAD,
+    )
+    assert running.automated_review_status is AutomatedReviewStatus.RUNNING
+
+    changes = record_review(
+        session,
+        view.publication_id,
+        reviewed_head_sha=HEAD,
+        decision=ReviewDecision.CHANGES_REQUIRED,
+        require_codex_review=True,
+    )
+
+    assert changes.state is PublicationState.CHANGES_REQUIRED
+    assert changes.automated_review_status is AutomatedReviewStatus.RUNNING
+
+
+def test_reapproval_after_changes_requires_successor_and_codex_pass(session):
+    first = published_publication(session, issue_number=55)
+    changes = record_review(
+        session,
+        first.publication_id,
+        reviewed_head_sha=HEAD,
+        decision=ReviewDecision.CHANGES_REQUIRED,
+    )
+    with pytest.raises(
+        DomainError,
+        match="required Codex review has not passed or been adjudicated",
+    ):
+        record_review(
+            session,
+            first.publication_id,
+            reviewed_head_sha=HEAD,
+            decision=ReviewDecision.APPROVED,
+            require_codex_review=True,
+        )
+
+    submit_verified_candidate(
+        session,
+        first.publication_id,
+        successor_source(),
+    )
+    admitted = admit_current_candidate(session, first.publication_id)
+    republished = mark_remote_published(
+        session,
+        first.publication_id,
+        admitted.current_candidate.head_sha,
+        branch=first.remote_branch,
+        base_branch=first.base_branch,
+        pull_request_number=first.pull_request_number,
+    )
+    _reconcile_empty_pr_findings(session, republished)
+    reviewed = pass_codex_review(session, republished)
+    approved = record_review(
+        session,
+        first.publication_id,
+        reviewed_head_sha=reviewed.remote_head_sha,
+        decision=ReviewDecision.APPROVED,
+        require_codex_review=True,
+    )
+
+    assert changes.state is PublicationState.CHANGES_REQUIRED
+    assert reviewed.state is PublicationState.IN_REVIEW
+    assert approved.state is PublicationState.APPROVED
 
 
 def test_hash_chain_tamper_fails_closed(session):
@@ -462,6 +639,7 @@ def test_ready_to_merge_successor_invalidates_mergeability_and_stale_approval(se
         base_branch=first.base_branch,
         pull_request_number=first.pull_request_number,
     )
+    _reconcile_empty_pr_findings(session, republished)
     assert republished.state is PublicationState.IN_REVIEW
     with pytest.raises(DomainError, match="stale"):
         record_review(
@@ -576,6 +754,7 @@ def test_codex_pass_from_old_head_does_not_satisfy_successor_review(session):
         base_branch=first.base_branch,
         pull_request_number=first.pull_request_number,
     )
+    _reconcile_empty_pr_findings(session, published)
 
     assert published.automated_review_status is None
     assert published.automated_review_head_sha is None
@@ -1234,6 +1413,7 @@ def test_merged_is_inactive_for_canonical_publication_resolution(session):
         base_branch="master",
         pull_request_number=66,
     )
+    _reconcile_empty_pr_findings(session, published)
     approved = record_review(
         session,
         original.publication_id,
@@ -1380,6 +1560,7 @@ def test_required_human_approval_rejects_stale_plane_fallback(session):
         base_branch=first.base_branch,
         pull_request_number=first.pull_request_number,
     )
+    _reconcile_empty_pr_findings(session, successor)
     _mark_required_codex_unavailable(session, successor)
 
     with pytest.raises(DomainError, match="required Codex review has not passed"):

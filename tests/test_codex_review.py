@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 from pydantic import SecretStr
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.schema import CreateTable
+from fastapi.testclient import TestClient
 
 import control_plane.codex_review as codex_review_module
+import control_plane.remediation as remediation_module
+from control_plane.config import settings
 from control_plane.codex_review import (
     CodexReviewBroker,
     CodexReviewError,
@@ -33,8 +37,11 @@ from control_plane.github_app import InstallationAccess
 from control_plane.github_review_auth import (
     GitHubReviewTokenProvider,
 )
+from control_plane.github_webhook import _derive_next
 from control_plane.models import CodexReviewDispatchRow
+from control_plane.main import app, get_codex_review_broker, get_session
 from control_plane.profile_registry import profile_for_repository
+from control_plane.pr_findings import reconcile_pr_findings
 from control_plane.quarantine import VerifiedCandidateSource
 from control_plane.repository import load_events
 from control_plane.service import (
@@ -42,6 +49,7 @@ from control_plane.service import (
     fence_codex_review_trigger_dispatch,
     create_publication,
     get_view,
+    invalidate_codex_review,
     mark_remote_published,
     mark_codex_review_unavailable,
     record_review,
@@ -81,13 +89,38 @@ def published_publication(session):
             status=ValidationStatus.PASS,
             evidence_sha256=f"{index:064x}",
         )
-    return mark_remote_published(
+    view = mark_remote_published(
         session,
         view.publication_id,
         HEAD,
         branch="control-plane/issue-88-abcd1234",
         base_branch="master",
         pull_request_number=44,
+    )
+    _reconcile_empty_pr_findings(session, view)
+    return view
+
+
+def _reconcile_empty_pr_findings(session, view):
+    github = SimpleNamespace(
+        pull_request=lambda repository, number, token: PullRequestSnapshot(
+            number=view.pull_request_number,
+            state="open",
+            base_ref=view.base_branch,
+            head_ref=view.remote_branch,
+            head_sha=view.remote_head_sha,
+            base_sha=BASE,
+        ),
+        ref_sha=lambda repository, branch, token: BASE,
+        list_pull_reviews=lambda repository, number, token: [],
+        list_pull_review_comments=lambda repository, number, token: [],
+        list_pull_review_threads=lambda repository, number, token: [],
+    )
+    return reconcile_pr_findings(
+        session,
+        view.publication_id,
+        github=github,
+        token="test-installation-token",
     )
 
 
@@ -141,6 +174,7 @@ class FakeGitHub:
             base_ref="master",
             head_ref="control-plane/issue-88-abcd1234",
             head_sha=head_sha,
+            base_sha=BASE,
         )
 
     def list_issue_comments(self, repository, number, token):
@@ -197,6 +231,47 @@ def broker(
         trigger_user=trigger_user,
     )
     return value, token_provider, github
+
+
+def test_open_remediation_blocks_codex_request_before_run_or_dispatch_lease(
+    session,
+    monkeypatch,
+):
+    view = published_publication(session)
+    value, tokens, github = broker()
+    before_events = load_events(session, view.publication_id)
+    original_overrides = app.dependency_overrides.copy()
+    monkeypatch.setattr(
+        remediation_module,
+        "publication_has_unresolved_remediation_findings",
+        lambda *_args: True,
+    )
+    monkeypatch.setattr(settings, "codex_review_mode", "required")
+
+    def override_session():
+        yield session
+
+    app.dependency_overrides[get_session] = override_session
+    app.dependency_overrides[get_codex_review_broker] = lambda: value
+
+    try:
+        response = TestClient(app).post(
+            f"/api/v1/internal/publications/{view.publication_id}/codex-review/request",
+            headers={"X-Control-Plane-Token": settings.internal_token},
+        )
+
+        assert response.status_code == 409
+        assert "remediation findings remain unresolved" in response.json()["detail"]
+    finally:
+        app.dependency_overrides.clear()
+        app.dependency_overrides.update(original_overrides)
+
+    assert load_events(session, view.publication_id) == before_events
+    assert get_view(session, view.publication_id).automated_review_status is None
+    assert tokens.requests == []
+    assert github.pull_request_requests == 0
+    assert github.posted_bodies == []
+    assert session.query(CodexReviewDispatchRow).count() == 0
 
 
 def remove_trigger_credential(value):
@@ -560,6 +635,32 @@ def test_required_mode_blocks_human_review_before_codex_pass(session):
         )
 
 
+@pytest.mark.parametrize(
+    ("decision", "require_codex_review", "expected_state"),
+    [
+        (ReviewDecision.APPROVED, False, PublicationState.APPROVED),
+        (ReviewDecision.CHANGES_REQUIRED, True, PublicationState.CHANGES_REQUIRED),
+    ],
+)
+def test_direct_review_only_requires_codex_adjudication_for_required_approval(
+    session,
+    decision,
+    require_codex_review,
+    expected_state,
+):
+    view = published_publication(session)
+
+    reviewed = record_review(
+        session,
+        view.publication_id,
+        reviewed_head_sha=HEAD,
+        decision=decision,
+        require_codex_review=require_codex_review,
+    )
+
+    assert reviewed.state is expected_state
+
+
 def test_clean_native_codex_review_releases_human_review(session):
     view = published_publication(session)
     value, _tokens, github = broker()
@@ -579,6 +680,162 @@ def test_clean_native_codex_review_releases_human_review(session):
         require_codex_review=True,
     )
     assert approved.state is PublicationState.APPROVED
+
+
+def test_body_only_codex_finding_requires_changes_and_is_ledgered(session):
+    view = published_publication(session)
+    value, _tokens, github = broker()
+    running = value.request(session, view.publication_id)
+    body = (
+        "## Review findings\n\n"
+        "### [P1] Keep ambiguous Codex invocations out of fallback\n\n"
+        "An unmanaged invocation can make the generic exception handler record "
+        "CODEX_TRIGGER_UNAVAILABLE, making required-mode Principal Reviewer "
+        "fallback eligible.\n\n"
+        "## Summary\n\nThe remaining review notes are informational.\n"
+    )
+    github.reviews.append(
+        PullReviewSnapshot(
+            review_id=710,
+            actor=CODEX_ACTOR,
+            body=body,
+            state="COMMENTED",
+            commit_id=HEAD,
+            submitted_at="2026-09-27T20:01:00Z",
+        )
+    )
+
+    observed = value.reconcile(session, view.publication_id)
+    after = get_view(session, view.publication_id)
+    completed = next(
+        event
+        for event in load_events(session, view.publication_id)
+        if event["event_type"] == "CODEX_REVIEW_COMPLETED"
+        and event["payload"]["run_id"] == running.automated_review_run_id
+    )
+    finding = completed["payload"]["findings"][0]
+
+    assert observed.state == "CHANGES_REQUIRED"
+    assert after.automated_review_findings_count == 1
+    assert finding["source_kind"] == "REVIEW_BODY"
+    assert finding["provider_review_id"] == 710
+    assert "provider_comment_id" not in finding
+    assert finding["finding_id"].startswith(
+        f"codex-body:run-{running.automated_review_run_id}:head-{HEAD}:review-710:"
+    )
+    assert finding["provider_body_sha256"]
+
+
+def test_equivalent_inline_and_review_body_findings_are_not_duplicated(session):
+    view = published_publication(session)
+    value, _tokens, github = broker()
+    value.request(session, view.publication_id)
+    finding_body = (
+        "### [P1] Keep ambiguous Codex invocations out of fallback\n\n"
+        "An unmanaged invocation can make the generic exception handler record "
+        "CODEX_TRIGGER_UNAVAILABLE, making required-mode Principal Reviewer "
+        "fallback eligible."
+    )
+    github.reviews.append(
+        PullReviewSnapshot(
+            review_id=711,
+            actor=CODEX_ACTOR,
+            body=f"## Findings\n\n{finding_body}",
+            state="COMMENTED",
+            commit_id=HEAD,
+            submitted_at="2026-09-27T20:01:00Z",
+        )
+    )
+    github.review_comments.append(
+        PullReviewCommentSnapshot(
+            comment_id=712,
+            review_id=711,
+            actor=CODEX_ACTOR,
+            body=finding_body,
+            commit_id=HEAD,
+            path="control_plane/codex_review.py",
+            line=700,
+            created_at="2026-09-27T20:01:01Z",
+        )
+    )
+
+    value.reconcile(session, view.publication_id)
+
+    after = get_view(session, view.publication_id)
+    assert after.automated_review_findings_count == 1
+
+
+@pytest.mark.parametrize("surface", ["review", "reaction"])
+def test_terminal_codex_pass_is_invalidated_when_expected_evidence_disappears(
+    session,
+    surface,
+):
+    view = published_publication(session)
+    value, _tokens, github = broker()
+    value.request(session, view.publication_id)
+    if surface == "review":
+        github.reviews.append(
+            PullReviewSnapshot(
+                review_id=713,
+                actor=CODEX_ACTOR,
+                body="Review passed.",
+                state="COMMENTED",
+                commit_id=HEAD,
+                submitted_at="2026-09-27T20:01:00Z",
+            )
+        )
+    else:
+        github.reactions.append(
+            IssueReactionSnapshot(
+                reaction_id=714,
+                actor=CODEX_ACTOR,
+                content="+1",
+                created_at="2026-09-27T20:01:00Z",
+            )
+        )
+    assert value.reconcile(session, view.publication_id).state == "PASS"
+
+    if surface == "review":
+        github.reviews.clear()
+    else:
+        github.reactions.clear()
+
+    observed = value.reconcile(session, view.publication_id)
+
+    assert observed.state == "INVALIDATED"
+    assert get_view(
+        session,
+        view.publication_id,
+    ).automated_review_status is AutomatedReviewStatus.UNAVAILABLE
+
+
+def test_terminal_codex_pass_is_invalidated_when_review_body_changes(session):
+    view = published_publication(session)
+    value, _tokens, github = broker()
+    value.request(session, view.publication_id)
+    review = PullReviewSnapshot(
+        review_id=715,
+        actor=CODEX_ACTOR,
+        body="Review passed.",
+        state="COMMENTED",
+        commit_id=HEAD,
+        submitted_at="2026-09-27T20:01:00Z",
+    )
+    github.reviews.append(review)
+    assert value.reconcile(session, view.publication_id).state == "PASS"
+
+    github.reviews[0] = PullReviewSnapshot(
+        review_id=review.review_id,
+        actor=review.actor,
+        body="Changed provider evidence.",
+        state=review.state,
+        commit_id=review.commit_id,
+        submitted_at=review.submitted_at,
+    )
+
+    observed = value.reconcile(session, view.publication_id)
+
+    assert observed.state == "INVALIDATED"
 
 
 def test_clean_codex_thumbsup_reaction_can_complete_pass(session):
@@ -870,8 +1127,169 @@ def test_same_second_unmanaged_codex_invocation_blocks_governed_trigger(session)
         value.request(session, view.publication_id)
 
     assert github.posted_bodies == []
-    after = get_view(session, view.publication_id)
-    assert after.automated_review_status is AutomatedReviewStatus.UNAVAILABLE
+    events = load_events(session, view.publication_id)
+    assert any(
+        event["event_type"] == "CODEX_REVIEW_INVALIDATED"
+        for event in events
+    )
+    assert not any(
+        event["event_type"] == "CODEX_REVIEW_UNAVAILABLE"
+        for event in events
+    )
+
+
+def test_malformed_unmanaged_codex_invocation_invalidates_without_fallback(session):
+    view = published_publication(session)
+    github = FakeGitHub()
+    github.issue_comments.append(
+        IssueCommentSnapshot(
+            comment_id=851,
+            actor="DEAMBROGGI",
+            body="@codex review",
+            created_at="not-a-timestamp",
+        )
+    )
+    value, _tokens, github = broker(github=github)
+
+    with pytest.raises(CodexReviewError, match="failed closed"):
+        value.request(session, view.publication_id)
+
+    current = get_view(session, view.publication_id)
+    events = load_events(session, view.publication_id)
+    invalidations = [
+        event
+        for event in events
+        if event["event_type"] == "CODEX_REVIEW_INVALIDATED"
+    ]
+    assert len(invalidations) == 1
+    assert invalidations[0]["payload"]["reason"] == "CODEX_AMBIGUOUS_INVOCATION"
+    assert invalidations[0]["payload"]["evidence_ids"] == [851]
+    assert not any(
+        event["event_type"] == "CODEX_REVIEW_UNAVAILABLE"
+        for event in events
+    )
+    assert current.state is PublicationState.CHANGES_REQUIRED
+    assert current.review_decision is None
+    assert github.posted_bodies == []
+    assert _derive_next(
+        session,
+        view.publication_id,
+        codex_review_mode="required",
+    ) == ("IMPLEMENTER", "REMEDIATE_FINDINGS")
+
+    invalidate_codex_review(
+        session,
+        view.publication_id,
+        run_id=current.automated_review_run_id,
+        reviewed_head_sha=current.automated_review_head_sha,
+        reason="CODEX_AMBIGUOUS_INVOCATION",
+        evidence_ids=[851],
+    )
+    repeated_events = load_events(session, view.publication_id)
+    assert sum(
+        event["event_type"] == "CODEX_REVIEW_INVALIDATED"
+        for event in repeated_events
+    ) == 1
+
+
+def test_malformed_timestamp_on_non_codex_comment_does_not_block_trigger(session):
+    view = published_publication(session)
+    github = FakeGitHub()
+    github.issue_comments.append(
+        IssueCommentSnapshot(
+            comment_id=852,
+            actor="DEAMBROGGI",
+            body="Ordinary review coordination note",
+            created_at="not-a-timestamp",
+        )
+    )
+    value, _tokens, github = broker(github=github)
+
+    triggered = value.request(session, view.publication_id)
+
+    assert triggered.automated_review_status is AutomatedReviewStatus.RUNNING
+    assert len(github.posted_bodies) == 1
+    assert not any(
+        event["event_type"] in {
+            "CODEX_REVIEW_INVALIDATED",
+            "CODEX_REVIEW_UNAVAILABLE",
+        }
+        for event in load_events(session, view.publication_id)
+    )
+
+
+def test_malformed_unmanaged_codex_invocation_invalidates_during_reconcile(session):
+    view = published_publication(session)
+    value, _tokens, github = broker()
+    running = value.request(session, view.publication_id)
+    trigger_comment_id = running.automated_review_trigger_comment_id
+    assert trigger_comment_id is not None
+    github.issue_comments.append(
+        IssueCommentSnapshot(
+            comment_id=853,
+            actor="DEAMBROGGI",
+            body="@codex review",
+            created_at="not-a-timestamp",
+        )
+    )
+
+    observed = value.reconcile(session, view.publication_id)
+
+    current = get_view(session, view.publication_id)
+    events = load_events(session, view.publication_id)
+    invalidation = next(
+        event
+        for event in events
+        if event["event_type"] == "CODEX_REVIEW_INVALIDATED"
+    )
+    assert observed.state == "INVALIDATED"
+    assert invalidation["payload"]["reason"] == "CODEX_AMBIGUOUS_INVOCATION"
+    assert invalidation["payload"]["evidence_ids"] == [853]
+    assert current.state is PublicationState.CHANGES_REQUIRED
+    assert _derive_next(
+        session,
+        view.publication_id,
+        codex_review_mode="required",
+    ) == ("IMPLEMENTER", "REMEDIATE_FINDINGS")
+    assert not any(
+        event["event_type"] == "CODEX_REVIEW_UNAVAILABLE"
+        for event in events
+    )
+
+
+def test_genuine_trigger_readback_failure_remains_unavailable(session):
+    class TriggerReadbackFailureGitHub(FakeGitHub):
+        def __init__(self):
+            super().__init__()
+            self.trigger_pull_requests = 0
+
+        def pull_request(self, repository, number, token):
+            self.trigger_pull_requests += 1
+            if self.trigger_pull_requests == 2:
+                raise GitHubApiError("temporary trigger pull read failure")
+            return super().pull_request(repository, number, token)
+
+    view = published_publication(session)
+    github = TriggerReadbackFailureGitHub()
+    value, _tokens, github = broker(github=github)
+
+    with pytest.raises(CodexReviewError, match="failed closed"):
+        value.request(session, view.publication_id)
+
+    current = get_view(session, view.publication_id)
+    events = load_events(session, view.publication_id)
+    unavailable = [
+        event
+        for event in events
+        if event["event_type"] == "CODEX_REVIEW_UNAVAILABLE"
+    ]
+    assert current.automated_review_status is AutomatedReviewStatus.UNAVAILABLE
+    assert len(unavailable) == 1
+    assert unavailable[0]["payload"]["reason"] == "CODEX_TRIGGER_UNAVAILABLE"
+    assert not any(
+        event["event_type"] == "CODEX_REVIEW_INVALIDATED"
+        for event in events
+    )
 
 
 def test_stale_locked_codex_head_check_closes_external_verification_race(
@@ -912,6 +1330,7 @@ def test_stale_locked_codex_head_check_closes_external_verification_race(
             base_branch=view.base_branch,
             pull_request_number=view.pull_request_number,
         )
+        _reconcile_empty_pr_findings(session, get_view(session, view.publication_id))
         return original_request(*args, **kwargs)
 
     monkeypatch.setattr(
@@ -1055,6 +1474,10 @@ def test_successor_head_gets_new_codex_run_and_old_trigger_remains_historical(se
         branch=first.remote_branch,
         base_branch=first.base_branch,
         pull_request_number=first.pull_request_number,
+    )
+    _reconcile_empty_pr_findings(
+        session,
+        get_view(session, first.publication_id),
     )
     github.head_sha = head_b
 

@@ -24,6 +24,32 @@ class PullRequestSnapshot:
     head_sha: str
     merged: bool = False
     merge_commit_sha: str | None = None
+    mergeable: bool | None = None
+    base_sha: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PullReviewThreadSnapshot:
+    thread_node_id: str
+    is_resolved: bool
+    comment_ids: tuple[int, ...]
+    root_comment_id: int
+
+
+@dataclass(frozen=True, slots=True)
+class GitHubCommitSnapshot:
+    sha: str
+    tree_sha: str
+    parents: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class GitHubCommitComparisonSnapshot:
+    base_sha: str
+    head_sha: str
+    merge_base_sha: str
+    ahead_by: int
+    behind_by: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +100,7 @@ class PullReviewCommentSnapshot:
     line: int | None
     created_at: str
     in_reply_to_id: int | None = None
+    side: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -270,6 +297,110 @@ class GitHubRepositoryGateway:
         if len(value) != 40 or any(c not in "0123456789abcdef" for c in value):
             raise GitHubApiError("GitHub ref SHA is invalid")
         return value
+
+    def commit(
+        self,
+        repository: str,
+        sha: str,
+        token: str,
+    ) -> GitHubCommitSnapshot:
+        requested_sha = sha.lower()
+        if len(requested_sha) != 40 or any(
+            char not in "0123456789abcdef" for char in requested_sha
+        ):
+            raise GitHubApiError("GitHub commit SHA is invalid")
+        owner, name = self._parts(repository)
+        response = self._request(
+            "GET",
+            f"{self.api_url}/repos/{owner}/{name}/commits/{requested_sha}",
+            token=token,
+        )
+        assert response is not None
+        try:
+            payload = response.json()
+            if not isinstance(payload, dict):
+                raise ValueError("invalid commit payload")
+            result_sha = str(payload["sha"]).lower()
+            tree_sha = str(payload["commit"]["tree"]["sha"]).lower()
+            raw_parents = payload["parents"]
+            if not isinstance(raw_parents, list):
+                raise ValueError("invalid commit parents")
+            parents = tuple(str(item["sha"]).lower() for item in raw_parents)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise GitHubApiError("GitHub commit response is invalid") from exc
+        if result_sha != requested_sha:
+            raise GitHubApiError("GitHub commit response SHA is inconsistent")
+        for value in (result_sha, tree_sha, *parents):
+            if len(value) != 40 or any(
+                char not in "0123456789abcdef" for char in value
+            ):
+                raise GitHubApiError("GitHub commit response SHA is invalid")
+        if len(set(parents)) != len(parents):
+            raise GitHubApiError("GitHub commit parents are ambiguous")
+        return GitHubCommitSnapshot(
+            sha=result_sha,
+            tree_sha=tree_sha,
+            parents=parents,
+        )
+
+    def compare_commits(
+        self,
+        repository: str,
+        base_sha: str,
+        head_sha: str,
+        token: str,
+    ) -> GitHubCommitComparisonSnapshot:
+        requested_base = base_sha.lower()
+        requested_head = head_sha.lower()
+        for value in (requested_base, requested_head):
+            if len(value) != 40 or any(
+                char not in "0123456789abcdef" for char in value
+            ):
+                raise GitHubApiError("GitHub compare commit SHA is invalid")
+        owner, name = self._parts(repository)
+        response = self._request(
+            "GET",
+            f"{self.api_url}/repos/{owner}/{name}/compare/"
+            f"{requested_base}...{requested_head}",
+            token=token,
+        )
+        assert response is not None
+        try:
+            payload = response.json()
+            if not isinstance(payload, dict):
+                raise ValueError("invalid compare payload")
+            result_base = str(payload["base_commit"]["sha"]).lower()
+            result_head = str(payload["head_commit"]["sha"]).lower()
+            merge_base = str(payload["merge_base_commit"]["sha"]).lower()
+            ahead_by = payload["ahead_by"]
+            behind_by = payload["behind_by"]
+            if (
+                isinstance(ahead_by, bool)
+                or not isinstance(ahead_by, int)
+                or isinstance(behind_by, bool)
+                or not isinstance(behind_by, int)
+                or ahead_by < 0
+                or behind_by < 0
+            ):
+                raise ValueError("invalid compare counts")
+        except (KeyError, TypeError, ValueError) as exc:
+            raise GitHubApiError("GitHub commit comparison response is invalid") from exc
+        if result_base != requested_base or result_head != requested_head:
+            raise GitHubApiError("GitHub commit comparison identity is inconsistent")
+        if any(
+            len(value) != 40
+            or any(char not in "0123456789abcdef" for char in value)
+            for value in (result_base, result_head, merge_base)
+        ):
+            raise GitHubApiError("GitHub commit comparison SHA is invalid")
+        return GitHubCommitComparisonSnapshot(
+            base_sha=result_base,
+            head_sha=result_head,
+            merge_base_sha=merge_base,
+            ahead_by=ahead_by,
+            behind_by=behind_by,
+        )
+
     def _pull_snapshot(self, payload: dict) -> PullRequestSnapshot:
         try:
             merge_commit_sha = (
@@ -277,6 +408,9 @@ class GitHubRepositoryGateway:
                 if payload.get("merge_commit_sha") is not None
                 else None
             )
+            mergeable = payload.get("mergeable")
+            if mergeable is not None and not isinstance(mergeable, bool):
+                raise ValueError("invalid mergeable value")
             snapshot = PullRequestSnapshot(
                 number=int(payload["number"]),
                 state=str(payload["state"]),
@@ -285,6 +419,12 @@ class GitHubRepositoryGateway:
                 head_sha=str(payload["head"]["sha"]).lower(),
                 merged=bool(payload.get("merged", False)),
                 merge_commit_sha=merge_commit_sha,
+                mergeable=mergeable,
+                base_sha=(
+                    str(payload["base"]["sha"]).lower()
+                    if payload["base"].get("sha") is not None
+                    else None
+                ),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise GitHubApiError("GitHub pull request response is invalid") from exc
@@ -292,6 +432,11 @@ class GitHubRepositoryGateway:
             c not in "0123456789abcdef" for c in snapshot.head_sha
         ):
             raise GitHubApiError("GitHub pull request head SHA is invalid")
+        if snapshot.base_sha is not None and (
+            len(snapshot.base_sha) != 40
+            or any(c not in "0123456789abcdef" for c in snapshot.base_sha)
+        ):
+            raise GitHubApiError("GitHub pull request base SHA is invalid")
         if snapshot.merge_commit_sha is not None and (
             len(snapshot.merge_commit_sha) != 40
             or any(
@@ -1177,6 +1322,11 @@ class GitHubRepositoryGateway:
                     if payload.get("in_reply_to_id") is not None
                     else None
                 ),
+                side=(
+                    str(payload["side"])
+                    if payload.get("side") is not None
+                    else None
+                ),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise GitHubApiError(
@@ -1196,6 +1346,216 @@ class GitHubRepositoryGateway:
             params={"per_page": "100"},
         )
         return [self._pull_review_comment_snapshot(item) for item in payload]
+
+    def list_pull_review_threads(
+        self,
+        repository: str,
+        pull_number: int,
+        token: str,
+    ) -> list[PullReviewThreadSnapshot]:
+        if pull_number <= 0:
+            raise GitHubApiError("pull request number is invalid")
+        owner, name = self._parts(repository)
+        graphql_url = self.api_url
+        if graphql_url.endswith("/api/v3"):
+            graphql_url = graphql_url[:-7] + "/api/graphql"
+        else:
+            graphql_url += "/graphql"
+
+        threads_query = """
+        query($owner: String!, $name: String!, $number: Int!, $after: String) {
+          repository(owner: $owner, name: $name) {
+            pullRequest(number: $number) {
+              reviewThreads(first: 100, after: $after) {
+                nodes {
+                  id
+                  isResolved
+                  comments(first: 100) {
+                    nodes { databaseId }
+                    pageInfo { endCursor hasNextPage }
+                  }
+                }
+                pageInfo { endCursor hasNextPage }
+              }
+            }
+          }
+        }
+        """
+        comments_query = """
+        query($threadId: ID!, $after: String) {
+          node(id: $threadId) {
+            ... on PullRequestReviewThread {
+              id
+              comments(first: 100, after: $after) {
+                nodes { databaseId }
+                pageInfo { endCursor hasNextPage }
+              }
+            }
+          }
+        }
+        """
+
+        def graphql(query: str, variables: dict) -> dict:
+            try:
+                response = self.client.request(
+                    "POST",
+                    graphql_url,
+                    headers=self._headers(token),
+                    json={"query": query, "variables": variables},
+                )
+            except httpx.HTTPError as exc:
+                raise GitHubApiError("GitHub review thread listing failed") from exc
+            if response.status_code < 200 or response.status_code >= 300:
+                raise GitHubApiError(
+                    "GitHub review thread listing failed with "
+                    f"HTTP {response.status_code}"
+                )
+            try:
+                payload = response.json()
+                if not isinstance(payload, dict) or payload.get("errors"):
+                    raise ValueError("GraphQL error")
+                data = payload["data"]
+                if not isinstance(data, dict):
+                    raise ValueError("GraphQL data is invalid")
+                return data
+            except (KeyError, TypeError, ValueError) as exc:
+                raise GitHubApiError(
+                    "GitHub review thread response is invalid"
+                ) from exc
+
+        def read_connection(connection: object) -> tuple[list, bool, str | None]:
+            if not isinstance(connection, dict):
+                raise GitHubApiError("GitHub review thread connection is invalid")
+            nodes = connection.get("nodes")
+            page_info = connection.get("pageInfo")
+            if not isinstance(nodes, list) or not isinstance(page_info, dict):
+                raise GitHubApiError("GitHub review thread page is invalid")
+            has_next = page_info.get("hasNextPage")
+            cursor = page_info.get("endCursor")
+            if not isinstance(has_next, bool) or (
+                cursor is not None and (not isinstance(cursor, str) or not cursor)
+            ):
+                raise GitHubApiError("GitHub review thread cursor is invalid")
+            if has_next and cursor is None:
+                raise GitHubApiError("GitHub review thread next-page cursor is missing")
+            return nodes, has_next, cursor
+
+        def read_comment_id(node: object) -> int:
+            if not isinstance(node, dict):
+                raise GitHubApiError("GitHub review thread comment is invalid")
+            database_id = node.get("databaseId")
+            if (
+                isinstance(database_id, bool)
+                or not isinstance(database_id, int)
+                or database_id <= 0
+            ):
+                raise GitHubApiError("GitHub review thread comment identity is invalid")
+            return database_id
+
+        results: list[PullReviewThreadSnapshot] = []
+        seen_threads: set[str] = set()
+        comment_owners: dict[int, str] = {}
+        thread_cursor = None
+        seen_thread_cursors: set[str] = set()
+        for _ in range(100):
+            data = graphql(
+                threads_query,
+                {
+                    "owner": owner,
+                    "name": name,
+                    "number": pull_number,
+                    "after": thread_cursor,
+                },
+            )
+            try:
+                connection = data["repository"]["pullRequest"]["reviewThreads"]
+            except (KeyError, TypeError) as exc:
+                raise GitHubApiError(
+                    "GitHub review thread response is incomplete"
+                ) from exc
+            nodes, has_next, next_cursor = read_connection(connection)
+            for node in nodes:
+                if not isinstance(node, dict):
+                    raise GitHubApiError("GitHub review thread node is invalid")
+                thread_id = node.get("id")
+                resolved = node.get("isResolved")
+                if (
+                    not isinstance(thread_id, str)
+                    or not thread_id.strip()
+                    or not isinstance(resolved, bool)
+                    or thread_id in seen_threads
+                ):
+                    raise GitHubApiError(
+                        "GitHub review thread identity is invalid or duplicated"
+                    )
+                seen_threads.add(thread_id)
+
+                comment_nodes, more_comments, comment_cursor = read_connection(
+                    node.get("comments")
+                )
+                comment_ids = [read_comment_id(item) for item in comment_nodes]
+                seen_comment_cursors: set[str] = set()
+                for _ in range(100):
+                    if not more_comments:
+                        break
+                    if (
+                        comment_cursor is None
+                        or comment_cursor in seen_comment_cursors
+                    ):
+                        raise GitHubApiError(
+                            "GitHub review thread comment pagination cursor is corrupt"
+                        )
+                    seen_comment_cursors.add(comment_cursor)
+                    comment_data = graphql(
+                        comments_query,
+                        {"threadId": thread_id, "after": comment_cursor},
+                    )
+                    thread_node = comment_data.get("node")
+                    if (
+                        not isinstance(thread_node, dict)
+                        or thread_node.get("id") != thread_id
+                    ):
+                        raise GitHubApiError(
+                            "GitHub review thread comment page identity changed"
+                        )
+                    comment_nodes, more_comments, comment_cursor = read_connection(
+                        thread_node.get("comments")
+                    )
+                    comment_ids.extend(read_comment_id(item) for item in comment_nodes)
+                else:
+                    raise GitHubApiError(
+                        "GitHub review thread comment pagination safety cap reached"
+                    )
+
+                if not comment_ids or len(set(comment_ids)) != len(comment_ids):
+                    raise GitHubApiError(
+                        "GitHub review thread comments are empty or duplicated"
+                    )
+                for current_comment_id in comment_ids:
+                    if current_comment_id in comment_owners:
+                        raise GitHubApiError(
+                            "GitHub review comment is owned by multiple threads"
+                        )
+                    comment_owners[current_comment_id] = thread_id
+                results.append(
+                    PullReviewThreadSnapshot(
+                        thread_node_id=thread_id,
+                        is_resolved=resolved,
+                        comment_ids=tuple(comment_ids),
+                        root_comment_id=comment_ids[0],
+                    )
+                )
+
+            if not has_next:
+                break
+            if next_cursor is None or next_cursor in seen_thread_cursors:
+                raise GitHubApiError("GitHub review thread pagination cursor is corrupt")
+            seen_thread_cursors.add(next_cursor)
+            thread_cursor = next_cursor
+        else:
+            raise GitHubApiError("GitHub review thread pagination safety cap reached")
+
+        return results
 
     def reply_to_pull_review_comment(
         self,

@@ -154,6 +154,193 @@ def test_review_comment_listing_exhausts_github_pagination():
     assert [item.comment_id for item in comments] == [1, 2]
 
 
+def test_review_thread_listing_paginates_threads_and_ordered_comments():
+    calls = []
+
+    def thread_node(index, *, resolved=False, comments=None, more_comments=False):
+        return {
+            "id": f"PRRT_{index}",
+            "isResolved": resolved,
+            "comments": {
+                "nodes": comments or [{"databaseId": 1000 + index}],
+                "pageInfo": {
+                    "endCursor": "comment-cursor-1" if more_comments else None,
+                    "hasNextPage": more_comments,
+                },
+            },
+        }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        query = body["query"]
+        variables = body["variables"]
+        calls.append((query, variables))
+        if "reviewThreads(first: 100" in query:
+            assert variables["owner"] == "DEAMBROGGI"
+            assert variables["name"] == "FirstContact"
+            assert variables["number"] == 29
+            if variables["after"] is None:
+                nodes = [
+                    thread_node(
+                        0,
+                        comments=[
+                            {"databaseId": 1000},
+                            {"databaseId": 90001},
+                        ],
+                        more_comments=True,
+                    ),
+                    *[thread_node(index) for index in range(1, 100)],
+                ]
+                page_info = {
+                    "endCursor": "thread-cursor-1",
+                    "hasNextPage": True,
+                }
+            else:
+                assert variables["after"] == "thread-cursor-1"
+                nodes = [thread_node(100, resolved=True)]
+                page_info = {"endCursor": None, "hasNextPage": False}
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "repository": {
+                            "pullRequest": {
+                                "reviewThreads": {
+                                    "nodes": nodes,
+                                    "pageInfo": page_info,
+                                }
+                            }
+                        }
+                    }
+                },
+            )
+
+        assert "node(id: $threadId)" in query
+        assert variables == {"threadId": "PRRT_0", "after": "comment-cursor-1"}
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "node": {
+                        "id": "PRRT_0",
+                        "comments": {
+                            "nodes": [{"databaseId": 90002}],
+                            "pageInfo": {"endCursor": None, "hasNextPage": False},
+                        },
+                    }
+                }
+            },
+        )
+
+    gateway = GitHubRepositoryGateway(
+        api_url="https://api.github.test",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    threads = gateway.list_pull_review_threads(
+        "DEAMBROGGI/FirstContact",
+        29,
+        "installation-token",
+    )
+
+    assert len(threads) == 101
+    assert threads[0].thread_node_id == "PRRT_0"
+    assert threads[0].comment_ids == (1000, 90001, 90002)
+    assert threads[0].root_comment_id == 1000
+    assert threads[0].is_resolved is False
+    assert threads[-1].thread_node_id == "PRRT_100"
+    assert threads[-1].is_resolved is True
+    assert len(calls) == 3
+
+
+@pytest.mark.parametrize("duplicate_kind", ["thread", "comment"])
+def test_review_thread_listing_rejects_duplicate_identities(duplicate_kind):
+    def make_thread(thread_id, comment_id, resolved=False):
+        return {
+            "id": thread_id,
+            "isResolved": resolved,
+            "comments": {
+                "nodes": [{"databaseId": comment_id}],
+                "pageInfo": {"endCursor": None, "hasNextPage": False},
+            },
+        }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        assert "reviewThreads(first: 100" in body["query"]
+        second = (
+            make_thread("PRRT_1", 2)
+            if duplicate_kind == "thread"
+            else make_thread("PRRT_2", 1, resolved=True)
+        )
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "repository": {
+                        "pullRequest": {
+                            "reviewThreads": {
+                                "nodes": [make_thread("PRRT_1", 1), second],
+                                "pageInfo": {
+                                    "endCursor": None,
+                                    "hasNextPage": False,
+                                },
+                            }
+                        }
+                    }
+                }
+            },
+        )
+
+    gateway = GitHubRepositoryGateway(
+        api_url="https://api.github.test",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    with pytest.raises(GitHubApiError, match="duplicated|multiple threads"):
+        gateway.list_pull_review_threads(
+            "DEAMBROGGI/FirstContact",
+            29,
+            "installation-token",
+        )
+
+
+def test_review_thread_listing_rejects_missing_next_page_cursor():
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        assert "reviewThreads(first: 100" in body["query"]
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "repository": {
+                        "pullRequest": {
+                            "reviewThreads": {
+                                "nodes": [],
+                                "pageInfo": {
+                                    "endCursor": None,
+                                    "hasNextPage": True,
+                                },
+                            }
+                        }
+                    }
+                }
+            },
+        )
+
+    gateway = GitHubRepositoryGateway(
+        api_url="https://api.github.test",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    with pytest.raises(GitHubApiError, match="cursor is missing"):
+        gateway.list_pull_review_threads(
+            "DEAMBROGGI/FirstContact",
+            29,
+            "installation-token",
+        )
+
+
 def test_issue_comment_reactions_are_paginated_and_validated():
     seen = []
 
@@ -768,6 +955,7 @@ def test_merge_pull_request_binds_expected_head_and_returns_merge_commit():
 
 def test_pull_request_snapshot_exposes_merged_receipt():
     merge_sha = "5" * 40
+    base_sha = "1" * 40
 
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.method == "GET"
@@ -781,7 +969,7 @@ def test_pull_request_snapshot_exposes_merged_receipt():
                 "state": "closed",
                 "merged": True,
                 "merge_commit_sha": merge_sha,
-                "base": {"ref": "master"},
+                "base": {"ref": "master", "sha": base_sha},
                 "head": {
                     "ref": "control-plane/issue-22-canonical",
                     "sha": HEAD,
@@ -803,6 +991,32 @@ def test_pull_request_snapshot_exposes_merged_receipt():
     assert pull.merged is True
     assert pull.merge_commit_sha == merge_sha
     assert pull.head_sha == HEAD
+    assert pull.base_sha == base_sha
+
+
+def test_pull_request_snapshot_rejects_invalid_base_sha():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "number": 13,
+                "state": "open",
+                "merged": False,
+                "base": {"ref": "master", "sha": "invalid"},
+                "head": {
+                    "ref": "control-plane/issue-22-canonical",
+                    "sha": HEAD,
+                },
+            },
+        )
+
+    github = GitHubRepositoryGateway(
+        api_url="https://api.github.test",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    with pytest.raises(GitHubApiError, match="base SHA is invalid"):
+        github.pull_request("DEAMBROGGI/FirstContact", 13, "installation-token")
 
 
 def test_pull_request_merged_uses_dedicated_status_endpoint():
@@ -876,3 +1090,53 @@ def test_pull_request_merge_event_recovers_commit_sha():
     assert event.commit_id == merge_sha
     assert event.actor == "DEAMBROGGI"
     assert event.created_at == "2026-09-29T20:48:12Z"
+
+
+def test_commit_and_comparison_readbacks_return_exact_graph_metadata():
+    base_sha = "1" * 40
+    head_sha = "2" * 40
+    merge_sha = "4" * 40
+    tree_sha = "3" * 40
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith(f"/commits/{merge_sha}"):
+            return httpx.Response(
+                200,
+                json={
+                    "sha": merge_sha,
+                    "commit": {"tree": {"sha": tree_sha}},
+                    "parents": [{"sha": base_sha}, {"sha": head_sha}],
+                },
+            )
+        if request.url.path.endswith(f"/compare/{base_sha}...{head_sha}"):
+            return httpx.Response(
+                200,
+                json={
+                    "base_commit": {"sha": base_sha},
+                    "head_commit": {"sha": head_sha},
+                    "merge_base_commit": {"sha": base_sha},
+                    "ahead_by": 3,
+                    "behind_by": 0,
+                },
+            )
+        raise AssertionError(f"unexpected request {request.url}")
+
+    github = GitHubRepositoryGateway(
+        api_url="https://api.github.test",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    commit = github.commit("DEAMBROGGI/FirstContact", merge_sha, "token")
+    comparison = github.compare_commits(
+        "DEAMBROGGI/FirstContact",
+        base_sha,
+        head_sha,
+        "token",
+    )
+
+    assert commit.sha == merge_sha
+    assert commit.tree_sha == tree_sha
+    assert commit.parents == (base_sha, head_sha)
+    assert comparison.merge_base_sha == base_sha
+    assert comparison.ahead_by == 3
+    assert comparison.behind_by == 0

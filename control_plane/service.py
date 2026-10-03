@@ -215,6 +215,7 @@ _REMEDIATION_STATE_EVENTS = (
     "WORK_PACKAGE_CREATED",
     "WORK_PACKAGE_CLAIMED",
     "IMPLEMENTATION_SUBMITTED",
+    "HISTORICAL_IMPLEMENTATION_ADOPTED",
     "SUCCESSOR_REVIEW_STARTED",
     "REJECTED_FINDINGS_FINALIZATION_STARTED",
     "WORK_PACKAGE_REWORK_REQUIRED",
@@ -445,6 +446,7 @@ def mark_remote_published(
     branch: str | None = None,
     base_branch: str | None = None,
     pull_request_number: int | None = None,
+    observed_remote_head_sha: str | None = None,
 ) -> PublicationView:
     view = _locked_publication_view(session, publication_id)
     payload: dict[str, Any] = {"head_sha": _sha(head_sha, "head_sha")}
@@ -458,6 +460,11 @@ def mark_remote_published(
         if pull_request_number <= 0:
             raise DomainError("pull_request_number must be positive")
         payload["pull_request_number"] = pull_request_number
+    if observed_remote_head_sha is not None:
+        payload["observed_remote_head_sha"] = _sha(
+            observed_remote_head_sha,
+            "observed_remote_head_sha",
+        )
     validate_transition(view, EventType.REMOTE_PUBLISHED, payload)
     append_event(session, publication_id, EventType.REMOTE_PUBLISHED, payload)
     session.commit()
@@ -526,6 +533,13 @@ def _required_review_adjudication(
         return None
 
     events = load_events(session, publication_id)
+    if any(
+        event["event_type"] == EventType.CODEX_REVIEW_INVALIDATED.value
+        and event["payload"].get("run_id") == run_id
+        and event["payload"].get("head_sha") == remote_head
+        for event in events
+    ):
+        return None
     unavailable_position: int | None = None
     recorded_by_run: dict[str, tuple[dict[str, Any], int]] = {}
     materialized: list[tuple[dict[str, Any], int]] = []
@@ -593,6 +607,15 @@ def _required_review_adjudication(
     }
 
 
+def required_review_adjudication(
+    session: Session,
+    publication_id: str,
+) -> dict[str, Any] | None:
+    """Return the exact-head automated/fallback adjudication without mutating state."""
+    view = get_view(session, publication_id)
+    return _required_review_adjudication(session, publication_id, view)
+
+
 def record_review(
     session: Session,
     publication_id: str,
@@ -600,14 +623,15 @@ def record_review(
     reviewed_head_sha: str,
     decision: ReviewDecision,
     require_codex_review: bool = False,
+    github_review_id: int | None = None,
 ) -> PublicationView:
     view = _locked_publication_view(session, publication_id)
     if decision is ReviewDecision.APPROVED:
-        unfinished = _unfinished_remediation_work_package_ids(session, publication_id)
-        if unfinished:
+        from .remediation import publication_has_unresolved_remediation_findings
+
+        if publication_has_unresolved_remediation_findings(session, publication_id):
             raise DomainError(
-                "human approval is blocked by unfinished remediation: "
-                + ", ".join(unfinished)
+                "human approval is blocked by unresolved remediation findings"
             )
     required_adjudication = None
     required_mode = require_codex_review or view.automated_review_mode == "required"
@@ -627,10 +651,108 @@ def record_review(
         "reviewed_head_sha": _sha(reviewed_head_sha, "reviewed_head_sha"),
         "decision": decision.value,
     }
+    if github_review_id is not None:
+        payload["github_review_id"] = github_review_id
     if required_adjudication is not None:
         payload["required_review_adjudication"] = required_adjudication
     validate_transition(view, EventType.REVIEW_RECORDED, payload)
     append_event(session, publication_id, EventType.REVIEW_RECORDED, payload)
+    session.commit()
+    return get_view(session, publication_id)
+
+
+def clear_human_review_block(
+    session: Session,
+    publication_id: str,
+    *,
+    reviewed_head_sha: str,
+    cleared_review_event_sequence: int,
+    blocking_review_id: int,
+    clearing_review_id: int,
+    clearing_review_state: str,
+) -> PublicationView:
+    provenance_values = (
+        cleared_review_event_sequence,
+        blocking_review_id,
+        clearing_review_id,
+    )
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value <= 0
+        for value in provenance_values
+    ):
+        raise DomainError("human review clearance provenance is invalid")
+    if not isinstance(clearing_review_state, str):
+        raise DomainError("human review clearance decision is invalid")
+    normalized_clearing_state = clearing_review_state.strip().upper()
+    if normalized_clearing_state not in {"APPROVED", "DISMISSED"}:
+        raise DomainError("human review clearance decision is invalid")
+
+    view = _locked_publication_view(session, publication_id)
+    payload = {
+        "reviewed_head_sha": _sha(reviewed_head_sha, "reviewed_head_sha"),
+        "cleared_review_event_sequence": cleared_review_event_sequence,
+        "blocking_review_id": blocking_review_id,
+        "clearing_review_id": clearing_review_id,
+        "clearing_review_state": normalized_clearing_state,
+    }
+    events = load_events(session, publication_id)
+    existing = next(
+        (
+            event
+            for event in events
+            if event["event_type"] == EventType.HUMAN_REVIEW_CLEARED.value
+            and event["payload"].get("cleared_review_event_sequence")
+            == payload["cleared_review_event_sequence"]
+        ),
+        None,
+    )
+    if existing is not None:
+        if existing["payload"] != payload:
+            raise DomainError("human review clearance evidence conflicts")
+        session.commit()
+        return get_view(session, publication_id)
+
+    if view.remote_head_sha != payload["reviewed_head_sha"]:
+        raise DomainError("human review clearance head is stale")
+    target = next(
+        (
+            event
+            for event in events
+            if event["sequence"] == payload["cleared_review_event_sequence"]
+        ),
+        None,
+    )
+    if (
+        target is None
+        or target["event_type"] != EventType.REVIEW_RECORDED.value
+        or target["payload"].get("decision")
+        != ReviewDecision.CHANGES_REQUIRED.value
+        or target["payload"].get("reviewed_head_sha")
+        != payload["reviewed_head_sha"]
+        or target["payload"].get("github_review_id")
+        != payload["blocking_review_id"]
+    ):
+        raise DomainError("human review clearance does not match its blocker")
+    latest_review_event = next(
+        (
+            event
+            for event in reversed(events)
+            if event["event_type"] == EventType.REVIEW_RECORDED.value
+            and event["payload"].get("reviewed_head_sha")
+            == payload["reviewed_head_sha"]
+        ),
+        None,
+    )
+    if latest_review_event is None or latest_review_event["sequence"] != target["sequence"]:
+        raise DomainError("human review clearance blocker is no longer current")
+
+    validate_transition(view, EventType.HUMAN_REVIEW_CLEARED, payload)
+    append_event(
+        session,
+        publication_id,
+        EventType.HUMAN_REVIEW_CLEARED,
+        payload,
+    )
     session.commit()
     return get_view(session, publication_id)
 
@@ -696,6 +818,10 @@ def record_merged(
             raise DomainError("merged publication receipt does not match")
         session.commit()
         return view
+    from .remediation import publication_has_unresolved_remediation_findings
+
+    if publication_has_unresolved_remediation_findings(session, publication_id):
+        raise DomainError("merge is blocked by unresolved remediation findings")
     validate_transition(view, EventType.MERGED, payload)
     append_event(session, publication_id, EventType.MERGED, payload)
     session.commit()
@@ -750,6 +876,15 @@ def request_codex_review(
     if mode not in {"advisory", "required"}:
         raise DomainError("Codex review mode must be advisory or required")
     view = _locked_publication_view(session, publication_id)
+    from .remediation import (
+        RemediationFindingsOpen,
+        publication_has_unresolved_remediation_findings,
+    )
+
+    if publication_has_unresolved_remediation_findings(session, publication_id):
+        raise RemediationFindingsOpen(
+            "Codex review is blocked while remediation findings remain unresolved"
+        )
     if view.remote_head_sha is None:
         raise DomainError("Codex review requires published head")
     expected_head = _sha(expected_head_sha, "expected_head_sha")
@@ -807,6 +942,8 @@ def complete_codex_review(
     provider_review_ids: list[int],
     provider_comment_ids: list[int],
     provider_reaction_ids: list[int] | None = None,
+    provider_completed_at: str | None = None,
+    provider_evidence_sha256: str | None = None,
 ) -> PublicationView:
     if result not in {
         AutomatedReviewStatus.PASS,
@@ -816,6 +953,10 @@ def complete_codex_review(
     if len(findings) > 200:
         raise DomainError("too many Codex review findings")
     head = _sha(reviewed_head_sha, "reviewed_head_sha")
+    normalized_provider_time = _normalize_provider_timestamp(
+        provider_completed_at,
+        "Codex provider completion timestamp",
+    )
     payload = {
         "run_id": run_id,
         "head_sha": head,
@@ -832,7 +973,47 @@ def complete_codex_review(
             set(int(value) for value in (provider_reaction_ids or []))
         ),
     }
+    if provider_evidence_sha256 is not None:
+        if len(provider_evidence_sha256) != 64 or any(
+            char not in "0123456789abcdef"
+            for char in provider_evidence_sha256
+        ):
+            raise DomainError("Codex provider evidence digest is invalid")
+        payload["provider_evidence_sha256"] = provider_evidence_sha256
+    if normalized_provider_time is not None:
+        payload["provider_completed_at"] = normalized_provider_time
     view = _locked_publication_view(session, publication_id)
+    if view.automated_review_status is AutomatedReviewStatus.UNAVAILABLE:
+        unavailable_events = [
+            event
+            for event in load_events(session, publication_id)
+            if event["event_type"] == EventType.CODEX_REVIEW_UNAVAILABLE.value
+            and event["payload"].get("run_id") == run_id
+            and event["payload"].get("head_sha") == head
+        ]
+        if (
+            normalized_provider_time is None
+            or not unavailable_events
+            or any(
+                event["event_type"] == EventType.CODEX_REVIEW_INVALIDATED.value
+                and event["payload"].get("run_id") == run_id
+                and event["payload"].get("head_sha") == head
+                for event in load_events(session, publication_id)
+            )
+        ):
+            raise DomainError("Codex result cannot supersede invalidated or untimed unavailability")
+        unavailable_time = unavailable_events[-1]["payload"].get("provider_occurred_at")
+        parsed_unavailable_time = _parse_provider_timestamp(
+            unavailable_time,
+            "Codex unavailability timestamp",
+        )
+        parsed_completion_time = _parse_provider_timestamp(
+            normalized_provider_time,
+            "Codex provider completion timestamp",
+        )
+        if parsed_completion_time <= parsed_unavailable_time:
+            raise DomainError("Codex result does not postdate provider unavailability")
+        payload["supersedes_unavailability"] = True
     validate_transition(view, EventType.CODEX_REVIEW_COMPLETED, payload)
     append_event(session, publication_id, EventType.CODEX_REVIEW_COMPLETED, payload)
     session.commit()
@@ -845,6 +1026,7 @@ def mark_codex_review_unavailable(
     run_id: str,
     reviewed_head_sha: str,
     reason: str,
+    provider_occurred_at: str | None = None,
 ) -> PublicationView:
     if not reason or len(reason) > 200:
         raise DomainError("Codex unavailable reason must be 1..200 characters")
@@ -853,11 +1035,83 @@ def mark_codex_review_unavailable(
         "head_sha": _sha(reviewed_head_sha, "reviewed_head_sha"),
         "reason": reason,
     }
+    normalized_provider_time = _normalize_provider_timestamp(
+        provider_occurred_at,
+        "Codex provider unavailability timestamp",
+    )
+    if normalized_provider_time is not None:
+        payload["provider_occurred_at"] = normalized_provider_time
     view = _locked_publication_view(session, publication_id)
     validate_transition(view, EventType.CODEX_REVIEW_UNAVAILABLE, payload)
     append_event(session, publication_id, EventType.CODEX_REVIEW_UNAVAILABLE, payload)
     session.commit()
     return get_view(session, publication_id)
+
+
+def invalidate_codex_review(
+    session: Session,
+    publication_id: str,
+    *,
+    run_id: str,
+    reviewed_head_sha: str,
+    reason: str,
+    evidence_ids: list[int],
+) -> PublicationView:
+    if not reason or len(reason) > 200:
+        raise DomainError("Codex invalidation reason must be 1..200 characters")
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value <= 0
+        for value in evidence_ids
+    ):
+        raise DomainError("Codex invalidation evidence ids are invalid")
+    payload = {
+        "run_id": run_id,
+        "head_sha": _sha(reviewed_head_sha, "reviewed_head_sha"),
+        "reason": reason,
+        "evidence_ids": sorted(set(evidence_ids)),
+    }
+    if not payload["evidence_ids"]:
+        raise DomainError("Codex invalidation requires evidence ids")
+    view = _locked_publication_view(session, publication_id)
+    if (
+        view.automated_review_run_id != run_id
+        or view.automated_review_head_sha != payload["head_sha"]
+    ):
+        raise DomainError("Codex invalidation run or head is stale")
+    existing = next(
+        (
+            event
+            for event in load_events(session, publication_id)
+            if event["event_type"] == EventType.CODEX_REVIEW_INVALIDATED.value
+            and event["payload"] == payload
+        ),
+        None,
+    )
+    if existing is not None:
+        session.commit()
+        return view
+    validate_transition(view, EventType.CODEX_REVIEW_INVALIDATED, payload)
+    append_event(session, publication_id, EventType.CODEX_REVIEW_INVALIDATED, payload)
+    session.commit()
+    return get_view(session, publication_id)
+
+
+def _parse_provider_timestamp(value: object, field: str) -> datetime:
+    if not isinstance(value, str) or not value.strip():
+        raise DomainError(f"{field} is missing or invalid")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise DomainError(f"{field} is invalid") from exc
+    if parsed.tzinfo is None:
+        raise DomainError(f"{field} must include a timezone")
+    return parsed.astimezone(timezone.utc)
+
+
+def _normalize_provider_timestamp(value: str | None, field: str) -> str | None:
+    if value is None:
+        return None
+    return _parse_provider_timestamp(value, field).isoformat()
 
 
 def _utc(value: datetime) -> datetime:

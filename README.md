@@ -181,3 +181,59 @@ Delivery profiles are immutable historical contracts. A candidate continues to
 validate against its pinned profile id/version/digest even after a newer profile
 becomes active. Admission-critical jobs in schema-v2 profiles are additionally
 bound to versioned JobDefinitions and their digests.
+
+
+## GitHub Webhook/Event Gateway
+
+Issue #26 adds a durable GitHub App webhook inbox and exact-head Review Watch.
+The webhook is a wake-up signal only: every accepted delivery is persisted first,
+then Plane re-reads the canonical PR/review/comment through the GitHub App before
+any publication transition.
+
+Runtime configuration:
+
+```env
+CONTROL_PLANE_GITHUB_WEBHOOK_SECRET=<dedicated webhook secret>
+CONTROL_PLANE_GITHUB_WEBHOOK_MAX_PAYLOAD_BYTES=1048576
+CONTROL_PLANE_HUMAN_REVIEW_ACTORS=DEAMBROGGI
+```
+
+The webhook secret is separate from the GitHub App PEM and review-trigger token.
+
+Inbound endpoint:
+
+```text
+POST /api/v1/github/webhooks
+X-Hub-Signature-256: sha256=...
+X-GitHub-Delivery: <stable delivery id>
+X-GitHub-Event: <event name>
+```
+
+Properties:
+
+- HMAC-SHA256 is validated before any database mutation.
+- payload size is bounded before signature work;
+- `X-GitHub-Delivery` is the durable idempotency identity;
+- identical delivery replay is safe;
+- conflicting reuse of one delivery id fails closed;
+- registered repository profiles are the inbound repository allowlist;
+- inbox rows survive restart and pending rows can be replayed;
+- `ReviewWatch` persists repository / Publication / PR / exact HEAD / run /
+  expected actors / next role / next action;
+- Codex usage-limit comments become `UNAVAILABLE` only after re-reading the
+  governed trigger and provider evidence;
+- Human Review is re-read from GitHub and must match the current exact HEAD;
+- PR synchronize/head drift marks the watch stale instead of reusing old evidence;
+- closed/merged PR events reuse the existing merge reconciler.
+
+Recovery endpoint:
+
+```text
+POST /api/v1/internal/github/webhooks/reconcile
+POST /api/v1/internal/github/webhooks/reconcile?publication_id=<id>
+GET  /api/v1/internal/github/review-watches/<publication_id>
+```
+
+The recovery path is authoritative-equivalent to webhook processing. Missing or
+out-of-order webhooks therefore do not require operator scripts to reconstruct
+the provider/human review state.
