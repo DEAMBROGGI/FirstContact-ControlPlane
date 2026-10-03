@@ -31,6 +31,7 @@ from control_plane.main import (
 )
 from control_plane.models import GitHubWebhookDeliveryRow, ReviewWatchRow
 from control_plane.profile_registry import profile_for_repository
+from control_plane.pr_findings import reconcile_pr_findings
 from control_plane.publisher import PublicationError
 from control_plane.quarantine import VerifiedCandidateSource
 from control_plane.repository import load_events
@@ -130,7 +131,7 @@ def published_publication(session):
             status=ValidationStatus.PASS,
             evidence_sha256=f"{index:064x}",
         )
-    return mark_remote_published(
+    view = mark_remote_published(
         session,
         view.publication_id,
         HEAD,
@@ -138,6 +139,27 @@ def published_publication(session):
         base_branch="master",
         pull_request_number=44,
     )
+    github = SimpleNamespace(
+        pull_request=lambda repository, number, token: PullRequestSnapshot(
+            number=view.pull_request_number,
+            state="open",
+            base_ref=view.base_branch,
+            head_ref=view.remote_branch,
+            head_sha=view.remote_head_sha,
+            base_sha=BASE,
+        ),
+        ref_sha=lambda repository, branch, token: BASE,
+        list_pull_reviews=lambda repository, number, token: [],
+        list_pull_review_comments=lambda repository, number, token: [],
+        list_pull_review_threads=lambda repository, number, token: [],
+    )
+    reconcile_pr_findings(
+        session,
+        view.publication_id,
+        github=github,
+        token="test-installation-token",
+    )
+    return view
 
 
 class FakeApiTokenProvider:

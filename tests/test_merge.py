@@ -8,6 +8,7 @@ import control_plane.remediation as remediation_module
 
 from control_plane.domain import DomainError, PublicationState, ReviewDecision, ValidationStatus
 from control_plane.github_api import GitHubApiError, PullRequestSnapshot
+from control_plane.pr_findings import reconcile_pr_findings
 from control_plane.merge import (
     MergeCoordinator,
     MergeError,
@@ -64,6 +65,7 @@ def ready_publication(session, *, issue_number: int = 220):
         base_branch="master",
         pull_request_number=PR_NUMBER,
     )
+    _reconcile_empty_pr_findings(session, view)
     view = record_review(
         session,
         view.publication_id,
@@ -107,11 +109,35 @@ def approved_publication(session, *, issue_number: int = 221):
         base_branch="master",
         pull_request_number=PR_NUMBER,
     )
+    _reconcile_empty_pr_findings(session, view)
     return record_review(
         session,
         view.publication_id,
         reviewed_head_sha=HEAD,
         decision=ReviewDecision.APPROVED,
+    )
+
+
+def _reconcile_empty_pr_findings(session, view):
+    github = SimpleNamespace(
+        pull_request=lambda repository, number, token: PullRequestSnapshot(
+            number=view.pull_request_number,
+            state="open",
+            base_ref=view.base_branch,
+            head_ref=view.remote_branch,
+            head_sha=view.remote_head_sha,
+            base_sha=BASE,
+        ),
+        ref_sha=lambda repository, branch, token: BASE,
+        list_pull_reviews=lambda repository, number, token: [],
+        list_pull_review_comments=lambda repository, number, token: [],
+        list_pull_review_threads=lambda repository, number, token: [],
+    )
+    return reconcile_pr_findings(
+        session,
+        view.publication_id,
+        github=github,
+        token="test-installation-token",
     )
 
 

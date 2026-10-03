@@ -29,6 +29,7 @@ from control_plane.main import (
 )
 from control_plane.merge import MergeCoordinator
 from control_plane.profile_registry import profile_for_repository
+from control_plane.pr_findings import reconcile_pr_findings
 from control_plane.quarantine import (
     BASE_REF,
     HEAD_REF,
@@ -115,6 +116,36 @@ def merge_publication(session, issue_number, *, ready=True):
         branch=MERGE_BRANCH,
         base_branch="master",
         pull_request_number=MERGE_PR_NUMBER,
+    )
+
+    class EmptyGitHub:
+        def pull_request(self, repository, number, token):
+            return PullRequestSnapshot(
+                number=number,
+                state="open",
+                base_ref="master",
+                head_ref=MERGE_BRANCH,
+                head_sha=MERGE_HEAD,
+                base_sha=MERGE_BASE,
+            )
+
+        def ref_sha(self, repository, branch, token):
+            return MERGE_BASE
+
+        def list_pull_reviews(self, repository, number, token):
+            return []
+
+        def list_pull_review_comments(self, repository, number, token):
+            return []
+
+        def list_pull_review_threads(self, repository, number, token):
+            return []
+
+    reconcile_pr_findings(
+        session,
+        view.publication_id,
+        github=EmptyGitHub(),
+        token="installation-token",
     )
     view = record_review(
         session,

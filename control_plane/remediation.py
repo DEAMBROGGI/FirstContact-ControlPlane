@@ -4,7 +4,7 @@ import hashlib
 import json
 import re
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from enum import StrEnum
 from typing import Any, Mapping
@@ -28,6 +28,7 @@ from .models import (
     RemediationWorkPackageRow,
 )
 from .repository import ZERO_HASH, append_event, load_events
+from .profile_registry import ProfileError, profile_for_identity
 from .service import get_view
 
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -359,10 +360,59 @@ def _fold(work_package_id: str, row: RemediationWorkPackageRow, events: list[dic
             if implementation_issue_number is not None and implementation_issue_number != linked_number:
                 raise RuntimeError("remediation issue link changed in the event ledger")
             implementation_issue_number = linked_number
+        elif event_type == "HUMAN_PR_FINDING_ADOPTED":
+            raw_finding = payload.get("finding")
+            if not isinstance(raw_finding, dict):
+                raise RuntimeError("adopted PR finding event is malformed")
+            finding = _finding_defaults(dict(raw_finding))
+            finding_id = finding.get("finding_id")
+            identity = finding.get("normalized_identity")
+            if (
+                not isinstance(finding_id, str)
+                or not finding_id
+                or finding_id in findings
+                or any(
+                    prior.get("normalized_identity") == identity
+                    for prior in findings.values()
+                )
+            ):
+                raise RuntimeError("adopted PR finding identity is duplicated")
+            findings[finding_id] = finding
         elif event_type == "WORK_PACKAGE_CLAIMED":
             state = WorkPackageState.IN_PROGRESS
             implementer = payload["actor"]
-        elif event_type == "IMPLEMENTATION_SUBMITTED":
+        elif event_type in {
+            "IMPLEMENTATION_SUBMITTED",
+            "HISTORICAL_IMPLEMENTATION_ADOPTED",
+        }:
+            if event_type == "HISTORICAL_IMPLEMENTATION_ADOPTED":
+                evidence = payload.get("evidence")
+                candidate_evidence = (
+                    evidence.get("candidate") if isinstance(evidence, dict) else None
+                )
+                source_findings = (
+                    evidence.get("source_findings") if isinstance(evidence, dict) else None
+                )
+                source_finding_ids = (
+                    [item.get("finding_id") for item in source_findings]
+                    if isinstance(source_findings, list)
+                    and all(isinstance(item, dict) for item in source_findings)
+                    else None
+                )
+                if (
+                    not isinstance(evidence, dict)
+                    or not isinstance(candidate_evidence, dict)
+                    or not isinstance(payload.get("evidence_sha256"), str)
+                    or hashlib.sha256(_canonical(evidence).encode("utf-8")).hexdigest()
+                    != payload["evidence_sha256"]
+                    or payload.get("candidate_id") != candidate_evidence.get("candidate_id")
+                    or payload.get("head_sha") != candidate_evidence.get("head_sha")
+                    or payload.get("summary") != evidence.get("summary")
+                    or payload.get("actor") != evidence.get("actor")
+                    or payload.get("reason") != evidence.get("reason")
+                    or payload.get("source_finding_ids") != source_finding_ids
+                ):
+                    raise RuntimeError("historical implementation adoption evidence is corrupt")
             state = WorkPackageState.IMPLEMENTED
             candidate_id = payload["candidate_id"]
             implementation_head_sha = payload["head_sha"]
@@ -541,10 +591,128 @@ def finding_is_terminal(finding: Mapping[str, Any]) -> bool:
     )
 
 
+def _source_matches_reconciled_thread(
+    source: Mapping[str, Any],
+    thread: Mapping[str, Any],
+    *,
+    reconciliation_id: str | None = None,
+) -> bool:
+    if reconciliation_id is not None:
+        if (
+            source.get("kind") != "GITHUB_REVIEW_THREAD"
+            or source.get("provider") != "GITHUB_HUMAN_REVIEW"
+            or source.get("reconciliation_id") != reconciliation_id
+            or source.get("provider_thread_node_id") != thread.get("thread_node_id")
+            or source.get("provider_thread_id") != thread.get("root_comment_id")
+            or source.get("provider_review_id") != thread.get("provider_review_id")
+            or source.get("finding_body_sha256") != thread.get("body_sha256")
+        ):
+            return False
+        for source_key, thread_key in (
+            ("source_reviewed_head_sha", "source_reviewed_head_sha"),
+            ("source_actor", "source_actor"),
+            ("path", "path"),
+            ("line", "line"),
+            ("side", "side"),
+            ("body", "body"),
+        ):
+            if source.get(source_key) != thread.get(thread_key):
+                return False
+        return True
+
+    provider_thread_id = source.get("provider_thread_id")
+    comment_ids = thread.get("comment_ids")
+    return (
+        isinstance(comment_ids, list)
+        and provider_thread_id in comment_ids
+        and source.get("provider_review_id") == thread.get("provider_review_id")
+        and source.get("provider_thread_node_id")
+        in {None, thread.get("thread_node_id")}
+    )
+
+
+def _current_pr_thread_findings(
+    session: Session,
+    publication_id: str,
+) -> tuple[Any | None, list[tuple[dict[str, Any], Any | None, dict[str, Any] | None]]]:
+    from .pr_findings import current_reconciliation
+
+    reconciliation = current_reconciliation(session, publication_id)
+    if reconciliation is None:
+        return None, []
+
+    package_ids = tuple(
+        session.scalars(
+            select(RemediationWorkPackageRow.id)
+            .where(RemediationWorkPackageRow.publication_id == publication_id)
+            .order_by(RemediationWorkPackageRow.created_at, RemediationWorkPackageRow.id)
+        )
+    )
+    packages = {
+        work_package_id: get_work_package(session, work_package_id)
+        for work_package_id in package_ids
+    }
+    bindings = []
+    for thread in reconciliation.evidence["threads"]:
+        classification = thread.get("classification")
+        if classification == "TRACKED":
+            work_package_id = thread.get("work_package_id")
+            finding_id = thread.get("finding_id")
+            package = packages.get(work_package_id)
+            if package is None or package.publication_id != publication_id:
+                raise DomainError("reconciled finding work-package ownership is corrupt")
+            matches = [
+                finding
+                for finding in package.findings
+                if finding.get("finding_id") == finding_id
+            ]
+            if len(matches) != 1 or not _source_matches_reconciled_thread(
+                matches[0].get("source", {}),
+                thread,
+            ):
+                raise DomainError("reconciled finding ownership no longer matches Plane")
+            bindings.append((thread, package, matches[0]))
+            continue
+
+        if classification != "ORPHAN":
+            raise DomainError("PR finding reconciliation classification is corrupt")
+        adopted = []
+        for package in packages.values():
+            for finding in package.findings:
+                if _source_matches_reconciled_thread(
+                    finding.get("source", {}),
+                    thread,
+                    reconciliation_id=reconciliation.id,
+                ):
+                    adopted.append((package, finding))
+        if len(adopted) > 1:
+            raise DomainError("historical PR finding adoption is ambiguous")
+        if adopted:
+            package, finding = adopted[0]
+            bindings.append((thread, package, finding))
+        else:
+            bindings.append((thread, None, None))
+    return reconciliation, bindings
+
+
 def publication_has_unresolved_remediation_findings(
     session: Session,
     publication_id: str,
 ) -> bool:
+    reconciliation, thread_findings = _current_pr_thread_findings(
+        session,
+        publication_id,
+    )
+    if reconciliation is None:
+        return True
+    if any(
+        package is None
+        or finding is None
+        or not finding_is_terminal(finding)
+        for _thread, package, finding in thread_findings
+    ):
+        return True
+
     package_ids = session.scalars(
         select(RemediationWorkPackageRow.id)
         .where(RemediationWorkPackageRow.publication_id == publication_id)
@@ -552,8 +720,6 @@ def publication_has_unresolved_remediation_findings(
     )
     for work_package_id in package_ids:
         view = get_work_package(session, work_package_id)
-        if view.state is WorkPackageState.DONE:
-            continue
         if any(not finding_is_terminal(finding) for finding in view.findings):
             return True
     return False
@@ -563,6 +729,17 @@ def remediation_watch_action(
     session: Session,
     publication_id: str,
 ) -> tuple[str, str] | None:
+    try:
+        reconciliation, thread_findings = _current_pr_thread_findings(
+            session,
+            publication_id,
+        )
+    except DomainError:
+        return "CONTROL_PLANE", "BLOCKED"
+    if reconciliation is None:
+        return "CONTROL_PLANE", "RECONCILE_PR_FINDINGS"
+    if any(package is None for _thread, package, _finding in thread_findings):
+        return "PRINCIPAL_REVIEWER", "ADJUDICATE_HISTORICAL_FINDINGS"
     if not publication_has_unresolved_remediation_findings(session, publication_id):
         return None
     package_ids = session.scalars(
@@ -609,28 +786,118 @@ def _validate_governed_published_candidate(
     ):
         raise DomainError("implementation candidate does not belong to this publication and head")
 
+    _governed_candidate_event_evidence(
+        session,
+        candidate,
+        load_events(session, view.publication_id),
+    )
+    return candidate
+
+
+def _governed_candidate_event_evidence(
+    session: Session,
+    candidate: CandidateRow,
+    events: list[dict[str, Any]],
+) -> dict[str, Any]:
+    expected_candidate = {
+        "base_sha": candidate.base_sha,
+        "head_sha": candidate.head_sha,
+        "tree_sha": candidate.tree_sha,
+        "profile_id": candidate.profile_id,
+        "profile_version": candidate.profile_version,
+        "profile_digest": candidate.profile_digest,
+    }
+    submissions = [
+        event
+        for event in events
+        if event["event_type"] == EventType.CANDIDATE_SUBMITTED.value
+        and event["payload"].get("candidate_id") == candidate.id
+    ]
+    admissions = [
+        event
+        for event in events
+        if event["event_type"] == EventType.CANDIDATE_ADMITTED.value
+        and event["payload"].get("candidate_id") == candidate.id
+    ]
+    if (
+        len(submissions) != 1
+        or any(
+            submissions[0]["payload"].get(key) != value
+            for key, value in expected_candidate.items()
+        )
+        or len(admissions) != 1
+        or any(
+            admissions[0]["payload"].get(key) != value
+            for key, value in (
+                ("candidate_id", candidate.id),
+                ("profile_id", candidate.profile_id),
+                ("profile_version", candidate.profile_version),
+                ("profile_digest", candidate.profile_digest),
+            )
+        )
+        or admissions[0]["sequence"] <= submissions[0]["sequence"]
+    ):
+        raise DomainError("implementation candidate submission or admission evidence is ambiguous")
+    try:
+        publication = session.get(PublicationRow, candidate.publication_id)
+        if publication is None:
+            raise DomainError("implementation candidate publication is missing")
+        profile = profile_for_identity(
+            publication.repository,
+            candidate.profile_id,
+            candidate.profile_version,
+            candidate.profile_digest,
+        )
+    except ProfileError as exc:
+        raise DomainError("implementation candidate profile evidence is invalid") from exc
+
+    validation_events: dict[str, dict[str, Any]] = {}
+    for event in events:
+        if (
+            event["event_type"] != EventType.VALIDATION_RECORDED.value
+            or event["payload"].get("candidate_id") != candidate.id
+        ):
+            continue
+        payload = event["payload"]
+        job_id = payload.get("job_id")
+        if not isinstance(job_id, str) or job_id not in profile.required_jobs:
+            raise DomainError("implementation candidate has an unexpected validation record")
+        if job_id in validation_events:
+            raise DomainError("implementation candidate validation evidence is duplicated")
+        definition = profile.definition_for(job_id)
+        expected_definition = (
+            {
+                "job_id": definition.job_id,
+                "version": definition.version,
+                "digest": definition.digest,
+                "implementation": definition.implementation,
+                "result_schema": definition.result_schema,
+            }
+            if definition is not None
+            else None
+        )
+        if (
+            payload.get("status") != "PASS"
+            or not isinstance(payload.get("evidence_sha256"), str)
+            or not _EVIDENCE_RE.fullmatch(payload["evidence_sha256"])
+            or payload.get("job_definition") != expected_definition
+            or event["sequence"] <= submissions[0]["sequence"]
+            or event["sequence"] >= admissions[0]["sequence"]
+        ):
+            raise DomainError("implementation candidate required validation is not an exact pass")
+        validation_events[job_id] = event
+    if set(validation_events) != set(profile.required_jobs):
+        raise DomainError("implementation candidate is missing required validation evidence")
+
     active_candidate_id = None
     active_admitted = False
-    exact_submission_seen = False
-    published = False
-    for event in load_events(session, view.publication_id):
+    publication_events = []
+    for event in events:
         payload = event["payload"]
         event_type = event["event_type"]
         if event_type == EventType.CANDIDATE_SUBMITTED.value:
             active_candidate_id = payload.get("candidate_id")
             active_admitted = False
-            if active_candidate_id == candidate.id:
-                exact_submission_seen = all(
-                    payload.get(key) == value
-                    for key, value in (
-                        ("base_sha", candidate.base_sha),
-                        ("head_sha", candidate.head_sha),
-                        ("tree_sha", candidate.tree_sha),
-                        ("profile_id", candidate.profile_id),
-                        ("profile_version", candidate.profile_version),
-                        ("profile_digest", candidate.profile_digest),
-                    )
-                )
         elif event_type == EventType.CANDIDATE_ADMITTED.value:
             if active_candidate_id == candidate.id:
                 active_admitted = all(
@@ -651,10 +918,39 @@ def _validate_governed_published_candidate(
                 and active_admitted
                 and payload.get("head_sha") == candidate.head_sha
             ):
-                published = True
-    if not exact_submission_seen or not published:
+                publication_events.append(event)
+            if active_candidate_id == candidate.id:
+                active_candidate_id = None
+                active_admitted = False
+    if len(publication_events) != 1:
         raise DomainError("implementation candidate was not admitted and governed-published")
-    return candidate
+    published = publication_events[0]
+    if published["sequence"] <= admissions[0]["sequence"]:
+        raise DomainError("implementation candidate publication predates admission")
+    return {
+        "candidate_id": candidate.id,
+        **expected_candidate,
+        "candidate_submission_event_hash": submissions[0]["event_hash"],
+        "candidate_admission_event_hash": admissions[0]["event_hash"],
+        "required_validations": [
+            {
+                "job_id": job_id,
+                "status": "PASS",
+                "evidence_sha256": validation_events[job_id]["payload"][
+                    "evidence_sha256"
+                ],
+                "event_hash": validation_events[job_id]["event_hash"],
+            }
+            for job_id in sorted(profile.required_jobs)
+        ],
+        "remote_publication_event_hash": published["event_hash"],
+        "remote_publication_sequence": published["sequence"],
+        "canonical_pr_identity": {
+            "branch": published["payload"].get("branch"),
+            "base_branch": published["payload"].get("base_branch"),
+            "pull_request_number": published["payload"].get("pull_request_number"),
+        },
+    }
 
 
 def _validate_governed_remote_publication_history(
@@ -671,6 +967,7 @@ def _validate_governed_remote_publication_history(
     active_admitted = False
     published_head: str | None = None
     publication_identity: tuple[str, str, int] | None = None
+    publication_base_sha: str | None = None
     target_published = False
 
     for event in events:
@@ -701,6 +998,10 @@ def _validate_governed_remote_publication_history(
                 raise DomainError("candidate submission in publication history is ambiguous")
             active_candidate = submitted_candidate
             active_admitted = False
+            if publication_base_sha is None:
+                publication_base_sha = submitted_candidate.base_sha
+            elif submitted_candidate.base_sha != publication_base_sha:
+                raise DomainError("candidate base changed in publication history")
         elif event_type == EventType.CANDIDATE_ADMITTED.value:
             if active_candidate is None or not all(
                 payload.get(key) == value
@@ -769,6 +1070,11 @@ def _validate_governed_remote_publication_history(
         not target_published
         or published_head is None
         or published_head != publication.remote_head_sha
+        or publication_base_sha != candidate.base_sha
+        or (
+            publication.current_candidate is not None
+            and publication.current_candidate.base_sha != candidate.base_sha
+        )
         or publication_identity
         != (
             publication.remote_branch,
@@ -1578,6 +1884,188 @@ def claim_work_package(
     return get_work_package(session, work_package_id)
 
 
+def adopt_historical_pr_finding(
+    session: Session,
+    work_package_id: str,
+    *,
+    reconciliation_id: str,
+    root_comment_id: int,
+    principal_review_run_id: str,
+    decision: str,
+    reason: str,
+    priority: str,
+    idempotency_key: str,
+) -> RemediationWorkPackageView:
+    from .pr_findings import current_reconciliation, reconciliation_receipt
+
+    row = _lock_publication_then_work_package(session, work_package_id)
+    normalized_decision = decision.strip().upper()
+    try:
+        decision_value = PrincipalDecision(normalized_decision)
+    except ValueError as exc:
+        raise DomainError("Principal historical finding decision is invalid") from exc
+    normalized_reason = reason.strip()
+    normalized_priority = priority.strip().upper()
+    normalized_run_id = principal_review_run_id.strip()
+    if not normalized_reason or len(normalized_reason) > 1000:
+        raise DomainError("Principal historical finding reason is required and bounded")
+    _assert_safe_client_text(normalized_reason, "Principal historical finding reason")
+    if normalized_priority not in {"P0", "P1", "P2", "P3", "P4"}:
+        raise DomainError("historical finding priority is invalid")
+    if not normalized_run_id or len(normalized_run_id) > 160:
+        raise DomainError("Principal historical finding review run is invalid")
+    _assert_safe_client_text(normalized_run_id, "Principal historical finding review run")
+    if isinstance(root_comment_id, bool) or root_comment_id <= 0:
+        raise DomainError("historical finding root comment identity is invalid")
+
+    receipt_row, receipt = reconciliation_receipt(session, reconciliation_id)
+    if receipt_row.publication_id != row.publication_id:
+        raise DomainError("historical finding receipt belongs to another publication")
+    threads = [
+        item
+        for item in receipt["threads"]
+        if item.get("root_comment_id") == root_comment_id
+    ]
+    if len(threads) != 1 or threads[0].get("classification") != "ORPHAN":
+        raise DomainError("historical finding is not an unambiguous orphan in the receipt")
+    thread = threads[0]
+    source_head = thread.get("source_reviewed_head_sha")
+    source_body = thread.get("body")
+    source_path = thread.get("path")
+    source_actor = thread.get("source_actor")
+    body_sha256 = thread.get("body_sha256")
+    thread_node_id = thread.get("thread_node_id")
+    provider_review_id = thread.get("provider_review_id")
+    if (
+        thread.get("is_resolved") is not False
+        or not isinstance(thread_node_id, str)
+        or not thread_node_id.strip()
+        or isinstance(provider_review_id, bool)
+        or not isinstance(provider_review_id, int)
+        or provider_review_id <= 0
+        or not isinstance(source_head, str)
+        or not _SHA_RE.fullmatch(source_head)
+        or not isinstance(source_actor, str)
+        or not source_actor.strip()
+        or not isinstance(source_path, str)
+        or not source_path.strip()
+        or not isinstance(source_body, str)
+        or not source_body.strip()
+        or not isinstance(body_sha256, str)
+        or not _EVIDENCE_RE.fullmatch(body_sha256)
+    ):
+        raise DomainError("historical finding receipt lacks exact source evidence")
+    _assert_safe_client_text(source_body, "historical GitHub finding")
+
+    review_evidence = _principal_review_evidence(
+        session,
+        row.publication_id,
+        review_run_id=normalized_run_id,
+        head_sha=receipt_row.remote_head_sha,
+    )
+    finding_digest = hashlib.sha256(
+        f"{receipt_row.repository}\0{receipt_row.pull_request_number}\0{thread_node_id}".encode(
+            "utf-8"
+        )
+    ).hexdigest()
+    finding_id = f"github-human-review:{finding_digest[:32]}"
+    normalized_identity = f"github-human-review:{receipt_row.pull_request_number}:{finding_digest}"
+    finding = _finding_defaults(
+        {
+            "finding_id": finding_id,
+            "normalized_identity": normalized_identity,
+            "priority": normalized_priority,
+            "source": {
+                "kind": "GITHUB_REVIEW_THREAD",
+                "provider": "GITHUB_HUMAN_REVIEW",
+                "provider_review_id": provider_review_id,
+                "provider_thread_id": root_comment_id,
+                "provider_thread_node_id": thread_node_id,
+                "reconciliation_id": receipt_row.id,
+                "finding_body_sha256": body_sha256,
+                "source_review_state": thread.get("source_review_state"),
+                "source_reviewed_head_sha": source_head,
+                "source_comment_commit_sha": thread.get("source_comment_commit_sha"),
+                "source_actor": source_actor,
+                "path": source_path,
+                "line": thread.get("line"),
+                "side": thread.get("side"),
+                "body": source_body,
+            },
+            "principal_decision": {
+                "decision": decision_value.value,
+                "actor": review_evidence["reviewer"],
+                "reason": normalized_reason,
+            },
+            "desired_reaction": "none",
+        }
+    )
+    payload = {
+        "reconciliation_id": receipt_row.id,
+        "reconciliation_sequence": receipt_row.sequence,
+        "reconciliation_sha256": receipt_row.evidence_sha256,
+        "thread_node_id": thread_node_id,
+        "root_comment_id": root_comment_id,
+        "principal_adjudication": {
+            "decision": decision_value.value,
+            "actor": review_evidence["reviewer"],
+            "reason": normalized_reason,
+            "review_run_id": review_evidence["review_run_id"],
+            "review_event_hash": review_evidence["review_event_hash"],
+            "reviewed_head_sha": receipt_row.remote_head_sha,
+        },
+        "finding": finding,
+    }
+    duplicate = _command_duplicate(
+        session,
+        row,
+        event_type="HUMAN_PR_FINDING_ADOPTED",
+        idempotency_key=idempotency_key,
+        payload=payload,
+    )
+    if duplicate is not None:
+        return duplicate
+
+    current_receipt = current_reconciliation(session, row.publication_id)
+    if current_receipt is None or current_receipt.id != receipt_row.id:
+        raise DomainError("historical finding receipt is stale for the current published head")
+    current_thread = next(
+        (
+            item
+            for item in current_receipt.evidence["threads"]
+            if item.get("root_comment_id") == root_comment_id
+        ),
+        None,
+    )
+    if current_thread is None or current_thread.get("classification") != "ORPHAN":
+        raise DomainError("historical finding is no longer an unowned open PR thread")
+    current = get_work_package(session, work_package_id)
+    if current.state not in {
+        WorkPackageState.READY,
+        WorkPackageState.IN_PROGRESS,
+        WorkPackageState.REWORK_REQUIRED,
+    }:
+        raise DomainError("historical findings can only be adopted before implementation")
+    package_ids = session.scalars(
+        select(RemediationWorkPackageRow.id).where(
+            RemediationWorkPackageRow.publication_id == row.publication_id
+        )
+    )
+    for existing_package_id in package_ids:
+        existing_package = get_work_package(session, existing_package_id)
+        if any(item.get("finding_id") == finding_id for item in existing_package.findings):
+            raise DomainError("historical PR finding was already adopted")
+    _append(
+        session,
+        row,
+        event_type="HUMAN_PR_FINDING_ADOPTED",
+        idempotency_key=idempotency_key,
+        payload=payload,
+    )
+    session.commit()
+    return get_work_package(session, work_package_id)
+
+
 def submit_implementation(
     session: Session,
     work_package_id: str,
@@ -1640,6 +2128,208 @@ def submit_implementation(
         session,
         row,
         event_type="IMPLEMENTATION_SUBMITTED",
+        idempotency_key=idempotency_key,
+        payload=payload,
+    )
+    session.commit()
+    return get_work_package(session, work_package_id)
+
+
+def adopt_historical_implementation(
+    session: Session,
+    work_package_id: str,
+    *,
+    candidate_id: str,
+    actor: str,
+    reason: str,
+    summary: str,
+    idempotency_key: str,
+) -> RemediationWorkPackageView:
+    from .pr_findings import current_reconciliation
+
+    row = _lock_publication_then_work_package(session, work_package_id)
+    normalized_actor = actor.strip()
+    normalized_reason = reason.strip()
+    normalized_summary = summary.strip()
+    if not candidate_id or len(candidate_id) > 36:
+        raise DomainError("historical implementation candidate id is invalid")
+    if not normalized_actor or len(normalized_actor) > 200:
+        raise DomainError("historical implementation actor is required and bounded")
+    if not normalized_reason or len(normalized_reason) > 1000:
+        raise DomainError("historical implementation reason is required and bounded")
+    if not normalized_summary or len(normalized_summary) > 4000:
+        raise DomainError("historical implementation summary must contain 1..4000 characters")
+    if not idempotency_key.strip() or len(idempotency_key) > 200:
+        raise DomainError("idempotency_key must contain 1..200 characters")
+    for value, field_name in (
+        (normalized_actor, "historical implementation actor"),
+        (normalized_reason, "historical implementation reason"),
+        (normalized_summary, "historical implementation summary"),
+    ):
+        _assert_safe_client_text(value, field_name)
+
+    existing = session.scalar(
+        select(RemediationEventRow).where(
+            RemediationEventRow.work_package_id == row.id,
+            RemediationEventRow.idempotency_key == idempotency_key,
+        )
+    )
+    if existing is not None:
+        if (
+            existing.event_type != "HISTORICAL_IMPLEMENTATION_ADOPTED"
+            or existing.payload.get("candidate_id") != candidate_id
+            or existing.payload.get("actor") != normalized_actor
+            or existing.payload.get("reason") != normalized_reason
+            or existing.payload.get("summary") != normalized_summary
+        ):
+            raise DomainError("idempotency key was already used for another command")
+        replay = get_work_package(session, work_package_id)
+        session.commit()
+        return replay
+
+    current = get_work_package(session, work_package_id)
+    if current.state is not WorkPackageState.IN_PROGRESS:
+        raise DomainError("historical implementation adoption requires an active work claim")
+    if current.implementer != normalized_actor:
+        raise DomainError("historical implementation actor does not own the work claim")
+    if not any(
+        finding["principal_decision"]["decision"] == PrincipalDecision.ACCEPTED.value
+        for finding in current.findings
+    ):
+        raise DomainError("historical implementation requires an accepted source finding")
+    candidate = session.get(CandidateRow, candidate_id)
+    publication = get_view(session, row.publication_id)
+    reconciliation = current_reconciliation(session, row.publication_id)
+    if (
+        candidate is None
+        or candidate.publication_id != row.publication_id
+        or publication.current_candidate is None
+        or candidate.base_sha != publication.current_candidate.base_sha
+        or reconciliation is None
+        or reconciliation.base_sha != candidate.base_sha
+    ):
+        raise DomainError("historical implementation candidate is not bound to the current PR base")
+    candidate_view = replace(
+        current,
+        candidate_id=candidate.id,
+        implementation_head_sha=candidate.head_sha,
+    )
+    published_head = _validate_governed_remote_publication_history(
+        session,
+        candidate_view,
+    )
+    events = load_events(session, row.publication_id)
+    candidate_evidence = _governed_candidate_event_evidence(
+        session,
+        candidate,
+        events,
+    )
+    published_sequence = candidate_evidence["remote_publication_sequence"]
+    remote_publications = [
+        event
+        for event in events
+        if event["event_type"] == EventType.REMOTE_PUBLISHED.value
+    ]
+    source_publications = [
+        event
+        for event in remote_publications
+        if event["payload"].get("head_sha") == current.reviewed_head_sha
+    ]
+    if len(source_publications) != 1 or source_publications[0]["sequence"] >= published_sequence:
+        raise DomainError("historical implementation must descend from the reviewed PR head")
+    source_publication_sequence = source_publications[0]["sequence"]
+    descendant_publications = [
+        {
+            "sequence": event["sequence"],
+            "head_sha": event["payload"].get("head_sha"),
+            "previous_head_sha": event["payload"].get("previous_head_sha"),
+            "event_hash": event["event_hash"],
+        }
+        for event in remote_publications
+        if event["sequence"] >= source_publication_sequence
+    ]
+    if (
+        not descendant_publications
+        or not any(
+            item["event_hash"] == candidate_evidence["remote_publication_event_hash"]
+            for item in descendant_publications
+        )
+        or descendant_publications[-1]["head_sha"] != published_head
+        or descendant_publications[0]["head_sha"] != current.reviewed_head_sha
+    ):
+        raise DomainError("historical implementation is not on the package's governed PR history")
+
+    source_findings = sorted(
+        (
+            {
+                "finding_id": str(finding.get("finding_id") or ""),
+                "normalized_identity": str(finding.get("normalized_identity") or ""),
+            }
+            for finding in current.findings
+        ),
+        key=lambda item: item["finding_id"],
+    )
+    source_finding_ids = [item["finding_id"] for item in source_findings]
+    if (
+        not source_findings
+        or any(not item["finding_id"] or not item["normalized_identity"] for item in source_findings)
+        or len(source_finding_ids) != len(set(source_finding_ids))
+        or len({item["normalized_identity"] for item in source_findings})
+        != len(source_findings)
+    ):
+        raise DomainError("historical implementation source finding identities are ambiguous")
+
+    evidence = {
+        "candidate": candidate_evidence,
+        "canonical_pr_identity": {
+            "repository": publication.repository,
+            "branch": publication.remote_branch,
+            "base_branch": publication.base_branch,
+            "base_sha": candidate.base_sha,
+            "pull_request_number": publication.pull_request_number,
+        },
+        "reconciliation_id": reconciliation.id,
+        "reconciliation_sha256": reconciliation.evidence_sha256,
+        "current_published_head_sha": published_head,
+        "descendant_publications": descendant_publications,
+        "source_findings": source_findings,
+        "actor": normalized_actor,
+        "reason": normalized_reason,
+        "summary": normalized_summary,
+    }
+    evidence_sha256 = hashlib.sha256(_canonical(evidence).encode("utf-8")).hexdigest()
+    payload = {
+        "candidate_id": candidate.id,
+        "head_sha": candidate.head_sha,
+        "summary": normalized_summary,
+        "evidence_sha256": evidence_sha256,
+        "evidence": evidence,
+        "actor": normalized_actor,
+        "reason": normalized_reason,
+        "source_finding_ids": source_finding_ids,
+    }
+    duplicate = _command_duplicate(
+        session,
+        row,
+        event_type="HISTORICAL_IMPLEMENTATION_ADOPTED",
+        idempotency_key=idempotency_key,
+        payload=payload,
+    )
+    if duplicate is not None:
+        return duplicate
+    for other_id in session.scalars(
+        select(RemediationWorkPackageRow.id).where(
+            RemediationWorkPackageRow.publication_id == row.publication_id,
+            RemediationWorkPackageRow.id != row.id,
+        )
+    ):
+        other = get_work_package(session, other_id)
+        if other.candidate_id == candidate.id:
+            raise DomainError("historical implementation candidate is already adopted")
+    _append(
+        session,
+        row,
+        event_type="HISTORICAL_IMPLEMENTATION_ADOPTED",
         idempotency_key=idempotency_key,
         payload=payload,
     )

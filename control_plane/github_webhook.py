@@ -1161,6 +1161,24 @@ class GitHubWebhookGateway:
         self._verify_pull_identity(view, pull)
         return pull
 
+    def reconcile_pr_findings(
+        self,
+        session: Session,
+        publication_id: str,
+    ) -> dict[str, Any]:
+        view = get_view(session, publication_id)
+        if view.pull_request_number is None or view.remote_head_sha is None:
+            raise DomainError("PR finding reconciliation requires published PR metadata")
+        access = self._access(view.repository)
+        from .pr_findings import reconcile_pr_findings
+
+        return reconcile_pr_findings(
+            session,
+            publication_id,
+            github=self.github,
+            token=access.token,
+        )
+
     def _base_is_current(
         self,
         session: Session,
@@ -1645,6 +1663,19 @@ class GitHubWebhookGateway:
             "DISMISSED",
         }:
             return "NON_DECISION_HUMAN_REVIEW"
+
+        if review_state == ReviewDecision.APPROVED.value:
+            from .remediation import publication_has_unresolved_remediation_findings
+
+            try:
+                findings_open = publication_has_unresolved_remediation_findings(
+                    session,
+                    publication_id,
+                )
+            except DomainError:
+                findings_open = True
+            if findings_open:
+                return "HUMAN_APPROVAL_BLOCKED_REMEDIATION"
 
         if (
             view.state is PublicationState.IN_REVIEW
@@ -2575,6 +2606,7 @@ class GitHubWebhookGateway:
                     "MERGE_POLICY_VIOLATION",
                     "STALE_HEAD",
                     "STALE_BASE",
+                    "HUMAN_APPROVAL_BLOCKED_REMEDIATION",
                 }
             ):
                 latest_pull = self._read_pull(latest, access.token)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 from pydantic import SecretStr
@@ -40,6 +41,7 @@ from control_plane.github_webhook import _derive_next
 from control_plane.models import CodexReviewDispatchRow
 from control_plane.main import app, get_codex_review_broker, get_session
 from control_plane.profile_registry import profile_for_repository
+from control_plane.pr_findings import reconcile_pr_findings
 from control_plane.quarantine import VerifiedCandidateSource
 from control_plane.repository import load_events
 from control_plane.service import (
@@ -87,13 +89,38 @@ def published_publication(session):
             status=ValidationStatus.PASS,
             evidence_sha256=f"{index:064x}",
         )
-    return mark_remote_published(
+    view = mark_remote_published(
         session,
         view.publication_id,
         HEAD,
         branch="control-plane/issue-88-abcd1234",
         base_branch="master",
         pull_request_number=44,
+    )
+    _reconcile_empty_pr_findings(session, view)
+    return view
+
+
+def _reconcile_empty_pr_findings(session, view):
+    github = SimpleNamespace(
+        pull_request=lambda repository, number, token: PullRequestSnapshot(
+            number=view.pull_request_number,
+            state="open",
+            base_ref=view.base_branch,
+            head_ref=view.remote_branch,
+            head_sha=view.remote_head_sha,
+            base_sha=BASE,
+        ),
+        ref_sha=lambda repository, branch, token: BASE,
+        list_pull_reviews=lambda repository, number, token: [],
+        list_pull_review_comments=lambda repository, number, token: [],
+        list_pull_review_threads=lambda repository, number, token: [],
+    )
+    return reconcile_pr_findings(
+        session,
+        view.publication_id,
+        github=github,
+        token="test-installation-token",
     )
 
 
@@ -147,6 +174,7 @@ class FakeGitHub:
             base_ref="master",
             head_ref="control-plane/issue-88-abcd1234",
             head_sha=head_sha,
+            base_sha=BASE,
         )
 
     def list_issue_comments(self, repository, number, token):
@@ -1302,6 +1330,7 @@ def test_stale_locked_codex_head_check_closes_external_verification_race(
             base_branch=view.base_branch,
             pull_request_number=view.pull_request_number,
         )
+        _reconcile_empty_pr_findings(session, get_view(session, view.publication_id))
         return original_request(*args, **kwargs)
 
     monkeypatch.setattr(
@@ -1445,6 +1474,10 @@ def test_successor_head_gets_new_codex_run_and_old_trigger_remains_historical(se
         branch=first.remote_branch,
         base_branch=first.base_branch,
         pull_request_number=first.pull_request_number,
+    )
+    _reconcile_empty_pr_findings(
+        session,
+        get_view(session, first.publication_id),
     )
     github.head_sha = head_b
 

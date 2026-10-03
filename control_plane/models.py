@@ -105,6 +105,38 @@ class EventRow(Base):
     event_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
 
 
+class PRFindingReconciliationRow(Base):
+    __tablename__ = "pr_finding_reconciliations"
+    __table_args__ = (
+        UniqueConstraint(
+            "publication_id",
+            "sequence",
+            name="uq_pr_finding_reconciliation_sequence",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    publication_id: Mapped[str] = mapped_column(
+        ForeignKey("publications.id"),
+        nullable=False,
+        index=True,
+    )
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    repository: Mapped[str] = mapped_column(String(200), nullable=False)
+    pull_request_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    remote_head_sha: Mapped[str] = mapped_column(String(40), nullable=False)
+    remote_branch: Mapped[str] = mapped_column(String(200), nullable=False)
+    base_branch: Mapped[str] = mapped_column(String(200), nullable=False)
+    base_sha: Mapped[str] = mapped_column(String(40), nullable=False)
+    observed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utcnow,
+        nullable=False,
+    )
+    evidence: Mapped[dict] = mapped_column(JSON, nullable=False)
+    evidence_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+
+
 class RemediationWorkPackageRow(Base):
     """Aggregate identity and issue-link index; the event ledger is authoritative."""
 

@@ -26,6 +26,7 @@ from control_plane.github_api import (
     PullRequestSnapshot,
     PullReviewCommentSnapshot,
     PullReviewSnapshot,
+    PullReviewThreadSnapshot,
 )
 from control_plane.github_app import InstallationAccess
 from control_plane.plane_review import (
@@ -54,6 +55,7 @@ from control_plane.models import (
 from control_plane.main import mergeability_record, review_record
 from control_plane.schemas import MergeabilityRequest, ReviewRequest
 from control_plane.profile_registry import profile_for_repository
+from control_plane.pr_findings import reconcile_pr_findings
 from control_plane.quarantine import VerifiedCandidateSource
 from control_plane.repository import load_events
 from control_plane.service import (
@@ -116,13 +118,47 @@ def published(session, issue_number=2601):
             status=ValidationStatus.PASS,
             evidence_sha256=f"{index:064x}",
         )
-    return mark_remote_published(
+    view = mark_remote_published(
         session,
         view.publication_id,
         HEAD,
         branch=f"control-plane/issue-{issue_number}-webhook",
         base_branch="master",
         pull_request_number=44,
+    )
+    _reconcile_empty_pr_findings(session, view)
+    return view
+
+
+def _reconcile_empty_pr_findings(session, view):
+    class EmptyGitHub:
+        def pull_request(self, repository, number, token):
+            return PullRequestSnapshot(
+                number=view.pull_request_number,
+                state="open",
+                base_ref=view.base_branch,
+                head_ref=view.remote_branch,
+                head_sha=view.remote_head_sha,
+                base_sha=BASE,
+            )
+
+        def ref_sha(self, repository, branch, token):
+            return BASE
+
+        def list_pull_reviews(self, repository, number, token):
+            return []
+
+        def list_pull_review_comments(self, repository, number, token):
+            return []
+
+        def list_pull_review_threads(self, repository, number, token):
+            return []
+
+    return reconcile_pr_findings(
+        session,
+        view.publication_id,
+        github=EmptyGitHub(),
+        token="installation-token",
     )
 
 
@@ -145,7 +181,7 @@ def publish_next_head(session, view):
             status=ValidationStatus.PASS,
             evidence_sha256=f"{index + 20:064x}",
         )
-    return mark_remote_published(
+    published_head = mark_remote_published(
         session,
         view.publication_id,
         NEXT_HEAD,
@@ -153,6 +189,8 @@ def publish_next_head(session, view):
         base_branch=view.base_branch,
         pull_request_number=view.pull_request_number,
     )
+    _reconcile_empty_pr_findings(session, published_head)
+    return published_head
 
 
 def start_codex(session, view, *, expected_head_sha=HEAD, mode="required"):
@@ -514,6 +552,7 @@ class FakeGitHub:
             base_ref="master",
             head_ref="control-plane/issue-2601-webhook",
             head_sha=self.head_sha,
+            base_sha=BASE,
             merged=self.merged,
             merge_commit_sha=("9" * 40 if self.merged else None),
             mergeable=self.mergeable,
@@ -2207,6 +2246,108 @@ def test_exact_human_approval_can_advance_directly_to_ready_to_merge(session):
     assert current.mergeable is True
     assert result.next_role == "CONTROL_PLANE"
     assert result.next_action == "MERGE"
+
+
+def test_exact_human_approval_is_settled_while_orphan_pr_thread_is_open(session):
+    view = complete_codex_pass(session, start_codex(session, published(session)))
+    gate_time = codex_gate_time(session, view)
+    approval = PullReviewSnapshot(
+        review_id=804,
+        actor=HUMAN_ACTOR,
+        body="approved exact head with an unresolved historical finding",
+        state="APPROVED",
+        commit_id=HEAD,
+        submitted_at=(gate_time + timedelta(seconds=1)).isoformat(),
+    )
+    comment = PullReviewCommentSnapshot(
+        comment_id=4401,
+        review_id=4400,
+        actor="historical-reviewer",
+        body="Unadopted historical PR finding",
+        commit_id=HEAD,
+        path="control_plane/remediation.py",
+        line=84,
+        created_at="2026-10-01T12:00:00Z",
+        side="RIGHT",
+    )
+
+    class ReconciliationGitHub:
+        def pull_request(self, repository, number, token):
+            return PullRequestSnapshot(
+                number=number,
+                state="open",
+                base_ref="master",
+                head_ref=view.remote_branch,
+                head_sha=HEAD,
+                base_sha=BASE,
+            )
+
+        def ref_sha(self, repository, branch, token):
+            return BASE
+
+        def list_pull_reviews(self, repository, number, token):
+            return [
+                PullReviewSnapshot(
+                    review_id=4400,
+                    actor="historical-reviewer",
+                    body="historical finding",
+                    state="DISMISSED",
+                    commit_id=HEAD,
+                    submitted_at="2026-10-01T11:59:00Z",
+                )
+            ]
+
+        def list_pull_review_comments(self, repository, number, token):
+            return [comment]
+
+        def list_pull_review_threads(self, repository, number, token):
+            return [PullReviewThreadSnapshot("PRRT_h17_orphan", False, (4401,), 4401)]
+
+    receipt = reconcile_pr_findings(
+        session,
+        view.publication_id,
+        github=ReconciliationGitHub(),
+        token="installation-token",
+    )
+    assert receipt["threads"][0]["classification"] == "ORPHAN"
+
+    github = FakeGitHub()
+    github.mergeable = True
+    github.reviews = [approval]
+    value = gateway(github)
+    result = process_human_review_delivery(
+        session,
+        value,
+        delivery_id="delivery-human-approval-blocked-orphan",
+        review_id=approval.review_id,
+    )
+    replay = value.process_delivery(session, "delivery-human-approval-blocked-orphan")
+
+    current = get_view(session, view.publication_id)
+    events = load_events(session, view.publication_id)
+    watch = get_review_watch(session, view.publication_id)
+    assert result.outcome == "HUMAN_APPROVAL_BLOCKED_REMEDIATION"
+    assert result.next_role == "PRINCIPAL_REVIEWER"
+    assert result.next_action == "ADJUDICATE_HISTORICAL_FINDINGS"
+    assert replay.outcome == "PROCESSED"
+    assert get_webhook_delivery(
+        session,
+        "delivery-human-approval-blocked-orphan",
+    ).state == "PROCESSED"
+    assert current.state is PublicationState.IN_REVIEW
+    assert current.review_decision is None
+    assert current.mergeable is None
+    assert not any(
+        event["event_type"]
+        in {
+            EventType.REVIEW_RECORDED.value,
+            EventType.MERGEABILITY_RECORDED.value,
+            EventType.MERGED.value,
+        }
+        for event in events
+    )
+    assert watch.next_role == "PRINCIPAL_REVIEWER"
+    assert watch.next_action == "ADJUDICATE_HISTORICAL_FINDINGS"
 
 
 def test_pending_pre_gate_human_approval_stays_stale_after_codex_completes(session):

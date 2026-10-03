@@ -39,6 +39,8 @@ from .remediation_materializer import (
 from .repository import load_events
 from .schemas import (
     AddWorkDependencyRequest,
+    AdoptHistoricalPRFindingRequest,
+    AdoptHistoricalImplementationRequest,
     ClaimNextWorkRequest,
     ClaimWorkItemRequest,
     CompleteWorkItemRequest,
@@ -65,6 +67,8 @@ from .remediation import (
     begin_rejected_findings_finalization,
     begin_principal_verification,
     begin_successor_verification,
+    adopt_historical_implementation,
+    adopt_historical_pr_finding,
     claim_work_package,
     create_work_package,
     get_work_package,
@@ -798,6 +802,30 @@ def publication_publish(
         raise HTTPException(status_code=502, detail="publication failed closed") from exc
 
 
+@app.post(
+    "/api/v1/internal/publications/{publication_id}/pr-findings/reconcile",
+    dependencies=[Depends(require_token)],
+)
+def publication_pr_findings_reconcile(
+    publication_id: str,
+    session: Session = Depends(get_session),
+    gateway: GitHubWebhookGateway = Depends(get_github_authoritative_gateway),
+):
+    try:
+        result = gateway.reconcile_pr_findings(session, publication_id)
+        _sync_publication_watch(session, publication_id)
+        return result
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="publication not found") from exc
+    except DomainError as exc:
+        raise _conflict(exc) from exc
+    except (GitHubAuthError, GitHubApiError, GitHubWebhookError) as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="PR finding reconciliation failed closed",
+        ) from exc
+
+
 
 @app.post(
     "/api/v1/internal/publications/{publication_id}/codex-review/request",
@@ -1240,6 +1268,42 @@ def remediation_work_package_claim(
 
 
 @app.post(
+    "/api/v1/internal/remediation/work-packages/{work_package_id}/pr-findings/adopt",
+    dependencies=[Depends(require_token)],
+)
+def remediation_work_package_adopt_pr_finding(
+    work_package_id: str,
+    request: AdoptHistoricalPRFindingRequest,
+    session: Session = Depends(get_session),
+    materializer: GitHubRemediationMaterializer = Depends(get_remediation_materializer),
+):
+    try:
+        view = adopt_historical_pr_finding(
+            session,
+            work_package_id,
+            reconciliation_id=request.reconciliation_id,
+            root_comment_id=request.root_comment_id,
+            principal_review_run_id=request.principal_review_run_id,
+            decision=request.decision,
+            reason=request.reason,
+            priority=request.priority,
+            idempotency_key=request.idempotency_key,
+        )
+        return _work_package_payload(
+            materializer.sync_issue_projection(session, view.work_package_id)
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="work package or receipt not found") from exc
+    except DomainError as exc:
+        raise _conflict(exc) from exc
+    except RemediationMaterializationError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="remediation status projection failed closed",
+        ) from exc
+
+
+@app.post(
     "/api/v1/internal/remediation/work-packages/{work_package_id}/implementation",
     dependencies=[Depends(require_token)],
 )
@@ -1264,6 +1328,40 @@ def remediation_work_package_submit_implementation(
         )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="work package not found") from exc
+    except DomainError as exc:
+        raise _conflict(exc) from exc
+    except RemediationMaterializationError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="remediation status projection failed closed",
+        ) from exc
+
+
+@app.post(
+    "/api/v1/internal/remediation/work-packages/{work_package_id}/implementation/adopt-historical",
+    dependencies=[Depends(require_token)],
+)
+def remediation_work_package_adopt_historical_implementation(
+    work_package_id: str,
+    request: AdoptHistoricalImplementationRequest,
+    session: Session = Depends(get_session),
+    materializer: GitHubRemediationMaterializer = Depends(get_remediation_materializer),
+):
+    try:
+        view = adopt_historical_implementation(
+            session,
+            work_package_id,
+            candidate_id=request.candidate_id,
+            actor=request.actor,
+            reason=request.reason,
+            summary=request.summary,
+            idempotency_key=request.idempotency_key,
+        )
+        return _work_package_payload(
+            materializer.sync_issue_projection(session, view.work_package_id)
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="work package or candidate not found") from exc
     except DomainError as exc:
         raise _conflict(exc) from exc
     except RemediationMaterializationError as exc:

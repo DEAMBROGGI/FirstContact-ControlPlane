@@ -28,6 +28,8 @@ from control_plane.github_api import (
     PullRequestSnapshot,
     PullReviewCommentReactionSnapshot,
     PullReviewCommentSnapshot,
+    PullReviewSnapshot,
+    PullReviewThreadSnapshot,
 )
 from control_plane.github_app import InstallationAccess
 from control_plane.github_webhook import (
@@ -37,6 +39,11 @@ from control_plane.github_webhook import (
 )
 from control_plane.main import app, get_remediation_materializer, get_session
 from control_plane.models import RemediationEventRow, RemediationWorkPackageRow
+from control_plane.models import (
+    PRFindingReconciliationRow,
+    RemediationEventRow,
+    RemediationWorkPackageRow,
+)
 from control_plane.plane_review import (
     complete_plane_review_materialization,
     record_plane_review,
@@ -46,6 +53,8 @@ from control_plane.quarantine import VerifiedCandidateSource
 from control_plane.remediation import (
     PrincipalDecision,
     WorkPackageState,
+    adopt_historical_implementation,
+    adopt_historical_pr_finding,
     begin_principal_verification,
     begin_rejected_findings_finalization,
     begin_successor_verification,
@@ -58,6 +67,7 @@ from control_plane.remediation import (
     load_work_package_events,
     mark_implementation_rework_required,
     publication_has_unresolved_remediation_findings,
+    remediation_watch_action,
     record_github_artifact,
     record_issue_closed,
     record_summary_comment,
@@ -69,6 +79,8 @@ from control_plane.remediation_materializer import (
     RemediationMaterializationError,
 )
 from control_plane.repository import append_event, load_events
+from control_plane.pr_findings import reconcile_pr_findings
+from control_plane.pr_findings import latest_reconciliation, reconcile_pr_findings
 from control_plane.service import (
     complete_codex_review,
     create_publication,
@@ -112,7 +124,7 @@ def publish(session, *, issue_number=10):
             evidence_sha256=f"{index:064x}",
         )
     assert view.state is PublicationState.ADMITTED
-    return mark_remote_published(
+    published = mark_remote_published(
         session,
         view.publication_id,
         HEAD,
@@ -120,6 +132,779 @@ def publish(session, *, issue_number=10):
         base_branch="master",
         pull_request_number=13,
     )
+    _reconcile_empty_pr_findings(session, published)
+    return published
+
+
+def _reconcile_empty_pr_findings(session, view):
+    class EmptyGitHub:
+        def pull_request(self, repository, number, token):
+            return PullRequestSnapshot(
+                number=number,
+                state="open",
+                base_ref=view.base_branch,
+                head_ref=view.remote_branch,
+                head_sha=view.remote_head_sha,
+                base_sha=BASE,
+            )
+
+        def ref_sha(self, repository, branch, token):
+            return BASE
+
+        def list_pull_reviews(self, repository, number, token):
+            return []
+
+        def list_pull_review_comments(self, repository, number, token):
+            return []
+
+        def list_pull_review_threads(self, repository, number, token):
+            return []
+
+    return reconcile_pr_findings(
+        session,
+        view.publication_id,
+        github=EmptyGitHub(),
+        token="test-installation-token",
+    )
+
+
+def _review_thread_gateway(
+    view,
+    reviews=(),
+    comments=(),
+    threads=(),
+    base_sha=BASE,
+):
+    def pull_request(repository, number, token):
+        return PullRequestSnapshot(
+            number=view.pull_request_number,
+            state="open",
+            base_ref=view.base_branch,
+            head_ref=view.remote_branch,
+            head_sha=view.remote_head_sha,
+            base_sha=base_sha,
+        )
+
+    return SimpleNamespace(
+        pull_request=pull_request,
+        ref_sha=lambda repository, branch, token: base_sha,
+        list_pull_reviews=lambda repository, number, token: list(reviews),
+        list_pull_review_comments=lambda repository, number, token: list(comments),
+        list_pull_review_threads=lambda repository, number, token: list(threads),
+    )
+
+
+def test_reconciliation_classifies_tracked_orphans_and_excludes_resolved_threads(
+    session,
+):
+    view, _source_run, package = create_package(session)
+    comments = [
+        PullReviewCommentSnapshot(
+            comment_id=4101,
+            review_id=3101,
+            actor="chatgpt-codex-connector[bot]",
+            body="Accepted review finding",
+            commit_id=HEAD,
+            path="control_plane/service.py",
+            line=20,
+            created_at="2026-10-01T12:00:00Z",
+            side="RIGHT",
+        ),
+        PullReviewCommentSnapshot(
+            comment_id=4201,
+            review_id=3201,
+            actor="principal-reviewer",
+            body="Historical orphan one",
+            commit_id=HEAD,
+            path="control_plane/remediation.py",
+            line=41,
+            created_at="2026-10-01T12:01:00Z",
+            side="LEFT",
+        ),
+        PullReviewCommentSnapshot(
+            comment_id=4202,
+            review_id=3202,
+            actor="principal-reviewer",
+            body="Historical orphan two",
+            commit_id=HEAD,
+            path="control_plane/service.py",
+            line=52,
+            created_at="2026-10-01T12:02:00Z",
+            side="RIGHT",
+        ),
+        PullReviewCommentSnapshot(
+            comment_id=4301,
+            review_id=3301,
+            actor="principal-reviewer",
+            body="Already resolved finding",
+            commit_id=HEAD,
+            path="control_plane/github_api.py",
+            line=63,
+            created_at="2026-10-01T12:03:00Z",
+            side="RIGHT",
+        ),
+    ]
+    reviews = [
+        PullReviewSnapshot(3101, "chatgpt-codex-connector[bot]", "", "COMMENTED", HEAD, "2026-10-01T12:00:00Z"),
+        PullReviewSnapshot(3201, "principal-reviewer", "", "COMMENTED", HEAD, "2026-10-01T12:01:00Z"),
+        PullReviewSnapshot(3202, "principal-reviewer", "", "COMMENTED", HEAD, "2026-10-01T12:02:00Z"),
+        PullReviewSnapshot(3301, "principal-reviewer", "", "COMMENTED", HEAD, "2026-10-01T12:03:00Z"),
+    ]
+    threads = [
+        PullReviewThreadSnapshot("PRRT_tracked", False, (4101,), 4101),
+        PullReviewThreadSnapshot("PRRT_orphan_1", False, (4201,), 4201),
+        PullReviewThreadSnapshot("PRRT_orphan_2", False, (4202,), 4202),
+        PullReviewThreadSnapshot("PRRT_resolved", True, (4301,), 4301),
+    ]
+
+    receipt = reconcile_pr_findings(
+        session,
+        view.publication_id,
+        github=_review_thread_gateway(view, reviews, comments, threads),
+        token="test-installation-token",
+    )
+
+    assert receipt["remote_head_sha"] == HEAD
+    assert receipt["unresolved_thread_count"] == 3
+    assert len(receipt["threads"]) == 3
+    by_comment = {item["root_comment_id"]: item for item in receipt["threads"]}
+    assert by_comment[4101]["classification"] == "TRACKED"
+    assert by_comment[4101]["work_package_id"] == package.work_package_id
+    assert by_comment[4101]["finding_id"] == "codex:3101:4101"
+    assert by_comment[4201]["classification"] == "ORPHAN"
+    assert by_comment[4202]["classification"] == "ORPHAN"
+    assert all(item["is_resolved"] is False for item in receipt["threads"])
+
+
+def test_reconciliation_discovers_real_shape_dismissed_review_orphans(session):
+    view = publish(session)
+    source_head = "e11e21c6c91d68f6edce8a8b847297ac8a74e20e"
+    review = PullReviewSnapshot(
+        5372357970,
+        "DEAMBROGGI",
+        "Historical human review",
+        "DISMISSED",
+        source_head,
+        "2026-09-01T12:00:00Z",
+    )
+    comments = [
+        PullReviewCommentSnapshot(
+            4149659655,
+            5372357970,
+            "DEAMBROGGI",
+            "Historical finding one",
+            source_head,
+            "control_plane/remediation.py",
+            120,
+            "2026-09-01T12:01:00Z",
+            side="RIGHT",
+        ),
+        PullReviewCommentSnapshot(
+            4149659671,
+            5372357970,
+            "DEAMBROGGI",
+            "Historical finding two",
+            source_head,
+            "control_plane/service.py",
+            240,
+            "2026-09-01T12:02:00Z",
+            side="LEFT",
+        ),
+    ]
+    threads = [
+        PullReviewThreadSnapshot("PRRT_historical_1", False, (4149659655,), 4149659655),
+        PullReviewThreadSnapshot("PRRT_historical_2", False, (4149659671,), 4149659671),
+    ]
+
+    receipt = reconcile_pr_findings(
+        session,
+        view.publication_id,
+        github=_review_thread_gateway(view, [review], comments, threads),
+        token="test-installation-token",
+    )
+
+    assert [item["root_comment_id"] for item in receipt["threads"]] == [
+        4149659655,
+        4149659671,
+    ]
+    assert all(item["classification"] == "ORPHAN" for item in receipt["threads"])
+    assert all(item["provider_review_id"] == 5372357970 for item in receipt["threads"])
+    assert all(item["source_review_state"] == "DISMISSED" for item in receipt["threads"])
+    assert all(
+        item["source_reviewed_head_sha"] == source_head
+        for item in receipt["threads"]
+    )
+
+
+def test_reconciliation_base_drift_does_not_append_receipt(session):
+    view = publish(session)
+    previous = latest_reconciliation(session, view.publication_id)
+    assert previous is not None
+
+    with pytest.raises(DomainError, match="canonical PR base drifted"):
+        reconcile_pr_findings(
+            session,
+            view.publication_id,
+            github=_review_thread_gateway(view, base_sha="4" * 40),
+            token="test-installation-token",
+        )
+
+    current = latest_reconciliation(session, view.publication_id)
+    assert current is not None
+    assert current.id == previous.id
+    assert current.sequence == previous.sequence
+
+
+def test_historical_finding_adoption_fails_closed_on_missing_or_corrupt_receipt(
+    session,
+):
+    view, _source_run, package = create_package(session, review_mode="advisory")
+    original_findings = get_work_package(session, package.work_package_id).findings
+    with pytest.raises(KeyError):
+        adopt_historical_pr_finding(
+            session,
+            package.work_package_id,
+            reconciliation_id="missing-reconciliation-receipt",
+            root_comment_id=4201,
+            principal_review_run_id="principal-adjudication-missing-receipt",
+            decision="ACCEPTED",
+            reason="Receipt identity must exist in the publication ledger.",
+            priority="P1",
+            idempotency_key="adopt-missing-receipt",
+        )
+
+    comment = PullReviewCommentSnapshot(
+        4201,
+        3201,
+        "DEAMBROGGI",
+        "Historical orphan finding",
+        HEAD,
+        "control_plane/remediation.py",
+        41,
+        "2026-10-01T12:01:00Z",
+        side="RIGHT",
+    )
+    receipt = reconcile_pr_findings(
+        session,
+        view.publication_id,
+        github=_review_thread_gateway(
+            view,
+            [PullReviewSnapshot(3201, "DEAMBROGGI", "", "DISMISSED", HEAD, None)],
+            [comment],
+            [PullReviewThreadSnapshot("PRRT_corrupt", False, (4201,), 4201)],
+        ),
+        token="test-installation-token",
+    )
+    row = latest_reconciliation(session, view.publication_id)
+    assert row is not None
+    row.evidence = {**row.evidence, "remote_head_sha": "4" * 40}
+
+    with pytest.raises(DomainError, match="binding is corrupt"):
+        adopt_historical_pr_finding(
+            session,
+            package.work_package_id,
+            reconciliation_id=receipt["reconciliation_id"],
+            root_comment_id=4201,
+            principal_review_run_id="principal-adjudication-corrupt-receipt",
+            decision="ACCEPTED",
+            reason="Corrupt receipts must not create authoritative findings.",
+            priority="P1",
+            idempotency_key="adopt-corrupt-receipt",
+        )
+
+    assert get_work_package(session, package.work_package_id).findings == original_findings
+
+
+@pytest.mark.parametrize("decision", ["ACCEPTED", "REJECTED"])
+def test_historical_orphan_adoption_binds_receipt_and_principal_decision(
+    session,
+    decision,
+):
+    view, _source_run, package = create_package(session, review_mode="advisory")
+    comment = PullReviewCommentSnapshot(
+        4201,
+        3201,
+        "DEAMBROGGI",
+        "Historical orphan finding",
+        HEAD,
+        "control_plane/remediation.py",
+        41,
+        "2026-10-01T12:01:00Z",
+        side="RIGHT",
+    )
+    receipt = reconcile_pr_findings(
+        session,
+        view.publication_id,
+        github=_review_thread_gateway(
+            view,
+            [PullReviewSnapshot(3201, "DEAMBROGGI", "", "DISMISSED", HEAD, None)],
+            [comment],
+            [PullReviewThreadSnapshot("PRRT_adopt", False, (4201,), 4201)],
+        ),
+        token="test-installation-token",
+    )
+    review_run_id = f"principal-adjudication-{decision.lower()}"
+    record_plane_review(
+        session,
+        view.publication_id,
+        run_id=review_run_id,
+        reviewer_kind="PRINCIPAL_REVIEWER",
+        reviewer="principal-reviewer:chatgpt",
+        reviewed_head_sha=HEAD,
+        body="Principal adjudication of the exact current PR head.",
+        comments=[],
+        idempotency_key=f"record:{review_run_id}",
+    )
+    complete_plane_review_materialization(
+        session,
+        view.publication_id,
+        run_id=review_run_id,
+        provider_review_id=9801,
+        receipts=[],
+    )
+
+    adopted = adopt_historical_pr_finding(
+        session,
+        package.work_package_id,
+        reconciliation_id=receipt["reconciliation_id"],
+        root_comment_id=4201,
+        principal_review_run_id=review_run_id,
+        decision=decision,
+        reason="Principal adjudicated the reconciled source finding.",
+        priority="P1",
+        idempotency_key=f"adopt:{decision.lower()}",
+    )
+    repeated = adopt_historical_pr_finding(
+        session,
+        package.work_package_id,
+        reconciliation_id=receipt["reconciliation_id"],
+        root_comment_id=4201,
+        principal_review_run_id=review_run_id,
+        decision=decision,
+        reason="Principal adjudicated the reconciled source finding.",
+        priority="P1",
+        idempotency_key=f"adopt:{decision.lower()}",
+    )
+
+    finding = next(
+        item for item in adopted.findings if item["finding_id"].startswith("github-human-review:")
+    )
+    events = load_work_package_events(session, package.work_package_id)
+    event = next(item for item in events if item["event_type"] == "HUMAN_PR_FINDING_ADOPTED")
+    assert finding["source"]["reconciliation_id"] == receipt["reconciliation_id"]
+    assert finding["source"]["provider_thread_id"] == 4201
+    assert finding["source"]["provider_review_id"] == 3201
+    assert finding["source"]["source_reviewed_head_sha"] == HEAD
+    assert finding["source"]["source_actor"] == "DEAMBROGGI"
+    assert finding["source"]["body"] == "Historical orphan finding"
+    assert finding["principal_decision"]["decision"] == decision
+    assert finding["principal_decision"]["actor"] == "principal-reviewer:chatgpt"
+    assert event["payload"]["principal_adjudication"]["review_event_hash"]
+    assert repeated.findings == adopted.findings
+    assert sum(item["event_type"] == "HUMAN_PR_FINDING_ADOPTED" for item in events) == 1
+    assert all(item["event_type"] != "IMPLEMENTATION_SUBMITTED" for item in events)
+
+
+def test_historical_orphan_adoption_rejects_h1_receipt_after_h2(session):
+    view, _source_run, package = create_package(session, review_mode="advisory")
+    comment = PullReviewCommentSnapshot(
+        4201,
+        3201,
+        "DEAMBROGGI",
+        "Historical orphan finding",
+        HEAD,
+        "control_plane/remediation.py",
+        41,
+        "2026-10-01T12:01:00Z",
+        side="RIGHT",
+    )
+    source_review = PullReviewSnapshot(3201, "DEAMBROGGI", "", "DISMISSED", HEAD, None)
+    source_thread = PullReviewThreadSnapshot("PRRT_adopt_h1_h2", False, (4201,), 4201)
+    receipt_h1 = reconcile_pr_findings(
+        session,
+        view.publication_id,
+        github=_review_thread_gateway(view, [source_review], [comment], [source_thread]),
+        token="test-installation-token",
+    )
+    review_run_id = "principal-adjudication-h1"
+    record_plane_review(
+        session,
+        view.publication_id,
+        run_id=review_run_id,
+        reviewer_kind="PRINCIPAL_REVIEWER",
+        reviewer="principal-reviewer:chatgpt",
+        reviewed_head_sha=HEAD,
+        body="Principal adjudication of H1.",
+        comments=[],
+        idempotency_key=f"record:{review_run_id}",
+    )
+    complete_plane_review_materialization(
+        session,
+        view.publication_id,
+        run_id=review_run_id,
+        provider_review_id=9802,
+        receipts=[],
+    )
+    next_head = "4" * 40
+    publish_successor_review(
+        session,
+        view,
+        head=next_head,
+        tree="5" * 40,
+        marker="b",
+        review_id=9202,
+        evidence_offset=100,
+    )
+    current = get_view(session, view.publication_id)
+    receipt_h2 = reconcile_pr_findings(
+        session,
+        view.publication_id,
+        github=_review_thread_gateway(
+            current,
+            [source_review],
+            [comment],
+            [source_thread],
+        ),
+        token="test-installation-token",
+    )
+
+    assert receipt_h2["remote_head_sha"] == next_head
+    with pytest.raises(DomainError, match="receipt is stale"):
+        adopt_historical_pr_finding(
+            session,
+            package.work_package_id,
+            reconciliation_id=receipt_h1["reconciliation_id"],
+            root_comment_id=4201,
+            principal_review_run_id=review_run_id,
+            decision="ACCEPTED",
+            reason="Principal adjudicated the reconciled source finding.",
+            priority="P1",
+            idempotency_key="adopt:stale-h1",
+        )
+
+
+def test_historical_implementation_adoption_persists_governed_candidate_proof(session):
+    view, _source_run, package = create_package(session, review_mode="advisory")
+    claim_work_package(
+        session,
+        package.work_package_id,
+        actor="copilot-implementer",
+        idempotency_key="claim-historical-implementation",
+    )
+    next_head = "4" * 40
+    candidate_id, _successor_run = publish_successor_review(
+        session,
+        view,
+        head=next_head,
+        tree="5" * 40,
+        marker="b",
+        review_id=9202,
+        evidence_offset=100,
+    )
+    publication = get_view(session, package.publication_id)
+    _reconcile_empty_pr_findings(session, publication)
+
+    with pytest.raises(DomainError, match="does not own the work claim"):
+        adopt_historical_implementation(
+            session,
+            package.work_package_id,
+            candidate_id=candidate_id,
+            actor="unclaimed-actor",
+            reason="A different actor cannot adopt the active implementation claim.",
+            summary="Attempt adoption without owning the work claim.",
+            idempotency_key="adopt-historical-implementation-unclaimed",
+        )
+    assert get_work_package(session, package.work_package_id).state is WorkPackageState.IN_PROGRESS
+
+    adopted = adopt_historical_implementation(
+        session,
+        package.work_package_id,
+        candidate_id=candidate_id,
+        actor="copilot-implementer",
+        reason="The exact governed candidate was published before package submission.",
+        summary="Adopt the already published implementation history.",
+        idempotency_key="adopt-historical-implementation",
+    )
+    repeated = adopt_historical_implementation(
+        session,
+        package.work_package_id,
+        candidate_id=candidate_id,
+        actor="copilot-implementer",
+        reason="The exact governed candidate was published before package submission.",
+        summary="Adopt the already published implementation history.",
+        idempotency_key="adopt-historical-implementation",
+    )
+
+    events = load_work_package_events(session, package.work_package_id)
+    event = next(
+        item
+        for item in events
+        if item["event_type"] == "HISTORICAL_IMPLEMENTATION_ADOPTED"
+    )
+    evidence = event["payload"]["evidence"]
+    assert adopted.state is WorkPackageState.IMPLEMENTED
+    assert adopted.candidate_id == candidate_id
+    assert adopted.implementation_head_sha == next_head
+    assert adopted.implementation_evidence_sha256 == event["payload"]["evidence_sha256"]
+    assert evidence["candidate"]["candidate_submission_event_hash"]
+    assert evidence["candidate"]["candidate_admission_event_hash"]
+    assert len(evidence["candidate"]["required_validations"]) == len(
+        profile_for_repository(REPOSITORY).required_jobs
+    )
+    assert all(
+        item["status"] == "PASS"
+        for item in evidence["candidate"]["required_validations"]
+    )
+    assert evidence["canonical_pr_identity"]["pull_request_number"] == 13
+    assert evidence["current_published_head_sha"] == next_head
+    assert [
+        item["head_sha"] for item in evidence["descendant_publications"]
+    ] == [HEAD, next_head]
+    assert evidence["source_findings"] == [
+        {
+            "finding_id": finding["finding_id"],
+            "normalized_identity": finding["normalized_identity"],
+        }
+        for finding in sorted(package.findings, key=lambda item: item["finding_id"])
+    ]
+    assert repeated.state is WorkPackageState.IMPLEMENTED
+    assert sum(
+        item["event_type"] == "HISTORICAL_IMPLEMENTATION_ADOPTED" for item in events
+    ) == 1
+    assert all(item["event_type"] != "IMPLEMENTATION_SUBMITTED" for item in events)
+
+
+@pytest.mark.parametrize("outcome", ["FIXED", "NOT_FIXED"])
+def test_adopted_human_finding_requires_exact_head_principal_verification_and_artifacts(
+    session,
+    outcome,
+):
+    view, _source_run, package = create_package(session, review_mode="advisory")
+    claim_work_package(
+        session,
+        package.work_package_id,
+        actor="copilot-implementer",
+        idempotency_key="claim-adopted-finding-implementation",
+    )
+    human_review = PullReviewSnapshot(
+        3201,
+        "DEAMBROGGI",
+        "Historical review",
+        "DISMISSED",
+        HEAD,
+        "2026-09-01T12:00:00Z",
+    )
+    human_comment = PullReviewCommentSnapshot(
+        4201,
+        3201,
+        "DEAMBROGGI",
+        "Historical orphan finding",
+        HEAD,
+        "control_plane/remediation.py",
+        41,
+        "2026-09-01T12:01:00Z",
+        side="RIGHT",
+    )
+    codex_review = PullReviewSnapshot(
+        3101,
+        "chatgpt-codex-connector[bot]",
+        "",
+        "COMMENTED",
+        HEAD,
+        "2026-09-01T12:00:00Z",
+    )
+    codex_comment = PullReviewCommentSnapshot(
+        4101,
+        3101,
+        "chatgpt-codex-connector[bot]",
+        "Accepted review finding",
+        HEAD,
+        "control_plane/service.py",
+        20,
+        "2026-09-01T12:01:00Z",
+        side="RIGHT",
+    )
+    h1_receipt = reconcile_pr_findings(
+        session,
+        view.publication_id,
+        github=_review_thread_gateway(
+            view,
+            [codex_review, human_review],
+            [codex_comment, human_comment],
+            [
+                PullReviewThreadSnapshot("PRRT_codex", False, (4101,), 4101),
+                PullReviewThreadSnapshot("PRRT_human", False, (4201,), 4201),
+            ],
+        ),
+        token="test-installation-token",
+    )
+    adjudication_run = "principal-adjudication-for-verification"
+    record_plane_review(
+        session,
+        view.publication_id,
+        run_id=adjudication_run,
+        reviewer_kind="PRINCIPAL_REVIEWER",
+        reviewer="principal-reviewer:chatgpt",
+        reviewed_head_sha=HEAD,
+        body="Principal adjudication of the historical thread.",
+        comments=[],
+        idempotency_key=f"record:{adjudication_run}",
+    )
+    complete_plane_review_materialization(
+        session,
+        view.publication_id,
+        run_id=adjudication_run,
+        provider_review_id=9804,
+        receipts=[],
+    )
+    adopt_historical_pr_finding(
+        session,
+        package.work_package_id,
+        reconciliation_id=h1_receipt["reconciliation_id"],
+        root_comment_id=4201,
+        principal_review_run_id=adjudication_run,
+        decision="ACCEPTED",
+        reason="The Principal accepted the historical finding.",
+        priority="P1",
+        idempotency_key="adopt:accepted-for-verification",
+    )
+
+    next_head = "4" * 40
+    candidate_id, _successor_run = publish_successor_review(
+        session,
+        view,
+        head=next_head,
+        tree="5" * 40,
+        marker="b",
+        review_id=9205,
+        evidence_offset=200,
+    )
+    current = get_view(session, view.publication_id)
+    h2_receipt = reconcile_pr_findings(
+        session,
+        view.publication_id,
+        github=_review_thread_gateway(
+            current,
+            [codex_review, human_review],
+            [codex_comment, human_comment],
+            [
+                PullReviewThreadSnapshot("PRRT_codex", False, (4101,), 4101),
+                PullReviewThreadSnapshot("PRRT_human", False, (4201,), 4201),
+            ],
+        ),
+        token="test-installation-token",
+    )
+    assert h2_receipt["remote_head_sha"] == next_head
+    assert all(item["classification"] == "TRACKED" for item in h2_receipt["threads"])
+    adopt_historical_implementation(
+        session,
+        package.work_package_id,
+        candidate_id=candidate_id,
+        actor="copilot-implementer",
+        reason="The validated H2 candidate is the implementation of these findings.",
+        summary="Adopt the exact governed H2 implementation.",
+        idempotency_key="adopt-historical-implementation-before-verification",
+    )
+
+    package_view = get_work_package(session, package.work_package_id)
+    accepted_findings = [
+        item
+        for item in package_view.findings
+        if item["principal_decision"]["decision"] == "ACCEPTED"
+    ]
+    verification_run = f"principal-verification-h2-{outcome.lower()}"
+    comments = [
+        {
+            "finding_id": item["finding_id"],
+            "normalized_identity": item["normalized_identity"],
+            "priority": item["priority"],
+            "path": f"control_plane/verification_{index}.py",
+            "line": index + 10,
+            "side": "RIGHT",
+            "body": f"Principal verification for {item['finding_id']}.",
+        }
+        for index, item in enumerate(accepted_findings)
+    ]
+    record_plane_review(
+        session,
+        view.publication_id,
+        run_id=verification_run,
+        reviewer_kind="PRINCIPAL_REVIEWER",
+        reviewer="principal-reviewer:chatgpt",
+        reviewed_head_sha=next_head,
+        body="Exact H2 Principal verification of all accepted findings.",
+        comments=comments,
+        idempotency_key=f"record:{verification_run}",
+    )
+    provider_review_id = 9805
+    complete_plane_review_materialization(
+        session,
+        view.publication_id,
+        run_id=verification_run,
+        provider_review_id=provider_review_id,
+        receipts=[
+            {
+                "finding_id": item["finding_id"],
+                "provider_comment_id": 9900 + index,
+                "provider_review_id": provider_review_id,
+                "path": item["path"],
+                "line": item["line"],
+            }
+            for index, item in enumerate(comments)
+        ],
+    )
+    verifying = begin_principal_verification(
+        session,
+        package.work_package_id,
+        review_run_id=verification_run,
+        head_sha=next_head,
+        idempotency_key=f"begin:{verification_run}",
+    )
+    assert verifying.principal_verification["candidate_id"] == candidate_id
+    assert verifying.principal_verification["head_sha"] == next_head
+    for finding in accepted_findings:
+        verify_finding(
+            session,
+            package.work_package_id,
+            finding_id=finding["finding_id"],
+            outcome=outcome,
+            reviewer="principal-reviewer:chatgpt",
+            evidence=f"{outcome} on the exact H2 candidate.",
+            idempotency_key=f"verify:{outcome}:{finding['finding_id']}",
+        )
+
+    final_package = get_work_package(session, package.work_package_id)
+    adopted_finding = next(
+        item for item in final_package.findings if item["source"].get("kind") == "GITHUB_REVIEW_THREAD"
+    )
+    assert adopted_finding["verification"]["outcome"] == outcome
+    assert adopted_finding["verification"]["head_sha"] == next_head
+    assert publication_has_unresolved_remediation_findings(session, view.publication_id)
+    with pytest.raises(DomainError, match="approval is blocked"):
+        record_review(
+            session,
+            view.publication_id,
+            reviewed_head_sha=next_head,
+            decision=ReviewDecision.APPROVED,
+        )
+    with pytest.raises(DomainError, match="Codex review is blocked"):
+        request_codex_review(
+            session,
+            view.publication_id,
+            mode="advisory",
+            expected_head_sha=next_head,
+        )
+    from control_plane.service import record_merged
+
+    with pytest.raises(DomainError, match="merge is blocked"):
+        record_merged(
+            session,
+            view.publication_id,
+            head_sha=next_head,
+            pull_request_number=13,
+            merge_commit_sha="6" * 40,
+            source="GITHUB_RECONCILE",
+        )
 
 
 def record_legacy_codex_review_request(session, view, *, head, run_id=None):
@@ -149,11 +934,12 @@ def add_completed_review(
     head=HEAD,
     result=AutomatedReviewStatus.CHANGES_REQUIRED,
     extra_findings=(),
+    mode="required",
 ):
     running = request_codex_review(
         session,
         view.publication_id,
-        mode="required",
+        mode=mode,
         expected_head_sha=head,
     )
     review_findings = (
@@ -284,12 +1070,14 @@ def create_package(
     issue_number=14,
     findings=None,
     extra_review_findings=(),
+    review_mode="required",
 ):
     view = publish(session)
     run_id = add_completed_review(
         session,
         view,
         extra_findings=extra_review_findings,
+        mode=review_mode,
     )
     package = create_work_package(
         session,
@@ -682,6 +1470,13 @@ def test_review_thread_resolution_uses_separate_secret_and_fails_closed_when_mis
 def test_project_and_codex_credentials_are_masked_and_factory_uses_project_setting(
     monkeypatch,
 ):
+    for field in (
+        "REMEDIATION_PROJECT_TOKEN",
+        "REMEDIATION_THREAD_TOKEN",
+        "CODEX_REVIEW_USER_TOKEN",
+    ):
+        monkeypatch.delenv(f"CONTROL_PLANE_{field}", raising=False)
+
     configured = Settings(
         _env_file=None,
         remediation_project_token=SecretStr("project-only-secret"),
@@ -1212,6 +2007,58 @@ def test_remediation_api_requires_internal_auth_and_claim_is_idempotent(session)
         app.dependency_overrides.pop(get_remediation_materializer, None)
 
 
+def test_historical_adoption_routes_require_internal_auth(session):
+    _view, _source_run, package = create_package(session)
+    original_findings = get_work_package(session, package.work_package_id).findings
+
+    class ProjectionStub:
+        def sync_issue_projection(self, _session, work_package_id):
+            return get_work_package(session, work_package_id)
+
+    original_overrides = app.dependency_overrides.copy()
+
+    def override_session():
+        yield session
+
+    app.dependency_overrides[get_session] = override_session
+    app.dependency_overrides[get_remediation_materializer] = lambda: ProjectionStub()
+    client = TestClient(app)
+    try:
+        base_path = (
+            f"/api/v1/internal/remediation/work-packages/{package.work_package_id}"
+        )
+        orphan_response = client.post(
+            f"{base_path}/pr-findings/adopt",
+            json={
+                "reconciliation_id": "00000000-0000-4000-8000-000000000001",
+                "root_comment_id": 4201,
+                "principal_review_run_id": "principal-adjudication-route-auth",
+                "decision": "ACCEPTED",
+                "reason": "Authorization is required before receipt adoption.",
+                "priority": "P1",
+                "idempotency_key": "unauthenticated-orphan-adoption",
+            },
+        )
+        implementation_response = client.post(
+            f"{base_path}/implementation/adopt-historical",
+            json={
+                "candidate_id": "00000000-0000-4000-8000-000000000002",
+                "actor": "copilot-implementer",
+                "reason": "Authorization is required before candidate adoption.",
+                "summary": "Historical governed implementation.",
+                "idempotency_key": "unauthenticated-implementation-adoption",
+            },
+        )
+
+        assert orphan_response.status_code == 401
+        assert implementation_response.status_code == 401
+    finally:
+        app.dependency_overrides.clear()
+        app.dependency_overrides.update(original_overrides)
+
+    assert get_work_package(session, package.work_package_id).findings == original_findings
+
+
 def test_implementation_submission_projects_actual_project_review_state(session):
     view, _source_run, package = create_package(session)
     claim_work_package(
@@ -1424,6 +2271,10 @@ def test_fixed_principal_verification_materializes_incrementally_with_candidate_
         branch=view.remote_branch,
         base_branch=view.base_branch,
         pull_request_number=view.pull_request_number,
+    )
+    _reconcile_empty_pr_findings(
+        session,
+        get_view(session, view.publication_id),
     )
     github = FakeRemediationGitHub(view)
     github.head_sha = descendant_head
