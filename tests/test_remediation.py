@@ -46,6 +46,7 @@ from control_plane.quarantine import VerifiedCandidateSource
 from control_plane.remediation import (
     PrincipalDecision,
     WorkPackageState,
+    begin_principal_verification,
     begin_rejected_findings_finalization,
     begin_successor_verification,
     claim_github_artifact_dispatch,
@@ -141,12 +142,33 @@ def record_legacy_codex_review_request(session, view, *, head, run_id=None):
     return SimpleNamespace(automated_review_run_id=run_id)
 
 
-def add_completed_review(session, view, *, head=HEAD, result=AutomatedReviewStatus.CHANGES_REQUIRED):
+def add_completed_review(
+    session,
+    view,
+    *,
+    head=HEAD,
+    result=AutomatedReviewStatus.CHANGES_REQUIRED,
+    extra_findings=(),
+):
     running = request_codex_review(
         session,
         view.publication_id,
         mode="required",
         expected_head_sha=head,
+    )
+    review_findings = (
+        [
+            {
+                "provider_comment_id": 4101,
+                "provider_review_id": 3101,
+                "path": "control_plane/service.py",
+                "line": 20,
+                "body": "Accepted review finding",
+            },
+            *deepcopy(list(extra_findings)),
+        ]
+        if result is AutomatedReviewStatus.CHANGES_REQUIRED
+        else []
     )
     completed = complete_codex_review(
         session,
@@ -154,21 +176,11 @@ def add_completed_review(session, view, *, head=HEAD, result=AutomatedReviewStat
         run_id=running.automated_review_run_id,
         reviewed_head_sha=head,
         result=result,
-        findings=(
-            [
-                {
-                    "provider_comment_id": 4101,
-                    "provider_review_id": 3101,
-                    "path": "control_plane/service.py",
-                    "line": 20,
-                    "body": "Accepted review finding",
-                }
-            ]
-            if result is AutomatedReviewStatus.CHANGES_REQUIRED
-            else []
-        ),
+        findings=review_findings,
         provider_review_ids=[3101],
-        provider_comment_ids=[4101] if result is AutomatedReviewStatus.CHANGES_REQUIRED else [],
+        provider_comment_ids=[
+            item["provider_comment_id"] for item in review_findings
+        ],
     )
     assert completed.automated_review_run_id == running.automated_review_run_id
     return completed.automated_review_run_id
@@ -266,9 +278,19 @@ def initial_findings():
     ]
 
 
-def create_package(session, *, issue_number=14):
+def create_package(
+    session,
+    *,
+    issue_number=14,
+    findings=None,
+    extra_review_findings=(),
+):
     view = publish(session)
-    run_id = add_completed_review(session, view)
+    run_id = add_completed_review(
+        session,
+        view,
+        extra_findings=extra_review_findings,
+    )
     package = create_work_package(
         session,
         publication_id=view.publication_id,
@@ -277,10 +299,160 @@ def create_package(session, *, issue_number=14):
         review_provider="CODEX_CODE_REVIEW",
         provider_review_id=3101,
         reviewed_head_sha=HEAD,
-        findings=initial_findings(),
+        findings=initial_findings() if findings is None else findings,
         idempotency_key="issue14-ready",
     )
     return view, run_id, package
+
+
+def two_provider_findings():
+    findings = deepcopy(initial_findings())
+    findings[1].update(
+        {
+            "finding_id": "codex:3101:4102",
+            "normalized_identity": "codex:review-3101:comment-4102",
+            "source": {
+                "kind": "PROVIDER_THREAD",
+                "provider": "CODEX_CODE_REVIEW",
+                "provider_review_id": 3101,
+                "provider_thread_id": 4102,
+            },
+            "desired_reaction": "+1",
+        }
+    )
+    extra_review_findings = [
+        {
+            "provider_comment_id": 4102,
+            "provider_review_id": 3101,
+            "path": "control_plane/service.py",
+            "line": 21,
+            "body": "Second accepted review finding",
+        }
+    ]
+    return findings, extra_review_findings
+
+
+def record_principal_review(
+    session,
+    publication_id,
+    *,
+    run_id,
+    head_sha,
+    reviewer_kind="PRINCIPAL_REVIEWER",
+    provider_review_id=9301,
+):
+    reviewer = "principal-reviewer:chatgpt"
+    provider_comment_id = provider_review_id + 100
+    comment = {
+        "finding_id": f"principal:{run_id}",
+        "normalized_identity": f"principal:fingerprint:{run_id}",
+        "priority": "P1",
+        "path": "control_plane/remediation.py",
+        "line": 947,
+        "side": "RIGHT",
+        "body": "Verify the exact implementation candidate.",
+    }
+    record_plane_review(
+        session,
+        publication_id,
+        run_id=run_id,
+        reviewer_kind=reviewer_kind,
+        reviewer=reviewer,
+        reviewed_head_sha=head_sha,
+        body="Principal verification of the exact implementation head.",
+        comments=[comment],
+        idempotency_key=f"record:{run_id}",
+    )
+    complete_plane_review_materialization(
+        session,
+        publication_id,
+        run_id=run_id,
+        provider_review_id=provider_review_id,
+        receipts=[
+            {
+                "finding_id": comment["finding_id"],
+                "provider_comment_id": provider_comment_id,
+                "provider_review_id": provider_review_id,
+                "path": comment["path"],
+                "line": comment["line"],
+            }
+        ],
+    )
+    return reviewer
+
+
+def prepare_principal_implementation(
+    session,
+    *,
+    implementation_head="4" * 40,
+    review_run_id="principal-review:implementation",
+    reviewer_kind="PRINCIPAL_REVIEWER",
+    findings=None,
+    extra_review_findings=(),
+    provider_review_id=9301,
+):
+    package_findings = (
+        [deepcopy(initial_findings()[0])]
+        if findings is None
+        else findings
+    )
+    view, source_run_id, package = create_package(
+        session,
+        findings=package_findings,
+        extra_review_findings=extra_review_findings,
+    )
+    claim_work_package(
+        session,
+        package.work_package_id,
+        actor="general-implementer",
+        idempotency_key="principal-implementation-claim",
+    )
+    candidate = submit_verified_candidate(
+        session,
+        view.publication_id,
+        source(implementation_head, "5" * 40, "b"),
+    )
+    submit_implementation(
+        session,
+        package.work_package_id,
+        candidate_id=candidate.current_candidate.candidate_id,
+        head_sha=implementation_head,
+        summary="Implement the accepted remediation findings.",
+        evidence_sha256="d" * 64,
+        idempotency_key="principal-implementation-submitted",
+    )
+    profile = profile_for_repository(REPOSITORY)
+    for index, job_id in enumerate(profile.required_jobs, 1):
+        record_validation(
+            session,
+            view.publication_id,
+            job_id=job_id,
+            status=ValidationStatus.PASS,
+            evidence_sha256=f"{index + 30:064x}",
+        )
+    mark_remote_published(
+        session,
+        view.publication_id,
+        implementation_head,
+        branch=view.remote_branch,
+        base_branch=view.base_branch,
+        pull_request_number=view.pull_request_number,
+    )
+    reviewer = record_principal_review(
+        session,
+        view.publication_id,
+        run_id=review_run_id,
+        head_sha=implementation_head,
+        reviewer_kind=reviewer_kind,
+        provider_review_id=provider_review_id,
+    )
+    return (
+        view,
+        source_run_id,
+        package,
+        candidate.current_candidate.candidate_id,
+        reviewer,
+    )
 
 
 def prepare_verifying_package(session):
@@ -839,6 +1011,13 @@ def test_materializer_recovers_lost_responses_without_duplicate_artifacts(sessio
     assert github.resolve_calls == 1
     assert len(github.issue_comments) == 1
     assert github.summary_calls == 1  # recovery found the marker before another comment attempt
+    legacy_summary = github.issue_comments[0].body
+    assert f"Candidate {result.candidate_id} at {result.implementation_head_sha}" in legacy_summary
+    assert (
+        f"reviewed by run {result.successor_review_run_id} at {result.successor_head_sha}"
+        in legacy_summary
+    )
+    assert "no code remediation was required" not in legacy_summary.lower()
     assert github.close_calls == 1
     assert github.project_statuses[-1] == ("I_kwDO_issue14", "Done")
     assert len(load_work_package_events(session, package.work_package_id)) == 13
@@ -1153,7 +1332,7 @@ def test_fixed_principal_verification_materializes_incrementally_with_candidate_
         actor="general-implementer",
         idempotency_key="claim-principal-fixed",
     )
-    implementation_head = "4" * 40
+    implementation_head = "a8187b6103845bcb9ed147df0ae40fac804d2a8a"
     candidate = submit_verified_candidate(
         session,
         view.publication_id,
@@ -1185,7 +1364,7 @@ def test_fixed_principal_verification_materializes_incrementally_with_candidate_
         base_branch=view.base_branch,
         pull_request_number=view.pull_request_number,
     )
-    review_run_id = "principal-review:fixed-incremental"
+    review_run_id = "principal-fix-review:wp47:h14"
     review_reviewer = "principal-reviewer:chatgpt"
     comments = [
         {
@@ -1224,8 +1403,30 @@ def test_fixed_principal_verification_materializes_incrementally_with_candidate_
             }
         ],
     )
+    descendant_head = "3700eac6819ef9a5450acf13d705fdab17cd26e7"
+    descendant = submit_verified_candidate(
+        session,
+        view.publication_id,
+        source(descendant_head, "6" * 40, "c"),
+    )
+    for index, job_id in enumerate(profile.required_jobs, 1):
+        record_validation(
+            session,
+            view.publication_id,
+            job_id=job_id,
+            status=ValidationStatus.PASS,
+            evidence_sha256=f"{index + 120:064x}",
+        )
+    mark_remote_published(
+        session,
+        view.publication_id,
+        descendant_head,
+        branch=view.remote_branch,
+        base_branch=view.base_branch,
+        pull_request_number=view.pull_request_number,
+    )
     github = FakeRemediationGitHub(view)
-    github.head_sha = implementation_head
+    github.head_sha = descendant_head
     github.drop_reaction_response = False
     github.drop_reply_response = False
     github.drop_summary_response = False
@@ -1336,6 +1537,365 @@ def test_fixed_principal_verification_materializes_incrementally_with_candidate_
     assert github.close_calls == 0
 
 
+def test_principal_verification_rejects_wrong_run_head_provider_and_reviewer_kind(
+    session,
+):
+    view, source_run_id, package, _candidate_id, reviewer = (
+        prepare_principal_implementation(session)
+    )
+    fallback_run_id = "principal-review:fallback-kind"
+    record_principal_review(
+        session,
+        view.publication_id,
+        run_id=fallback_run_id,
+        head_sha="4" * 40,
+        reviewer_kind="FALLBACK_REVIEWER",
+        provider_review_id=9310,
+    )
+    wrong_review_head = "8" * 40
+    submit_verified_candidate(
+        session,
+        view.publication_id,
+        source(wrong_review_head, "9" * 40, "e"),
+    )
+    profile = profile_for_repository(REPOSITORY)
+    for index, job_id in enumerate(profile.required_jobs, 1):
+        record_validation(
+            session,
+            view.publication_id,
+            job_id=job_id,
+            status=ValidationStatus.PASS,
+            evidence_sha256=f"{index + 300:064x}",
+        )
+    mark_remote_published(
+        session,
+        view.publication_id,
+        wrong_review_head,
+        branch=view.remote_branch,
+        base_branch=view.base_branch,
+        pull_request_number=view.pull_request_number,
+    )
+    wrong_head_run_id = "principal-review:wrong-head"
+    record_principal_review(
+        session,
+        view.publication_id,
+        run_id=wrong_head_run_id,
+        head_sha=wrong_review_head,
+        provider_review_id=9311,
+    )
+
+    invalid_bindings = [
+        ("missing-review-run", "4" * 40),
+        ("principal-review:implementation", "3" * 40),
+        (wrong_head_run_id, "4" * 40),
+        (source_run_id, "4" * 40),
+        (fallback_run_id, "4" * 40),
+    ]
+    for index, (run_id, head_sha) in enumerate(invalid_bindings):
+        with pytest.raises(DomainError):
+            begin_principal_verification(
+                session,
+                package.work_package_id,
+                review_run_id=run_id,
+                head_sha=head_sha,
+                idempotency_key=f"invalid-principal-binding-{index}",
+            )
+
+    started = begin_principal_verification(
+        session,
+        package.work_package_id,
+        review_run_id="principal-review:implementation",
+        head_sha="4" * 40,
+        idempotency_key="valid-principal-binding-after-rejections",
+    )
+    assert started.state is WorkPackageState.VERIFYING
+    assert started.principal_verification["reviewer"] == reviewer
+
+
+def test_principal_verification_rejects_wrong_candidate_and_unpublished_implementation(
+    session,
+):
+    view, _source_run_id, package, original_candidate_id, _reviewer = (
+        prepare_principal_implementation(session)
+    )
+    implementation_head = "4" * 40
+    mark_implementation_rework_required(
+        session,
+        package.work_package_id,
+        reason="Prepare a replacement-candidate identity check.",
+        idempotency_key="replacement-candidate-rework",
+    )
+    claim_work_package(
+        session,
+        package.work_package_id,
+        actor="general-implementer",
+        idempotency_key="replacement-candidate-claim",
+    )
+    replacement = submit_verified_candidate(
+        session,
+        view.publication_id,
+        source(implementation_head, "6" * 40, "c"),
+    )
+    replacement_candidate_id = replacement.current_candidate.candidate_id
+    assert replacement_candidate_id != original_candidate_id
+    submit_implementation(
+        session,
+        package.work_package_id,
+        candidate_id=replacement_candidate_id,
+        head_sha=implementation_head,
+        summary="Replacement candidate is not published.",
+        evidence_sha256="e" * 64,
+        idempotency_key="replacement-candidate-submitted",
+    )
+
+    with pytest.raises(DomainError, match="implementation candidate"):
+        begin_principal_verification(
+            session,
+            package.work_package_id,
+            review_run_id="principal-review:implementation",
+            head_sha=implementation_head,
+            idempotency_key="replacement-candidate-principal-start",
+        )
+
+
+def test_principal_materialization_rejects_unrecorded_live_head_before_writes(session):
+    view, _source_run_id, package, _candidate_id, reviewer = (
+        prepare_principal_implementation(session)
+    )
+    implementation_head = "4" * 40
+    github = FakeRemediationGitHub(view)
+    github.head_sha = implementation_head
+    github.drop_reaction_response = False
+    github.drop_reply_response = False
+    github.drop_summary_response = False
+    materializer = GitHubRemediationMaterializer(
+        token_provider=FakeRemediationTokenProvider(),
+        github=github,
+        project_token=SecretStr("project-user-token"),
+        review_thread_token=SecretStr("review-user-token"),
+    )
+    materializer.materialize(session, package.work_package_id)
+    begin_principal_verification(
+        session,
+        package.work_package_id,
+        review_run_id="principal-review:implementation",
+        head_sha=implementation_head,
+        idempotency_key="unrecorded-head-principal-start",
+    )
+    verify_finding(
+        session,
+        package.work_package_id,
+        finding_id="codex:3101:4101",
+        outcome="FIXED",
+        reviewer=reviewer,
+        evidence="The exact candidate is fixed.",
+        idempotency_key="unrecorded-head-principal-fixed",
+    )
+    artifacts_before = (
+        github.reaction_calls,
+        github.reply_calls,
+        github.resolve_calls,
+        github.summary_calls,
+        len(github.replies),
+    )
+    github.head_sha = "9" * 40
+
+    with pytest.raises(RemediationMaterializationError):
+        materializer.materialize(session, package.work_package_id)
+
+    fixed = get_work_package(session, package.work_package_id).findings[0]
+    assert fixed["verification_materialization"]["reply"] == "PENDING"
+    assert fixed["verification_materialization"]["resolution"] == "PENDING"
+    assert artifacts_before == (
+        github.reaction_calls,
+        github.reply_calls,
+        github.resolve_calls,
+        github.summary_calls,
+        len(github.replies),
+    )
+
+
+def test_principal_fixed_artifacts_survive_mixed_rework_and_second_implementation(
+    session,
+):
+    findings, extra_review_findings = two_provider_findings()
+    first_head = "4" * 40
+    first_run_id = "principal-review:mixed-first"
+    view, _source_run_id, package, _first_candidate_id, reviewer = (
+        prepare_principal_implementation(
+            session,
+            implementation_head=first_head,
+            review_run_id=first_run_id,
+            findings=findings,
+            extra_review_findings=extra_review_findings,
+        )
+    )
+    github = FakeRemediationGitHub(view)
+    github.head_sha = first_head
+    github.drop_reaction_response = False
+    github.drop_reply_response = False
+    github.drop_summary_response = False
+    materializer = GitHubRemediationMaterializer(
+        token_provider=FakeRemediationTokenProvider(),
+        github=github,
+        project_token=SecretStr("project-user-token"),
+        review_thread_token=SecretStr("review-user-token"),
+    )
+    materializer.materialize(session, package.work_package_id)
+    started = begin_principal_verification(
+        session,
+        package.work_package_id,
+        review_run_id=first_run_id,
+        head_sha=first_head,
+        idempotency_key="mixed-principal-first-start",
+    )
+    assert started.principal_verification["finding_ids"] == [
+        "codex:3101:4101",
+        "codex:3101:4102",
+    ]
+    verify_finding(
+        session,
+        package.work_package_id,
+        finding_id="codex:3101:4101",
+        outcome="FIXED",
+        reviewer=reviewer,
+        evidence="Finding A is fixed.",
+        idempotency_key="mixed-principal-a-fixed",
+    )
+    rework = verify_finding(
+        session,
+        package.work_package_id,
+        finding_id="codex:3101:4102",
+        outcome="NOT_FIXED",
+        reviewer=reviewer,
+        evidence="Finding B still reproduces.",
+        idempotency_key="mixed-principal-b-not-fixed",
+    )
+    assert rework.state is WorkPackageState.REWORK_REQUIRED
+
+    materialized = materializer.materialize(session, package.work_package_id)
+    fixed = next(
+        item for item in materialized.findings if item["finding_id"] == "codex:3101:4101"
+    )
+    not_fixed = next(
+        item for item in materialized.findings if item["finding_id"] == "codex:3101:4102"
+    )
+    assert materialized.state is WorkPackageState.REWORK_REQUIRED
+    assert fixed["closure_state"] == "FIXED"
+    assert fixed["verification_materialization"]["reply"] == "MATERIALIZED"
+    assert fixed["verification_materialization"]["resolution"] == "MATERIALIZED"
+    assert not_fixed["verification"]["outcome"] == "NOT_FIXED"
+    assert not_fixed["verification_history"][-1]["outcome"] == "NOT_FIXED"
+    assert not_fixed["verification_materialization"]["reply"] == "PENDING"
+    assert not_fixed["verification_materialization"]["resolution"] == "PENDING"
+    assert github.resolved == {4101}
+    assert 4102 not in github.resolved
+    assert github.reaction_calls == 2
+    assert github.reply_calls == 3
+    assert github.resolve_calls == 1
+    assert github.summary_calls == 0
+
+    materializer.materialize(session, package.work_package_id)
+    assert github.reaction_calls == 2
+    assert github.reply_calls == 3
+    assert github.resolve_calls == 1
+    assert github.summary_calls == 0
+
+    claim_work_package(
+        session,
+        package.work_package_id,
+        actor="general-implementer",
+        idempotency_key="mixed-principal-rework-claim",
+    )
+    second_head = "6" * 40
+    second_candidate = submit_verified_candidate(
+        session,
+        view.publication_id,
+        source(second_head, "7" * 40, "f"),
+    )
+    submit_implementation(
+        session,
+        package.work_package_id,
+        candidate_id=second_candidate.current_candidate.candidate_id,
+        head_sha=second_head,
+        summary="Fix the remaining finding without reopening A.",
+        evidence_sha256="f" * 64,
+        idempotency_key="mixed-principal-second-implementation",
+    )
+    profile = profile_for_repository(REPOSITORY)
+    for index, job_id in enumerate(profile.required_jobs, 1):
+        record_validation(
+            session,
+            view.publication_id,
+            job_id=job_id,
+            status=ValidationStatus.PASS,
+            evidence_sha256=f"{index + 400:064x}",
+        )
+    mark_remote_published(
+        session,
+        view.publication_id,
+        second_head,
+        branch=view.remote_branch,
+        base_branch=view.base_branch,
+        pull_request_number=view.pull_request_number,
+    )
+    second_run_id = "principal-review:mixed-second"
+    record_principal_review(
+        session,
+        view.publication_id,
+        run_id=second_run_id,
+        head_sha=second_head,
+        provider_review_id=9302,
+    )
+    github.head_sha = second_head
+    second_start = begin_principal_verification(
+        session,
+        package.work_package_id,
+        review_run_id=second_run_id,
+        head_sha=second_head,
+        idempotency_key="mixed-principal-second-start",
+    )
+    assert second_start.principal_verification["finding_ids"] == ["codex:3101:4102"]
+    verify_finding(
+        session,
+        package.work_package_id,
+        finding_id="codex:3101:4102",
+        outcome="FIXED",
+        reviewer=reviewer,
+        evidence="Finding B is fixed by the second implementation.",
+        idempotency_key="mixed-principal-b-fixed-second-attempt",
+    )
+
+    completed = materializer.materialize(session, package.work_package_id)
+    fixed_after_rework = next(
+        item
+        for item in completed.findings
+        if item["finding_id"] == "codex:3101:4101"
+    )
+    assert completed.state is WorkPackageState.DONE
+    assert fixed_after_rework["verification"]["review_run_id"] == first_run_id
+    assert fixed_after_rework["closure_state"] == "FIXED"
+    assert fixed_after_rework["verification_materialization"]["resolution"] == "MATERIALIZED"
+    assert github.resolved == {4101, 4102}
+    assert github.resolve_calls == 2
+    assert github.issue_state == "closed"
+    assert github.summary_calls == 1
+    summary = github.issue_comments[0].body
+    assert second_candidate.current_candidate.candidate_id in summary
+    assert second_head in summary
+    assert second_run_id in summary
+    assert "PLANE_REVIEW" in summary
+    assert reviewer in summary
+    assert "codex:3101:4101" in summary
+    assert "codex:3101:4102" in summary
+    assert "no code remediation was required" not in summary.lower()
+
+    materializer.materialize(session, package.work_package_id)
+    assert github.summary_calls == 1
+    assert github.reply_calls == 4
+    assert github.resolve_calls == 2
+
+
 def test_rejected_only_package_finalizes_without_candidate_or_successor_review(session):
     view = publish(session)
     source_run = add_completed_review(session, view)
@@ -1394,6 +1954,10 @@ def test_rejected_only_package_finalizes_without_candidate_or_successor_review(s
     assert len(github.replies) == 1
     assert github.resolved == {4101}
     assert github.issue_state == "closed"
+    rejected_summary = github.issue_comments[0].body
+    assert source_run in rejected_summary
+    assert HEAD in rejected_summary
+    assert "no code remediation was required" in rejected_summary.lower()
 
     publication = get_view(session, view.publication_id)
     assert publication.state is PublicationState.IN_REVIEW

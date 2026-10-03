@@ -24,6 +24,7 @@ from .remediation import (
     record_summary_comment,
     release_github_artifact_dispatch,
     successor_review_is_terminal,
+    validate_principal_verification_history,
 )
 from .service import get_view
 
@@ -96,6 +97,15 @@ class GitHubRemediationMaterializer:
         if principal_review is not None:
             expected_run_id = principal_review.get("review_run_id")
             expected_head_sha = principal_review.get("head_sha")
+            try:
+                expected_publication_head_sha = validate_principal_verification_history(
+                    session,
+                    package,
+                )
+            except DomainError as exc:
+                raise RemediationMaterializationError(
+                    "Principal verification is no longer backed by governed publication history"
+                ) from exc
             review_is_terminal = (
                 principal_review.get("provider") == "PLANE_REVIEW"
                 and principal_review.get("reviewer_kind") == "PRINCIPAL_REVIEWER"
@@ -108,6 +118,7 @@ class GitHubRemediationMaterializer:
         elif package.successor_review_run_id and package.successor_head_sha:
             expected_run_id = package.successor_review_run_id
             expected_head_sha = package.successor_head_sha
+            expected_publication_head_sha = expected_head_sha
             review_is_terminal = successor_review_is_terminal(
                 publication.automated_review_status,
                 package.successor_fallback,
@@ -119,6 +130,7 @@ class GitHubRemediationMaterializer:
         ):
             expected_run_id = package.review_run["run_id"]
             expected_head_sha = package.reviewed_head_sha
+            expected_publication_head_sha = expected_head_sha
             review_is_terminal = successor_review_is_terminal(
                 publication.automated_review_status,
                 None,
@@ -127,13 +139,20 @@ class GitHubRemediationMaterializer:
         else:
             expected_run_id = None
             expected_head_sha = None
+            expected_publication_head_sha = None
             review_is_terminal = False
             automated_review_bound = True
         if (
-            package.state is not WorkPackageState.VERIFYING
+            (
+                package.state is not WorkPackageState.VERIFYING
+                and not (
+                    principal_review is not None
+                    and package.state is WorkPackageState.REWORK_REQUIRED
+                )
+            )
             or not expected_run_id
             or not expected_head_sha
-            or publication.remote_head_sha != expected_head_sha
+            or publication.remote_head_sha != expected_publication_head_sha
             or (
                 automated_review_bound
                 and (
@@ -155,7 +174,12 @@ class GitHubRemediationMaterializer:
             publication.pull_request_number,
             token,
         )
-        self._exact_pull_request(view, publication, pull, expected_head_sha)
+        self._exact_pull_request(
+            view,
+            publication,
+            pull,
+            expected_publication_head_sha,
+        )
 
     def _verify_decision_context(
         self,
@@ -1005,7 +1029,10 @@ class GitHubRemediationMaterializer:
                         return get_work_package(session, work_package_id)
 
             view = get_work_package(session, work_package_id)
-            if view.state is not WorkPackageState.VERIFYING:
+            if view.state is not WorkPackageState.VERIFYING and not (
+                view.state is WorkPackageState.REWORK_REQUIRED
+                and view.principal_verification is not None
+            ):
                 return view
 
             for initial_finding in view.findings:
@@ -1093,7 +1120,18 @@ class GitHubRemediationMaterializer:
                         findings = ", ".join(
                             item["finding_id"] for item in view.findings
                         )
-                        if view.successor_review_run_id and view.successor_head_sha:
+                        if view.principal_verification is not None:
+                            principal_review = view.principal_verification
+                            evidence = (
+                                f"Implementation candidate {view.candidate_id} at "
+                                f"implementation head {view.implementation_head_sha} was "
+                                f"verified by Principal Review run "
+                                f"{principal_review['review_run_id']} at reviewed head "
+                                f"{principal_review['head_sha']} (provider "
+                                f"{principal_review['provider']}, reviewer "
+                                f"{principal_review['reviewer']})."
+                            )
+                        elif view.successor_review_run_id and view.successor_head_sha:
                             evidence = (
                                 f"Candidate {view.candidate_id} at "
                                 f"{view.implementation_head_sha} was reviewed by run "

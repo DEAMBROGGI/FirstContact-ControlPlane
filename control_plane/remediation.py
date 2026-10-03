@@ -657,6 +657,131 @@ def _validate_governed_published_candidate(
     return candidate
 
 
+def _validate_governed_remote_publication_history(
+    session: Session,
+    view: RemediationWorkPackageView,
+) -> str:
+    try:
+        candidate = _validate_governed_published_candidate(session, view)
+        events = load_events(session, view.publication_id)
+    except (KeyError, RuntimeError) as exc:
+        raise DomainError("governed publication history is corrupt") from exc
+
+    active_candidate: CandidateRow | None = None
+    active_admitted = False
+    published_head: str | None = None
+    publication_identity: tuple[str, str, int] | None = None
+    target_published = False
+
+    for event in events:
+        event_type = event["event_type"]
+        payload = event["payload"]
+        if event_type == EventType.CANDIDATE_SUBMITTED.value:
+            candidate_id = payload.get("candidate_id")
+            submitted_candidate = (
+                session.get(CandidateRow, candidate_id)
+                if isinstance(candidate_id, str)
+                else None
+            )
+            if (
+                submitted_candidate is None
+                or submitted_candidate.publication_id != view.publication_id
+                or not all(
+                    payload.get(key) == value
+                    for key, value in (
+                        ("base_sha", submitted_candidate.base_sha),
+                        ("head_sha", submitted_candidate.head_sha),
+                        ("tree_sha", submitted_candidate.tree_sha),
+                        ("profile_id", submitted_candidate.profile_id),
+                        ("profile_version", submitted_candidate.profile_version),
+                        ("profile_digest", submitted_candidate.profile_digest),
+                    )
+                )
+            ):
+                raise DomainError("candidate submission in publication history is ambiguous")
+            active_candidate = submitted_candidate
+            active_admitted = False
+        elif event_type == EventType.CANDIDATE_ADMITTED.value:
+            if active_candidate is None or not all(
+                payload.get(key) == value
+                for key, value in (
+                    ("candidate_id", active_candidate.id),
+                    ("profile_id", active_candidate.profile_id),
+                    ("profile_version", active_candidate.profile_version),
+                    ("profile_digest", active_candidate.profile_digest),
+                )
+            ):
+                raise DomainError("candidate admission in publication history is ambiguous")
+            active_admitted = True
+        elif event_type == EventType.CANDIDATE_REJECTED.value:
+            if active_candidate is None or payload.get("candidate_id") != active_candidate.id:
+                raise DomainError("candidate rejection in publication history is ambiguous")
+            active_candidate = None
+            active_admitted = False
+        elif event_type == EventType.REMOTE_PUBLISHED.value:
+            if active_candidate is None or not active_admitted:
+                raise DomainError("remote publication has no admitted candidate")
+            head_sha = payload.get("head_sha")
+            if (
+                not isinstance(head_sha, str)
+                or not _SHA_RE.fullmatch(head_sha)
+                or head_sha != active_candidate.head_sha
+            ):
+                raise DomainError("remote publication head does not match its admitted candidate")
+            previous_head_sha = payload.get("previous_head_sha")
+            if previous_head_sha != published_head:
+                raise DomainError("remote publication history is not a continuous head chain")
+
+            branch = payload.get("branch")
+            base_branch = payload.get("base_branch")
+            pull_request_number = payload.get("pull_request_number")
+            if (
+                not isinstance(branch, str)
+                or not branch.strip()
+                or not isinstance(base_branch, str)
+                or not base_branch.strip()
+                or isinstance(pull_request_number, bool)
+                or not isinstance(pull_request_number, int)
+                or pull_request_number <= 0
+            ):
+                raise DomainError("remote publication is missing canonical PR identity")
+            identity = (branch, base_branch, pull_request_number)
+            if publication_identity is not None and identity != publication_identity:
+                raise DomainError("canonical PR identity changed in publication history")
+            publication_identity = identity
+
+            observed_head_sha = payload.get("observed_remote_head_sha")
+            if observed_head_sha is not None and (
+                not isinstance(observed_head_sha, str)
+                or not _SHA_RE.fullmatch(observed_head_sha)
+                or observed_head_sha in {published_head, head_sha}
+            ):
+                raise DomainError("observed remote head in publication history is ambiguous")
+
+            if active_candidate.id == candidate.id and head_sha == candidate.head_sha:
+                target_published = True
+            published_head = head_sha
+            active_candidate = None
+            active_admitted = False
+
+    publication = get_view(session, view.publication_id)
+    if (
+        not target_published
+        or published_head is None
+        or published_head != publication.remote_head_sha
+        or publication_identity
+        != (
+            publication.remote_branch,
+            publication.base_branch,
+            publication.pull_request_number,
+        )
+    ):
+        raise DomainError(
+            "current publication head is not connected to the implementation by governed history"
+        )
+    return published_head
+
+
 def _principal_review_evidence(
     session: Session,
     publication_id: str,
@@ -747,6 +872,29 @@ def _principal_review_evidence(
     }
 
 
+def validate_principal_verification_history(
+    session: Session,
+    view: RemediationWorkPackageView,
+) -> str:
+    binding = view.principal_verification
+    if (
+        binding is None
+        or binding.get("candidate_id") != view.candidate_id
+        or binding.get("head_sha") != view.implementation_head_sha
+        or not binding.get("review_run_id")
+    ):
+        raise DomainError("Principal verification is not bound to this implementation")
+    evidence = _principal_review_evidence(
+        session,
+        view.publication_id,
+        review_run_id=str(binding["review_run_id"]),
+        head_sha=str(binding["head_sha"]),
+    )
+    if any(binding.get(key) != value for key, value in evidence.items()):
+        raise DomainError("Principal verification evidence changed after it was started")
+    return _validate_governed_remote_publication_history(session, view)
+
+
 def _finding_needs_principal_verification(finding: Mapping[str, Any]) -> bool:
     return (
         finding["principal_decision"]["decision"] == PrincipalDecision.ACCEPTED.value
@@ -775,7 +923,7 @@ def begin_principal_verification(
     current = get_work_package(session, work_package_id)
     if current.implementation_head_sha != normalized_head_sha:
         raise DomainError("Principal review head does not match the implementation head")
-    _validate_governed_published_candidate(session, current)
+    _validate_governed_remote_publication_history(session, current)
     evidence = _principal_review_evidence(
         session,
         row.publication_id,
@@ -1727,7 +1875,7 @@ def _verify_principal_finding(
     if not idempotency_key.strip() or len(idempotency_key) > 200:
         raise DomainError("idempotency_key must contain 1..200 characters")
 
-    _validate_governed_published_candidate(session, current)
+    _validate_governed_remote_publication_history(session, current)
     evidence_binding = _principal_review_evidence(
         session,
         row.publication_id,
